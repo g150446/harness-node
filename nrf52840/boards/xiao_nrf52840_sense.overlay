@@ -1,0 +1,34 @@
+/*
+ * Device Tree Overlay for Seeed Studio XIAO nRF52840 Sense
+ * Voice Bridge BLE - PDM Microphone Configuration
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+    chosen {
+        zephyr,console = &uart0;
+    };
+
+    pdm_sound: pdm-sound {
+        compatible = "nordic,nrf-pdm";
+        #sound-dai-cells = <0>;
+
+        clock-gpios = <&gpio0 32 GPIO_ACTIVE_HIGH>;  /* P1.00 - PDM CLK */
+        data-gpios = <&gpio0 16 GPIO_ACTIVE_HIGH>;   /* P0.16 - PDM DATA */
+        
+        status = "okay";
+    };
+};
+
+&pdm {
+    status = "okay";
+};
+
+&i2s {
+    status = "okay";
+};
+
+&uart0 {
+    status = "okay";
+};

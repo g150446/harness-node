@@ -1,0 +1,32 @@
+/*
+ * Device Tree Overlay for Seeed Studio XIAO nRF54L15 Sense
+ * Voice Bridge BLE - PDM Microphone Configuration
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+    chosen {
+        zephyr,console = &uart0;
+    };
+
+    /* PDM instance 20 for onboard DMIC microphone */
+    &pdm20 {
+        status = "okay";
+        
+        /* PDM Clock: P1.06 (D2) */
+        pdm_clk-gpios = <&gpio1 6 GPIO_ACTIVE_HIGH>;
+        
+        /* PDM Data: P1.07 (D3) */
+        pdm_data-gpios = <&gpio1 7 GPIO_ACTIVE_HIGH>;
+    };
+
+    /* DMIC audio device label */
+    dmic_dev: &pdm20 {
+        status = "okay";
+    };
+};
+
+&uart0 {
+    status = "okay";
+};

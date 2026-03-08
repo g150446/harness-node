@@ -1,0 +1,4 @@
+[manifest]
+path = nrf52840
+file = west.yml
+

@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash:*)",
+      "Bash(export:*)",
+      "Read(//opt/nordic/ncs/v2.9.2/**)",
+      "Bash(west flash --runner nrfutil --dev-id 81370703)",
+      "Bash(pip3 show:*)",
+      "Bash(pyocd list:*)",
+      "Bash(pyocd flash:*)",
+      "Bash(source:*)",
+      "Bash(pyocd reset:*)",
+      "Bash(pyocd commander:*)",
+      "Bash(grep:*)",
+      "Bash(pyocd:*)",
+      "Bash(cp:*)",
+      "Bash(/bin/cp:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

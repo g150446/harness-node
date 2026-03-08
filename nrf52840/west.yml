@@ -1,0 +1,23 @@
+manifest:
+  version: 1.0
+
+  defaults:
+    remote: upstream
+    revision: v4.0.0
+
+  remotes:
+    - name: upstream
+      url-base: https://github.com/zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      repo-path: zephyr
+      path: zephyr
+      import:
+        name-allowlist:
+          - hal_nordic
+          - mcuboot
+          - trusted-firmware-m
+
+  self:
+    path: nrf52840

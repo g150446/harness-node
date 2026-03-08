@@ -1,0 +1,87 @@
+# Build directories
+build/
+**/build/
+
+# Zephyr/NCS
+zephyr/
+modules/
+**/zephyr/
+**/modules/
+west_workspace/
+
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults.old
+*.elf
+*.bin
+*.map
+partitions.csv
+bootloader/
+ota_data_initial.bin
+
+# Nordic SDK / NCS
+sdkconfig
+sdkconfig.old
+*.hex
+*.uf2
+merge.hex
+merged.hex
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# Test output
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Documentation build
+docs/_build/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiler output
+*.o
+*.a
+*.d
