@@ -1,0 +1,2 @@
+dependencies:
+  espressif/es8311: ">=0.0.3"

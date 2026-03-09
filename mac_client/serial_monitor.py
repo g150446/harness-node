@@ -13,6 +13,7 @@ import time
 import argparse
 import subprocess
 import re
+import os
 
 try:
     import serial
@@ -108,6 +109,15 @@ def find_xiao_port():
     return None
 
 
+def prefer_monitor_port(port):
+    """Prefer the tty device for passive log monitoring on macOS."""
+    if port.startswith("/dev/cu."):
+        tty_port = "/dev/tty." + port[len("/dev/cu."):]
+        if os.path.exists(tty_port):
+            return tty_port
+    return port
+
+
 def print_ports(xiao_ports, other_ports):
     """Print available serial ports."""
     print("\n=== Available Serial Ports ===\n")
@@ -150,8 +160,13 @@ class SerialMonitor:
         self.drop_partial_line = True
 
     def _detect_connected_board_type(self):
+        candidates = {self.port}
+        if self.port.startswith("/dev/tty."):
+            candidates.add("/dev/cu." + self.port[len("/dev/tty."):])
+        elif self.port.startswith("/dev/cu."):
+            candidates.add("/dev/tty." + self.port[len("/dev/cu."):])
         for port_info in serial.tools.list_ports.comports():
-            if port_info.device == self.port:
+            if port_info.device in candidates:
                 return detect_board_type(port_info)
         return "unknown"
         
@@ -350,6 +365,10 @@ Examples:
             print("Error: No serial port found. Use --list to see available ports.")
             return 1
         print(f"Auto-detected port: {port}")
+    monitor_port = prefer_monitor_port(port)
+    if monitor_port != port:
+        print(f"Using monitor port: {monitor_port}")
+        port = monitor_port
     
     # Create monitor
     monitor = SerialMonitor(port, args.baud, args.timeout)
@@ -367,7 +386,9 @@ Examples:
     print("=" * 60)
     print()
     
-    default_auto_reset = monitor.board_type != "nrf54l15"
+    default_auto_reset = monitor.board_type not in {"nrf54l15", "esp32s3"}
+    if monitor.board_type == "esp32s3" and not args.auto_reset and not args.no_auto_reset:
+        print("Note: auto-reset is disabled by default for ESP32-S3 USB JTAG boards to avoid entering download mode.")
     auto_reset = default_auto_reset
     if args.auto_reset:
         auto_reset = True
