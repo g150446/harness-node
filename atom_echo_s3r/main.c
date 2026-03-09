@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -41,6 +42,16 @@ static const char *TAG = "voice_bridge";
 #define I2C_SDA_GPIO     45
 #define I2C_SCL_GPIO      0
 #define ES8311_I2C_ADDR  0x18
+
+// Grove Mini OLED (external I2C on Atom Echo S3R)
+#define OLED_I2C_PORT         I2C_NUM_1
+#define OLED_I2C_SCL_GPIO     1
+#define OLED_I2C_SDA_GPIO     2
+#define OLED_I2C_ADDR         0x3C
+#define OLED_WIDTH            72
+#define OLED_HEIGHT           40
+#define OLED_PAGE_COUNT       (OLED_HEIGHT / 8)
+#define OLED_X_OFFSET         28
 
 // Speaker amp enable (keep LOW while using the microphone)
 #define PA_EN_GPIO       18
@@ -88,6 +99,7 @@ static ble_uuid128_t gatt_svr_svc_sec_uuid = BLE_UUID128_INIT(0x00, 0x00, 0x00, 
 static uint16_t audio_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t audio_tx_char_handle;
 static uint16_t audio_rx_char_handle;
+static SemaphoreHandle_t oled_mutex;
 
 // ADPCM state
 static adpcm_state_t adpcm_enc_state;
@@ -107,6 +119,18 @@ static volatile bool stop_requested = false;
 // I2S handle
 static i2s_chan_handle_t i2s_rx_handle = NULL;
 
+typedef enum {
+    SYSTEM_STATUS_BOOT,
+    SYSTEM_STATUS_READY,
+    SYSTEM_STATUS_CONNECTED,
+    SYSTEM_STATUS_RECORDING,
+    SYSTEM_STATUS_ERROR,
+} system_status_t;
+
+static system_status_t current_status = SYSTEM_STATUS_BOOT;
+static bool oled_initialized = false;
+static uint8_t oled_buffer[OLED_WIDTH * OLED_PAGE_COUNT];
+
 // Forward declarations
 static void ble_app_advertise(void);
 static void ble_app_on_sync(void);
@@ -116,6 +140,9 @@ static void audio_stream_task(void *pvParameters);
 static void button_task(void *pvParameters);
 static void uart_task(void *pvParameters);
 static esp_err_t init_button(void);
+static esp_err_t init_oled(void);
+static void set_system_status(system_status_t status);
+static void set_system_error(const char *reason);
 static void send_status_event(uint8_t event_code, const char *event_name);
 static esp_err_t write_i2c_register(uint8_t dev_addr, uint8_t reg_addr, uint8_t value);
 static esp_err_t write_i2c_bulk_data(uint8_t dev_addr, const uint8_t *data);
@@ -141,6 +168,206 @@ static void request_recording_stop(const char *source)
     ESP_LOGI(TAG, "%s: Stop recording requested", source);
     recording_requested = false;
     stop_requested = true;
+}
+
+static const char *status_to_text(system_status_t status)
+{
+    switch (status) {
+    case SYSTEM_STATUS_BOOT:
+        return "BOOT";
+    case SYSTEM_STATUS_READY:
+        return "READY";
+    case SYSTEM_STATUS_CONNECTED:
+        return "LINK";
+    case SYSTEM_STATUS_RECORDING:
+        return "REC";
+    case SYSTEM_STATUS_ERROR:
+    default:
+        return "ERROR";
+    }
+}
+
+static const uint8_t *font5x7_get_glyph(char c)
+{
+    static const uint8_t glyph_space[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
+    static const uint8_t glyph_a[5] = {0x7E, 0x11, 0x11, 0x11, 0x7E};
+    static const uint8_t glyph_b[5] = {0x7F, 0x49, 0x49, 0x49, 0x36};
+    static const uint8_t glyph_c[5] = {0x3E, 0x41, 0x41, 0x41, 0x22};
+    static const uint8_t glyph_d[5] = {0x7F, 0x41, 0x41, 0x22, 0x1C};
+    static const uint8_t glyph_e[5] = {0x7F, 0x49, 0x49, 0x49, 0x41};
+    static const uint8_t glyph_i[5] = {0x00, 0x41, 0x7F, 0x41, 0x00};
+    static const uint8_t glyph_k[5] = {0x7F, 0x08, 0x14, 0x22, 0x41};
+    static const uint8_t glyph_l[5] = {0x7F, 0x40, 0x40, 0x40, 0x40};
+    static const uint8_t glyph_n[5] = {0x7F, 0x02, 0x04, 0x08, 0x7F};
+    static const uint8_t glyph_o[5] = {0x3E, 0x41, 0x41, 0x41, 0x3E};
+    static const uint8_t glyph_r[5] = {0x7F, 0x09, 0x19, 0x29, 0x46};
+    static const uint8_t glyph_t[5] = {0x01, 0x01, 0x7F, 0x01, 0x01};
+    static const uint8_t glyph_y[5] = {0x03, 0x04, 0x78, 0x04, 0x03};
+
+    switch (c) {
+    case 'A': return glyph_a;
+    case 'B': return glyph_b;
+    case 'C': return glyph_c;
+    case 'D': return glyph_d;
+    case 'E': return glyph_e;
+    case 'I': return glyph_i;
+    case 'K': return glyph_k;
+    case 'L': return glyph_l;
+    case 'N': return glyph_n;
+    case 'O': return glyph_o;
+    case 'R': return glyph_r;
+    case 'T': return glyph_t;
+    case 'Y': return glyph_y;
+    default:  return glyph_space;
+    }
+}
+
+static esp_err_t oled_write_command(uint8_t command)
+{
+    uint8_t packet[2] = {0x00, command};
+    return i2c_master_write_to_device(OLED_I2C_PORT, OLED_I2C_ADDR, packet, sizeof(packet), pdMS_TO_TICKS(100));
+}
+
+static esp_err_t oled_write_data(const uint8_t *data, size_t len)
+{
+    uint8_t packet[1 + OLED_WIDTH];
+    if (len > OLED_WIDTH) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    packet[0] = 0x40;
+    memcpy(&packet[1], data, len);
+    return i2c_master_write_to_device(OLED_I2C_PORT, OLED_I2C_ADDR, packet, len + 1, pdMS_TO_TICKS(100));
+}
+
+static void oled_clear_buffer(void)
+{
+    memset(oled_buffer, 0, sizeof(oled_buffer));
+}
+
+static void oled_draw_pixel(int x, int y)
+{
+    if ((x < 0) || (x >= OLED_WIDTH) || (y < 0) || (y >= OLED_HEIGHT)) {
+        return;
+    }
+    oled_buffer[(y / 8) * OLED_WIDTH + x] |= (1U << (y & 7));
+}
+
+static void oled_draw_text(const char *text, int x, int y, int scale)
+{
+    for (size_t idx = 0; text[idx] != '\0'; ++idx) {
+        const uint8_t *glyph = font5x7_get_glyph(text[idx]);
+        for (int col = 0; col < 5; ++col) {
+            for (int row = 0; row < 7; ++row) {
+                if ((glyph[col] >> row) & 0x01) {
+                    for (int sx = 0; sx < scale; ++sx) {
+                        for (int sy = 0; sy < scale; ++sy) {
+                            oled_draw_pixel(x + (idx * 6 + col) * scale + sx, y + row * scale + sy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static esp_err_t oled_flush_buffer(void)
+{
+    for (uint8_t page = 0; page < OLED_PAGE_COUNT; ++page) {
+        esp_err_t ret = oled_write_command(0x10 | (OLED_X_OFFSET >> 4));
+        if (ret != ESP_OK) { return ret; }
+        ret = oled_write_command(OLED_X_OFFSET & 0x0F);
+        if (ret != ESP_OK) { return ret; }
+        ret = oled_write_command(0xB0 | page);
+        if (ret != ESP_OK) { return ret; }
+        ret = oled_write_data(&oled_buffer[page * OLED_WIDTH], OLED_WIDTH);
+        if (ret != ESP_OK) { return ret; }
+    }
+    return ESP_OK;
+}
+
+static void oled_render_status_locked(system_status_t status)
+{
+    const char *text = status_to_text(status);
+    size_t len = strlen(text);
+    int scale = 2;
+    int width = (int)len * 6 * scale;
+    int x = (OLED_WIDTH - width) / 2;
+    int y = (OLED_HEIGHT - (7 * scale)) / 2;
+    if (x < 0) {
+        x = 0;
+    }
+    if (y < 0) {
+        y = 0;
+    }
+
+    oled_clear_buffer();
+    oled_draw_text(text, x, y, scale);
+    esp_err_t ret = oled_flush_buffer();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "oled_flush_buffer failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static void set_system_status(system_status_t status)
+{
+    current_status = status;
+    if (!oled_initialized || (oled_mutex == NULL)) {
+        return;
+    }
+    if (xSemaphoreTake(oled_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to lock OLED mutex");
+        return;
+    }
+    oled_render_status_locked(status);
+    xSemaphoreGive(oled_mutex);
+}
+
+static void set_system_error(const char *reason)
+{
+    ESP_LOGE(TAG, "%s", reason);
+    set_system_status(SYSTEM_STATUS_ERROR);
+}
+
+static esp_err_t init_oled(void)
+{
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = OLED_I2C_SDA_GPIO,
+        .scl_io_num = OLED_I2C_SCL_GPIO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 400000,
+    };
+
+    esp_err_t ret = i2c_param_config(OLED_I2C_PORT, &i2c_cfg);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = i2c_driver_install(OLED_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    oled_mutex = xSemaphoreCreateMutex();
+    if (oled_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    static const uint8_t init_seq[] = {
+        0xAE, 0xD5, 0x80, 0xA8, 0x27, 0xD3, 0x00, 0xAD, 0x30, 0x8D, 0x14,
+        0x40, 0xA6, 0xA4, 0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12, 0x81, 0xAF,
+        0xD9, 0x22, 0xDB, 0x20, 0x2E, 0xAF,
+    };
+    for (size_t i = 0; i < sizeof(init_seq); ++i) {
+        ret = oled_write_command(init_seq[i]);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    oled_initialized = true;
+    set_system_status(SYSTEM_STATUS_BOOT);
+    return ESP_OK;
 }
 
 static void send_status_event(uint8_t event_code, const char *event_name)
@@ -400,6 +627,7 @@ ble_app_advertise(void)
     });
     if (rc != 0) {
         ESP_LOGE(TAG, "Error setting adv fields: %d", rc);
+        set_system_status(SYSTEM_STATUS_ERROR);
         return;
     }
 
@@ -407,10 +635,14 @@ ble_app_advertise(void)
                       &adv_params, ble_app_gap_event, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "Error starting advertising: %d", rc);
+        set_system_status(SYSTEM_STATUS_ERROR);
         return;
     }
 
     ESP_LOGI(TAG, "Advertising started: %s", BLE_ADV_NAME);
+    if (!is_recording) {
+        set_system_status(SYSTEM_STATUS_READY);
+    }
 }
 
 static void
@@ -437,6 +669,9 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
             return 0;
         }
         audio_conn_handle = event->connect.conn_handle;
+        if (!is_recording) {
+            set_system_status(SYSTEM_STATUS_CONNECTED);
+        }
 
         ble_att_set_preferred_mtu(BLE_MTU_SIZE);
         ble_gattc_exchange_mtu(audio_conn_handle, NULL, NULL);
@@ -448,6 +683,7 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         is_recording = false;
         recording_requested = false;
         stop_requested = false;
+        set_system_status(SYSTEM_STATUS_READY);
         ble_app_advertise();
         break;
 
@@ -568,6 +804,7 @@ static void audio_stream_task(void *pvParameters)
     // Initialize audio hardware
     esp_err_t audio_ret = init_audio();
     if (audio_ret != ESP_OK) {
+        set_system_error("Audio init failed");
         ESP_LOGE(TAG, "Audio init failed (%s) — audio task exiting", esp_err_to_name(audio_ret));
         vTaskDelete(NULL);
         return;
@@ -601,6 +838,7 @@ static void audio_stream_task(void *pvParameters)
             is_recording = true;
             recording_requested = false;
             seq_num = 0;
+            set_system_status(SYSTEM_STATUS_RECORDING);
             send_status_event(EVENT_RECORDING_STARTED, "recording_started");
         }
 
@@ -609,6 +847,7 @@ static void audio_stream_task(void *pvParameters)
             ESP_LOGI(TAG, "Stopping recording...");
             is_recording = false;
             stop_requested = false;
+            set_system_status(audio_conn_handle == BLE_HS_CONN_HANDLE_NONE ? SYSTEM_STATUS_READY : SYSTEM_STATUS_CONNECTED);
             send_status_event(EVENT_RECORDING_STOPPED, "recording_stopped");
         }
 
@@ -802,7 +1041,16 @@ void app_main(void)
 
     ESP_LOGI(TAG, "UART initialized");
 
-    ESP_ERROR_CHECK(init_button());
+    esp_err_t oled_ret = init_oled();
+    if (oled_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Mini OLED init failed: %s", esp_err_to_name(oled_ret));
+    }
+
+    esp_err_t button_ret = init_button();
+    if (button_ret != ESP_OK) {
+        set_system_error("Button init failed");
+        ESP_ERROR_CHECK(button_ret);
+    }
 
     // Initialize BLE
     ESP_LOGI(TAG, "Initializing NimBLE...");
