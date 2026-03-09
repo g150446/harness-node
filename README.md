@@ -11,7 +11,7 @@ Supports:
 
 ```
 voice-bridge-ble/
-├── main/                      # ESP-IDF firmware (ESP32S3)
+├── esp32s3/                   # ESP-IDF firmware (ESP32S3)
 │   ├── main.c                 # Main application
 │   ├── adpcm.c/h              # IMA ADPCM codec
 │   └── CMakeLists.txt
@@ -48,7 +48,7 @@ voice-bridge-ble/
 
 ### For XIAO ESP32S3 Sense
 
-See `main/README.md` or the ESP-IDF section below.
+See `esp32s3/` or the ESP-IDF section below.
 
 ### For XIAO nRF52840 Sense
 
