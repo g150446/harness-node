@@ -1,0 +1,26 @@
+/*
+ * Device Tree Overlay for Seeed Studio XIAO nRF54L15 Sense
+ * IMU motion detection test application
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+    chosen {
+        zephyr,console = &uart20;
+        zephyr,shell-uart = &uart20;
+    };
+};
+
+&uart20 {
+    status = "okay";
+};
+
+&i2c30 {
+    status = "okay";
+};
+
+&lsm6ds3tr_c {
+    irq-gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+    status = "okay";
+};

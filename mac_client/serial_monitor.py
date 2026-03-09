@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-XIAO ESP32S3 Serial Monitor
+XIAO Serial Monitor
 
-Connects to XIAO ESP32S3 Sense via USB serial and displays log output.
+Connects to XIAO boards over USB serial and displays log output.
+Handles the XIAO nRF54L15 Sense CMSIS-DAP port more reliably than the
+original ESP32-specific implementation.
 """
 
 import sys
 import signal
 import time
 import argparse
+import subprocess
+import re
 
 try:
     import serial
@@ -23,7 +27,10 @@ except ImportError:
 # ============================================================================
 
 DEFAULT_BAUD_RATE = 115200
-DEFAULT_TIMEOUT = 0.01
+DEFAULT_TIMEOUT = 0.1
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+ORPHAN_COLOR_CODE_RE = re.compile(r"\[[0-9;]*m")
 
 
 # ============================================================================
@@ -40,9 +47,31 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
+def sanitize_serial_line(line):
+    """Strip ANSI escapes and non-printable control bytes from serial output."""
+    clean_line = ANSI_ESCAPE_RE.sub("", line)
+    clean_line = ORPHAN_COLOR_CODE_RE.sub("", clean_line)
+    clean_line = CONTROL_CHAR_RE.sub("", clean_line)
+    return clean_line
+
+
 # ============================================================================
 # Serial Port Functions
 # ============================================================================
+
+def detect_board_type(port_info):
+    """Infer the board family from serial port metadata."""
+    manufacturer = (port_info.manufacturer or "").lower()
+    description = (port_info.description or "").lower()
+
+    if "nrf54" in description or "cmsis-dap" in description:
+        return "nrf54l15"
+    if "esp32" in description or "usb jtag" in description:
+        return "esp32s3"
+    if "xiao" in manufacturer:
+        return "xiao"
+    return "unknown"
+
 
 def list_serial_ports():
     """List available serial ports."""
@@ -53,11 +82,10 @@ def list_serial_ports():
     for port in ports:
         manufacturer = port.manufacturer or ""
         description = port.description or ""
+        board_type = detect_board_type(port)
         
         # XIAO ESP32S3 uses USB Serial/JTAG
-        if 'XIAO' in manufacturer or 'ESP32' in description or 'USB JTAG' in description:
-            xiao_ports.append(port)
-        elif 'usbmodem' in port.device or 'USB Serial' in description:
+        if board_type != "unknown" or 'usbmodem' in port.device or 'USB Serial' in description:
             xiao_ports.append(port)
         else:
             other_ports.append(port)
@@ -66,7 +94,7 @@ def list_serial_ports():
 
 
 def find_xiao_port():
-    """Find XIAO ESP32S3 serial port."""
+    """Find a likely XIAO serial port."""
     xiao_ports, _ = list_serial_ports()
     
     if xiao_ports:
@@ -85,11 +113,13 @@ def print_ports(xiao_ports, other_ports):
     print("\n=== Available Serial Ports ===\n")
     
     if xiao_ports:
-        print("XIAO ESP32S3 / ESP devices:")
+        print("XIAO devices:")
         for port in xiao_ports:
+            board_type = detect_board_type(port)
             print(f"  {port.device}")
             print(f"    Description: {port.description}")
             print(f"    Manufacturer: {port.manufacturer}")
+            print(f"    Board type: {board_type}")
             print()
     
     if other_ports:
@@ -108,7 +138,7 @@ def print_ports(xiao_ports, other_ports):
 # ============================================================================
 
 class SerialMonitor:
-    """Serial monitor for XIAO ESP32S3."""
+    """Serial monitor for XIAO boards."""
     
     def __init__(self, port, baud_rate=DEFAULT_BAUD_RATE, timeout=DEFAULT_TIMEOUT):
         self.port = port
@@ -116,6 +146,14 @@ class SerialMonitor:
         self.timeout = timeout
         self.serial_conn = None
         self.line_buffer = ""
+        self.board_type = self._detect_connected_board_type()
+        self.drop_partial_line = True
+
+    def _detect_connected_board_type(self):
+        for port_info in serial.tools.list_ports.comports():
+            if port_info.device == self.port:
+                return detect_board_type(port_info)
+        return "unknown"
         
     def connect(self):
         """Connect to serial port."""
@@ -128,9 +166,9 @@ class SerialMonitor:
                 dsrdtr=False,
                 xonxoff=False,
             )
-            # Wait for the connection to establish
             time.sleep(0.5)
-            print(f"Connected to {self.port} at {self.baud_rate} baud")
+            self.drop_partial_line = True
+            print(f"Connected to {self.port} at {self.baud_rate} baud ({self.board_type})")
             return True
         except serial.SerialException as e:
             print(f"Error opening port {self.port}: {e}")
@@ -141,11 +179,38 @@ class SerialMonitor:
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
             print("Disconnected")
+        self.serial_conn = None
+    
+    def reconnect(self, wait_seconds=4.0):
+        """Reconnect after a device-side reset or USB reconnect."""
+        deadline = time.time() + wait_seconds
+        self.disconnect()
+        self.line_buffer = ""
+        while running and time.time() < deadline:
+            if self.connect():
+                return True
+            time.sleep(0.2)
+        return False
     
     def reset_device(self):
-        """Reset XIAO by toggling DTR/RTS."""
+        """Reset the connected board."""
+        print("Resetting device...")
+
+        if self.board_type == "nrf54l15":
+            try:
+                subprocess.run(
+                    ["pyocd", "reset", "-t", "nrf54l"],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if not self.reconnect(wait_seconds=6.0):
+                    print("Warning: device did not reconnect after pyocd reset")
+                return
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                print("Warning: pyocd reset failed, falling back to serial control")
+
         if self.serial_conn and self.serial_conn.is_open:
-            print("Resetting device...")
             self.serial_conn.setDTR(False)
             self.serial_conn.setRTS(True)
             time.sleep(0.1)
@@ -158,15 +223,24 @@ class SerialMonitor:
             return None
         
         while running:
+            if self.drop_partial_line and '\n' in self.line_buffer:
+                _, self.line_buffer = self.line_buffer.split('\n', 1)
+                self.drop_partial_line = False
+
+            if '\n' in self.line_buffer:
+                line, self.line_buffer = self.line_buffer.split('\n', 1)
+                return sanitize_serial_line(line)
+
             if self.serial_conn.in_waiting:
                 try:
-                    char = self.serial_conn.read().decode('utf-8', errors='ignore')
-                    if char:
-                        self.line_buffer += char
-                        if char == '\n':
-                            line = self.line_buffer
-                            self.line_buffer = ""
-                            return line
+                    chunk_size = max(1, self.serial_conn.in_waiting)
+                    chunk = self.serial_conn.read(chunk_size).decode('utf-8', errors='ignore')
+                    if chunk:
+                        self.line_buffer += chunk
+                except serial.SerialException as e:
+                    print(f"Read error: {e}")
+                    if not self.reconnect():
+                        return None
                 except Exception as e:
                     print(f"Read error: {e}")
                     return None
@@ -189,7 +263,6 @@ class SerialMonitor:
             while running:
                 line = self.read_line()
                 if line:
-                    # Filter and display ESP-IDF log lines
                     if line.strip():
                         print(line.rstrip())
         except KeyboardInterrupt:
@@ -207,7 +280,7 @@ class SerialMonitor:
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='XIAO ESP32S3 Serial Monitor',
+        description='XIAO Serial Monitor',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -215,6 +288,7 @@ Examples:
   %(prog)s -p /dev/tty.usbmodem1101  # Specify port
   %(prog)s -b 74880             # Use different baud rate
   %(prog)s --list               # List available ports
+  %(prog)s --auto-reset         # Reset before monitoring
   %(prog)s --reset              # Reset device and exit
         """
     )
@@ -245,6 +319,11 @@ Examples:
         '--reset',
         action='store_true',
         help='Reset device and exit'
+    )
+    parser.add_argument(
+        '--auto-reset',
+        action='store_true',
+        help='Force auto-reset on connect'
     )
     parser.add_argument(
         '--no-auto-reset',
@@ -284,11 +363,16 @@ Examples:
     
     # Run monitor
     print("=" * 60)
-    print("XIAO ESP32S3 Serial Monitor")
+    print("XIAO Serial Monitor")
     print("=" * 60)
     print()
     
-    auto_reset = not args.no_auto_reset
+    default_auto_reset = monitor.board_type != "nrf54l15"
+    auto_reset = default_auto_reset
+    if args.auto_reset:
+        auto_reset = True
+    if args.no_auto_reset:
+        auto_reset = False
     success = monitor.run(auto_reset=auto_reset)
     
     return 0 if success else 1
