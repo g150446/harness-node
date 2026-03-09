@@ -44,6 +44,9 @@ static const char *TAG = "voice_bridge";
 
 // Speaker amp enable (keep LOW while using the microphone)
 #define PA_EN_GPIO       18
+#define BUTTON_A_GPIO    41
+#define BUTTON_POLL_MS   10
+#define BUTTON_DEBOUNCE_MS 30
 
 // I2S configuration
 #define I2S_SAMPLE_RATE   16000
@@ -61,6 +64,10 @@ static const char *TAG = "voice_bridge";
 
 // Recording configuration
 #define RECORDING_PACKET_SIZE  200  // bytes of PCM data per packet (fits in BLE MTU)
+#define AUDIO_PACKET_SYNC_BYTE 0xAA
+#define EVENT_PACKET_SYNC_BYTE 0x55
+#define EVENT_RECORDING_STARTED 0x01
+#define EVENT_RECORDING_STOPPED 0x02
 
 // BLE UUIDs
 static ble_uuid128_t gatt_svr_svc_sec_uuid = BLE_UUID128_INIT(0x00, 0x00, 0x00, 0x00,
@@ -90,6 +97,7 @@ static uint8_t seq_num = 0;
 
 // Task handles
 static TaskHandle_t audio_task_handle;
+static TaskHandle_t button_task_handle;
 
 // Recording state
 static volatile bool is_recording = false;
@@ -105,12 +113,57 @@ static void ble_app_on_sync(void);
 static void ble_app_on_reset(int reason);
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg);
 static void audio_stream_task(void *pvParameters);
+static void button_task(void *pvParameters);
 static void uart_task(void *pvParameters);
+static esp_err_t init_button(void);
+static void send_status_event(uint8_t event_code, const char *event_name);
 static esp_err_t write_i2c_register(uint8_t dev_addr, uint8_t reg_addr, uint8_t value);
 static esp_err_t write_i2c_bulk_data(uint8_t dev_addr, const uint8_t *data);
 static esp_err_t set_microphone_enabled(bool enabled);
 static void calc_clock_div(uint32_t *div_a, uint32_t *div_b, uint32_t *div_n, uint32_t base_clock, uint32_t target_freq);
 static void apply_mic_clock_config(i2s_port_t port, uint32_t sample_rate_hz);
+
+static void request_recording_start(const char *source)
+{
+    if (is_recording || recording_requested) {
+        return;
+    }
+    ESP_LOGI(TAG, "%s: Start recording requested", source);
+    stop_requested = false;
+    recording_requested = true;
+}
+
+static void request_recording_stop(const char *source)
+{
+    if (!is_recording && !recording_requested) {
+        return;
+    }
+    ESP_LOGI(TAG, "%s: Stop recording requested", source);
+    recording_requested = false;
+    stop_requested = true;
+}
+
+static void send_status_event(uint8_t event_code, const char *event_name)
+{
+    if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+
+    const uint8_t packet[] = {0x00, EVENT_PACKET_SYNC_BYTE, event_code};
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(packet, sizeof(packet));
+    if (om == NULL) {
+        ESP_LOGW(TAG, "Failed to allocate status event buffer for %s", event_name);
+        return;
+    }
+
+    int rc = ble_gattc_notify_custom(audio_conn_handle, audio_tx_char_handle, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Failed to send status event %s: rc=%d", event_name, rc);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Sent status event: %s", event_name);
+}
 
 static esp_err_t write_i2c_register(uint8_t dev_addr, uint8_t reg_addr, uint8_t value)
 {
@@ -282,11 +335,9 @@ audio_gatt_svr_access(uint16_t conn_handle, uint16_t attr_handle,
         if (ctxt->om->om_len >= 1) {
             uint8_t cmd = ctxt->om->om_data[0];
             if (cmd == 0x01) {
-                ESP_LOGI(TAG, "Start recording command received");
-                recording_requested = true;
+                request_recording_start("BLE");
             } else if (cmd == 0x00) {
-                ESP_LOGI(TAG, "Stop recording command received");
-                stop_requested = true;
+                request_recording_stop("BLE");
             }
         }
         break;
@@ -395,6 +446,8 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "BLE disconnected");
         audio_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         is_recording = false;
+        recording_requested = false;
+        stop_requested = false;
         ble_app_advertise();
         break;
 
@@ -486,6 +539,24 @@ static esp_err_t init_audio(void)
     return ESP_OK;
 }
 
+static esp_err_t init_button(void)
+{
+    gpio_config_t button_cfg = {
+        .pin_bit_mask = 1ULL << BUTTON_A_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t ret = gpio_config(&button_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "button gpio_config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "Button A initialized on GPIO %d (active low)", BUTTON_A_GPIO);
+    return ESP_OK;
+}
+
 // ============================================================================
 // Audio Streaming Task
 // ============================================================================
@@ -530,6 +601,7 @@ static void audio_stream_task(void *pvParameters)
             is_recording = true;
             recording_requested = false;
             seq_num = 0;
+            send_status_event(EVENT_RECORDING_STARTED, "recording_started");
         }
 
         // Check for recording stop command
@@ -537,6 +609,7 @@ static void audio_stream_task(void *pvParameters)
             ESP_LOGI(TAG, "Stopping recording...");
             is_recording = false;
             stop_requested = false;
+            send_status_event(EVENT_RECORDING_STOPPED, "recording_stopped");
         }
 
         // Read from I2S RX
@@ -547,7 +620,7 @@ static void audio_stream_task(void *pvParameters)
             continue;
         }
 
-        if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        if (!is_recording || audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
             continue;
         }
 
@@ -606,7 +679,7 @@ static void audio_stream_task(void *pvParameters)
 
             // Create packet: [seq_num][0xAA][PCM data...]
             tx_packet[0] = seq_num++;
-            tx_packet[1] = 0xAA;  // Sync byte
+            tx_packet[1] = AUDIO_PACKET_SYNC_BYTE;
 
             memcpy(&tx_packet[2], &pcm_buffer[sample_index], samples_to_send * 2);
 
@@ -630,6 +703,39 @@ static void audio_stream_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+static void button_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Button task started");
+
+    int stable_level = gpio_get_level(BUTTON_A_GPIO);
+    int last_level = stable_level;
+    TickType_t last_change_tick = xTaskGetTickCount();
+
+    while (1) {
+        int level = gpio_get_level(BUTTON_A_GPIO);
+        TickType_t now = xTaskGetTickCount();
+
+        if (level != last_level) {
+            last_level = level;
+            last_change_tick = now;
+        }
+
+        if (level != stable_level &&
+            (now - last_change_tick) >= pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
+            stable_level = level;
+            if (stable_level == 0) {
+                if (is_recording || recording_requested) {
+                    request_recording_stop("Button A");
+                } else {
+                    request_recording_start("Button A");
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+    }
+}
+
 // ============================================================================
 // UART Task (for serial commands)
 // ============================================================================
@@ -646,11 +752,9 @@ static void uart_task(void *pvParameters)
         if (len > 0) {
             for (int i = 0; i < len; i++) {
                 if (uart_buf[i] == 'r' || uart_buf[i] == 'R') {
-                    ESP_LOGI(TAG, "Serial: Start recording");
-                    recording_requested = true;
+                    request_recording_start("Serial");
                 } else if (uart_buf[i] == 's' || uart_buf[i] == 'S') {
-                    ESP_LOGI(TAG, "Serial: Stop recording");
-                    stop_requested = true;
+                    request_recording_stop("Serial");
                 } else if (uart_buf[i] == 'h' || uart_buf[i] == 'H') {
                     ESP_LOGI(TAG, "Serial commands: 'r'=start, 's'=stop, 'h'=help");
                 }
@@ -698,6 +802,8 @@ void app_main(void)
 
     ESP_LOGI(TAG, "UART initialized");
 
+    ESP_ERROR_CHECK(init_button());
+
     // Initialize BLE
     ESP_LOGI(TAG, "Initializing NimBLE...");
 
@@ -724,9 +830,12 @@ void app_main(void)
     xTaskCreatePinnedToCore(audio_stream_task, "audio_stream", 8192, NULL, 5,
                            &audio_task_handle, 1);
 
+    ESP_LOGI(TAG, "Creating button task...");
+    xTaskCreate(button_task, "button_task", 3072, NULL, 4, &button_task_handle);
+
     ESP_LOGI(TAG, "Creating UART task...");
     xTaskCreate(uart_task, "uart_task", 4096, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "Voice Bridge BLE - Initialization complete");
-    ESP_LOGI(TAG, "Serial commands: 'r'=start recording, 's'=stop, 'h'=help");
+    ESP_LOGI(TAG, "Button A toggles real-time recording; serial commands: 'r'=start, 's'=stop, 'h'=help");
 }

@@ -2,8 +2,8 @@
 """
 Voice Bridge BLE - Mac Client (Recording Mode)
 
-Receives audio from XIAO ESP32S3 Sense via BLE and saves to WAV file.
-Uses serial commands to control recording start/stop.
+Receives audio and recorder state events over BLE and saves to WAV file.
+Supports both direct BLE/UART control and device-side button driven recording.
 """
 
 import asyncio
@@ -53,6 +53,9 @@ CHANNELS = 1
 # Recording packet format: [seq_num][sync_byte][data...]
 PACKET_HEADER_SIZE = 2
 PACKET_SYNC_BYTE = 0xAA
+EVENT_SYNC_BYTE = 0x55
+EVENT_RECORDING_STARTED = 0x01
+EVENT_RECORDING_STOPPED = 0x02
 
 
 # ============================================================================
@@ -192,6 +195,7 @@ class VoiceBridgeClient:
         self._packet_loss_count = 0
         self._packets_received = 0
         self._serial_port: Optional[serial.Serial] = None
+        self._remote_recording = False
 
     async def find_device(self) -> Optional[str]:
         """Find the Voice Bridge device."""
@@ -248,7 +252,7 @@ class VoiceBridgeClient:
             logger.info("Disconnected")
 
     def notification_handler(self, sender, data: bytes):
-        """Handle incoming BLE notifications (audio data)."""
+        """Handle incoming BLE notifications (audio packets and status events)."""
         if not self.is_connected:
             return
 
@@ -256,13 +260,17 @@ class VoiceBridgeClient:
         if len(data) < PACKET_HEADER_SIZE:
             return
 
-        seq_num = data[0]
         sync_byte = data[1]
 
-        # Verify sync byte
+        if sync_byte == EVENT_SYNC_BYTE:
+            self.handle_device_event(data[2:])
+            return
+
         if sync_byte != PACKET_SYNC_BYTE:
             logger.warning(f"Invalid sync byte: {sync_byte:02X}")
             return
+
+        seq_num = data[0]
 
         # Check sequence number for packet loss detection
         if self._last_seq_num >= 0:
@@ -278,6 +286,28 @@ class VoiceBridgeClient:
 
         # Write to WAV file
         self.recorder.write_samples(pcm_data)
+
+    def handle_device_event(self, payload: bytes):
+        """Handle device-side status events sent over BLE."""
+        if not payload:
+            logger.warning("Received empty device event payload")
+            return
+
+        event_code = payload[0]
+
+        if event_code == EVENT_RECORDING_STARTED:
+            self._last_seq_num = -1
+            self._remote_recording = True
+            logger.info("Device event: recording started")
+            if not self.recorder.is_recording:
+                self.recorder.start_recording()
+        elif event_code == EVENT_RECORDING_STOPPED:
+            self._remote_recording = False
+            logger.info("Device event: recording stopped")
+            if self.recorder.is_recording:
+                self.recorder.stop_recording()
+        else:
+            logger.info("Device event: unknown code 0x%02X", event_code)
 
     def send_serial_command(self, command: str):
         """Send command via serial."""
@@ -314,6 +344,8 @@ class VoiceBridgeClient:
     def start_recording(self):
         """Start recording via BLE command."""
         if self.client and self.client.is_connected:
+            self._last_seq_num = -1
+            self._remote_recording = True
             # Start local WAV recording
             self.recorder.start_recording()
 
@@ -326,6 +358,7 @@ class VoiceBridgeClient:
     def stop_recording(self):
         """Stop recording via BLE command."""
         if self.client and self.client.is_connected:
+            self._remote_recording = False
             # Stop local WAV recording
             self.recorder.stop_recording()
 
@@ -342,6 +375,7 @@ class VoiceBridgeClient:
         if self._packets_received > 0:
             loss_rate = self._packet_loss_count / (self._packets_received + self._packet_loss_count) * 100
             logger.info(f"Packet loss rate: {loss_rate:.1f}%")
+        logger.info(f"Remote recording active: {self._remote_recording}")
         logger.info(f"Recording duration: {self.recorder.get_recording_duration():.1f}s")
         logger.info(f"Bytes recorded: {self.recorder.bytes_recorded}")
 
@@ -356,8 +390,8 @@ async def interactive_control(client: VoiceBridgeClient):
     print("Voice Bridge BLE - Recording Control")
     print("=" * 60)
     print("\nCommands:")
-    print("  r / start  - Start recording")
-    print("  s / stop   - Stop recording")
+    print("  r / start  - Start recording via BLE")
+    print("  s / stop   - Stop recording via BLE")
     print("  R / record - Start recording via serial")
     print("  S / stop_serial - Stop recording via serial")
     print("  t / status - Show status")
@@ -379,20 +413,21 @@ async def interactive_control(client: VoiceBridgeClient):
 
     while True:
         try:
-            command = await loop.run_in_executor(None, input, "Command: ")
-            command = command.strip().lower()
+            raw_command = await loop.run_in_executor(None, input, "Command: ")
+            command = raw_command.strip()
+            command_lower = command.lower()
 
-            if command in ['q', 'quit', 'exit']:
+            if command_lower in ['q', 'quit', 'exit']:
                 break
-            elif command in ['r', 'start']:
+            elif command_lower in ['r', 'start'] and command == command_lower:
                 client.start_recording()
-            elif command in ['s', 'stop']:
+            elif command_lower in ['s', 'stop'] and command == command_lower:
                 client.stop_recording()
             elif command in ['R', 'record']:
                 client.send_serial_command('r')
             elif command in ['S', 'stop_serial']:
                 client.send_serial_command('s')
-            elif command in ['t', 'status']:
+            elif command_lower in ['t', 'status']:
                 client.print_stats()
                 if client.recorder.is_recording:
                     print(f"  Recording: YES ({client.recorder.get_recording_duration():.1f}s)")
