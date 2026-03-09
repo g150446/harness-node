@@ -71,6 +71,7 @@ coverage/
 .coverage
 htmlcov/
 .pytest_cache/
+mac_client/output/
 
 # Documentation build
 docs/_build/
