@@ -58,6 +58,7 @@ static const char *TAG = "voice_bridge";
 #define BUTTON_A_GPIO    41
 #define BUTTON_POLL_MS   10
 #define BUTTON_DEBOUNCE_MS 30
+#define BUTTON_DOUBLE_CLICK_MS 500
 
 // I2S configuration
 #define I2S_SAMPLE_RATE   16000
@@ -79,6 +80,7 @@ static const char *TAG = "voice_bridge";
 #define EVENT_PACKET_SYNC_BYTE 0x55
 #define EVENT_RECORDING_STARTED 0x01
 #define EVENT_RECORDING_STOPPED 0x02
+#define EVENT_CONVERSATION_TOGGLED 0x03
 
 // BLE UUIDs
 static ble_uuid128_t gatt_svr_svc_sec_uuid = BLE_UUID128_INIT(0x00, 0x00, 0x00, 0x00,
@@ -115,6 +117,7 @@ static TaskHandle_t button_task_handle;
 static volatile bool is_recording = false;
 static volatile bool recording_requested = false;
 static volatile bool stop_requested = false;
+static volatile bool stop_event_pending = false;
 
 // I2S handle
 static i2s_chan_handle_t i2s_rx_handle = NULL;
@@ -166,8 +169,11 @@ static void request_recording_stop(const char *source)
         return;
     }
     ESP_LOGI(TAG, "%s: Stop recording requested", source);
+    bool was_recording = is_recording;
     recording_requested = false;
+    is_recording = false;
     stop_requested = true;
+    stop_event_pending = was_recording;
 }
 
 static const char *status_to_text(system_status_t status)
@@ -683,6 +689,7 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         is_recording = false;
         recording_requested = false;
         stop_requested = false;
+        stop_event_pending = false;
         set_system_status(SYSTEM_STATUS_READY);
         ble_app_advertise();
         break;
@@ -843,12 +850,14 @@ static void audio_stream_task(void *pvParameters)
         }
 
         // Check for recording stop command
-        if (stop_requested && is_recording) {
-            ESP_LOGI(TAG, "Stopping recording...");
-            is_recording = false;
+        if (stop_requested) {
+            if (stop_event_pending) {
+                ESP_LOGI(TAG, "Stopping recording...");
+                set_system_status(audio_conn_handle == BLE_HS_CONN_HANDLE_NONE ? SYSTEM_STATUS_READY : SYSTEM_STATUS_CONNECTED);
+                send_status_event(EVENT_RECORDING_STOPPED, "recording_stopped");
+            }
             stop_requested = false;
-            set_system_status(audio_conn_handle == BLE_HS_CONN_HANDLE_NONE ? SYSTEM_STATUS_READY : SYSTEM_STATUS_CONNECTED);
-            send_status_event(EVENT_RECORDING_STOPPED, "recording_stopped");
+            stop_event_pending = false;
         }
 
         // Read from I2S RX
@@ -859,7 +868,7 @@ static void audio_stream_task(void *pvParameters)
             continue;
         }
 
-        if (!is_recording || audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        if (stop_requested || !is_recording || audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
             continue;
         }
 
@@ -949,6 +958,8 @@ static void button_task(void *pvParameters)
     int stable_level = gpio_get_level(BUTTON_A_GPIO);
     int last_level = stable_level;
     TickType_t last_change_tick = xTaskGetTickCount();
+    TickType_t first_click_tick = 0;
+    uint8_t click_count = 0;
 
     while (1) {
         int level = gpio_get_level(BUTTON_A_GPIO);
@@ -963,11 +974,36 @@ static void button_task(void *pvParameters)
             (now - last_change_tick) >= pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
             stable_level = level;
             if (stable_level == 0) {
-                if (is_recording || recording_requested) {
-                    request_recording_stop("Button A");
+                if (click_count == 0) {
+                    click_count = 1;
+                    first_click_tick = now;
                 } else {
-                    request_recording_start("Button A");
+                    TickType_t click_delta = now - first_click_tick;
+                    if (click_delta <= pdMS_TO_TICKS(BUTTON_DOUBLE_CLICK_MS)) {
+                        ESP_LOGI(TAG, "Button A double-click detected");
+                        if (is_recording || recording_requested) {
+                            request_recording_stop("Button A double-click");
+                        }
+                        send_status_event(EVENT_CONVERSATION_TOGGLED, "conversation_toggled");
+                        click_count = 0;
+                        first_click_tick = 0;
+                    } else {
+                        click_count = 1;
+                        first_click_tick = now;
+                    }
                 }
+            }
+        }
+
+        if (click_count == 1 &&
+            (now - first_click_tick) > pdMS_TO_TICKS(BUTTON_DOUBLE_CLICK_MS)) {
+            click_count = 0;
+            first_click_tick = 0;
+
+            if (is_recording || recording_requested) {
+                request_recording_stop("Button A");
+            } else {
+                request_recording_start("Button A");
             }
         }
 
