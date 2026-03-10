@@ -25,6 +25,49 @@ nRF54L15 は Nordic の最新 MCU で、以下の特徴があります：
 - pyocd (`pip install pyocd`) — フラッシュ用
 - Python 3.10+ / bleak / pyserial — Mac クライアント用
 
+## コードの説明
+
+### なぜカスタムボード定義が必要か
+
+NCS v2.9.2 には XIAO nRF54L15 のボード定義が含まれていないため、このリポジトリでは `boards/seeed/xiao_nrf54l15/` に Zephyr upstream ベースのカスタムボード定義を追加しています。
+
+このボード定義で以下を正しく設定しています。
+
+- XIAO nRF54L15 の UART 配置
+- PDM/IMU 用電源レギュレータ
+- オンボード PDM マイクのピン
+  - `PDM_CLK = P1.12`
+  - `PDM_DIN = P1.13`
+- `dmic20` / `imu0` などのエイリアス
+
+### 主要ファイル
+
+- `src/main.c`
+  - BLE サービスの初期化
+  - start/stop コマンドの受信
+  - PCM データの Notify 送信
+  - DMIC が使えない場合の 440Hz フォールバック
+- `src/audio_capture.c`
+  - `DT_ALIAS(dmic20)` から DMIC デバイスを取得
+  - 16kHz / 16bit / mono の PDM キャプチャを設定
+  - `audio_capture_start()`, `audio_capture_get_data()`, `audio_capture_stop()` を提供
+- `flash.sh`
+  - ソースを NCS サンプルディレクトリへコピー
+  - `xiao_nrf54l15/nrf54l15/cpuapp` でビルド
+  - pyocd 0.43.1 以降を優先して `nrf54l` ターゲットへフラッシュ
+- `../mac_client/nrf54_controller.py`
+  - BLE 経由で録音開始/停止を行う
+  - 受信した PCM を 16kHz WAV として保存する
+
+### データの流れ
+
+1. Mac クライアントが BLE 接続
+2. `0x01` を書き込むと録音開始
+3. `audio_capture.c` が DMIC から PCM バッファを取得
+4. `main.c` が `[seq][0xAA][pcm...]` 形式で Notify 送信
+5. Mac クライアントが WAV に保存
+6. `0x00` を書き込むと録音停止
+
 ## クイックスタート
 
 ### 1. 自動フラッシュスクリプト
@@ -43,7 +86,7 @@ cd nrf54l15
 
 ```bash
 cd mac_client
-python3 voice_bridge_recorder.py
+python3 nrf54_controller.py
 ```
 
 ### 3. 操作
@@ -63,8 +106,8 @@ python3 voice_bridge_recorder.py
 - マイク：オンボード PDM (MSM261DGT006)
 
 ### PDM マイクピン
-- PDM_CLK: P1.06 (D2)
-- PDM_DATA: P1.07 (D3)
+- PDM_CLK: P1.12
+- PDM_DATA: P1.13
 
 ### BLE
 - デバイス名：VoiceBridge
@@ -74,11 +117,11 @@ python3 voice_bridge_recorder.py
 - デフォルト MTU: 23（ATT ペイロード最大 20 バイト）
 
 ### 送信データ
-- パケットサイズ：20 バイト（ヘッダー 2 バイト + PCM データ 18 バイト）
 - パケット形式：[シーケンス番号][同期バイト 0xAA][PCM データ...]
+- PCM データは 16-bit little-endian
 
 ### 現在の制限事項
-- 音声キャプチャはシミュレーション（440Hz 正弦波）。実 PDM マイク対応は `audio_capture.c` の実装が必要
+- 音声キャプチャはオンボード PDM マイクを優先して使用し、初期化または読み取りに失敗した場合のみ 440Hz 正弦波へフォールバック
 - MTU 23 のため帯域が限られる（MTU 拡張で改善可能）
 
 ## 手動ビルド・フラッシュ
@@ -102,9 +145,9 @@ cp <project_dir>/nrf54l15/src/*.h nrf/samples/voice_bridge_nrf54l15/src/
 cp <project_dir>/nrf54l15/CMakeLists.txt nrf/samples/voice_bridge_nrf54l15/
 cp <project_dir>/nrf54l15/prj.conf nrf/samples/voice_bridge_nrf54l15/
 
-# ビルド (nrf54l15dk ボードターゲット)
+# ビルド (XIAO nRF54L15 ボードターゲット)
 rm -rf build
-west build -b nrf54l15dk/nrf54l15/cpuapp nrf/samples/voice_bridge_nrf54l15
+west build -b xiao_nrf54l15/nrf54l15/cpuapp nrf/samples/voice_bridge_nrf54l15 -- -DBOARD_ROOT=<project_dir>
 ```
 
 ### フラッシュ
@@ -144,7 +187,7 @@ Traits          serialPorts, usb
 
 - **ボード**: Seeed Studio XIAO nRF54L15 Sense (CMSIS-DAP, ID: 81370703)
 - **NCS**: v2.9.2 / ツールチェイン b8efef2ad5
-- **ボードターゲット**: `nrf54l15dk/nrf54l15/cpuapp`
+- **ボードターゲット**: `xiao_nrf54l15/nrf54l15/cpuapp`
 - **フラッシュ**: pyocd 0.43.1 (`pyocd flash -t nrf54l`)
 - **Mac クライアント**: bleak (BLE), Python 3.12
 
@@ -166,6 +209,9 @@ Traits          serialPorts, usb
 - scan response にデバイス名を含めるよう `BT_LE_ADV_CONN` + `scan_rsp` を使用
 - パケットサイズを MTU 23 に合わせて 20 バイトに調整
 - `flash.sh` のランナーを `nrfutil` → `pyocd` に変更（CMSIS-DAP 対応）
+- XIAO nRF54L15 のカスタムボード定義を追加し、実機向けビルドターゲットを `xiao_nrf54l15/nrf54l15/cpuapp` に変更
+- PDM マイクピンを `P1.12/P1.13` に修正
+- `mac_client/nrf54_controller.py` の WAV 保存サンプルレートを 16kHz に修正
 
 ## トラブルシューティング
 
@@ -224,8 +270,9 @@ nrf54l15/
 │   ├── main.c                  # メインアプリケーション
 │   ├── adpcm.c/h               # ADPCM コーデック
 │   └── audio_capture.c/h       # PDM オーディオキャプチャ
+├── boards/seeed/xiao_nrf54l15/      # XIAO nRF54L15 カスタムボード定義
 └── boards/
-    └── xiao_nrf54l15_sense.overlay  # ボード設定
+    └── xiao_nrf54l15_sense.overlay  # 旧オーバーレイ（参考用）
 ```
 
 ## 関連プロジェクト

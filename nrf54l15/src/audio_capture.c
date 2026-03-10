@@ -4,6 +4,7 @@
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/device.h>
 #include <zephyr/audio/dmic.h>
 #include <zephyr/logging/log.h>
 
@@ -34,6 +35,7 @@ K_MEM_SLAB_DEFINE_STATIC(pdm_mem_slab, FRAME_BYTES, BLOCK_COUNT, 4);
  * ============================================================================ */
 
 static const struct device *dmic_dev;
+static bool dmic_configured = false;
 static bool dmic_started = false;
 
 /* Current audio buffer from dmic_read */
@@ -45,9 +47,18 @@ static void *current_block = NULL;
 
 int audio_capture_init(void)
 {
-    dmic_dev = DEVICE_DT_GET(DT_NODELABEL(dmic_dev));
+    if (dmic_configured) {
+        return 0;
+    }
+
+#ifdef DT_N_ALIAS_dmic20
+    dmic_dev = DEVICE_DT_GET(DT_ALIAS(dmic20));
+#else
+    dmic_dev = DEVICE_DT_GET(DT_NODELABEL(pdm20));
+#endif
     if (!device_is_ready(dmic_dev)) {
-        LOG_ERR("DMIC device not ready");
+        LOG_ERR("DMIC device not ready: %s", dmic_dev->name);
+        printk("!!! DMIC device not ready: %s\n", dmic_dev->name);
         return -ENODEV;
     }
 
@@ -76,16 +87,23 @@ int audio_capture_init(void)
     int ret = dmic_configure(dmic_dev, &cfg);
     if (ret < 0) {
         LOG_ERR("DMIC configure failed: %d", ret);
+        printk("!!! DMIC configure failed: %d\n", ret);
         return ret;
     }
 
+    dmic_configured = true;
     LOG_INF("Audio capture initialized: %d Hz, %d-bit, %d ch, %d ms frames",
             SAMPLE_RATE, SAMPLE_BITS, CHANNELS, FRAME_MS);
+    printk("Audio init OK: %d Hz, %d samples/frame\n", SAMPLE_RATE, FRAME_SAMPLES);
     return 0;
 }
 
 int audio_capture_start(void)
 {
+    if (!dmic_configured) {
+        return -EIO;
+    }
+
     if (dmic_started) {
         return 0;
     }
@@ -93,11 +111,24 @@ int audio_capture_start(void)
     int ret = dmic_trigger(dmic_dev, DMIC_TRIGGER_START);
     if (ret < 0) {
         LOG_ERR("DMIC start failed: %d", ret);
+        printk("!!! DMIC start failed: %d\n", ret);
         return ret;
     }
 
     dmic_started = true;
     LOG_INF("Audio capture started");
+    printk("Audio started\n");
+
+    void *discard_block = NULL;
+    uint32_t discard_size;
+
+    ret = dmic_read(dmic_dev, 0, &discard_block, &discard_size, 1000);
+    if (ret == 0 && discard_block != NULL) {
+        k_mem_slab_free(&pdm_mem_slab, discard_block);
+    } else if (ret < 0) {
+        LOG_WRN("Initial DMIC discard read failed: %d", ret);
+    }
+
     return 0;
 }
 
@@ -139,6 +170,7 @@ int audio_capture_get_data(int16_t **buffer, size_t *size)
     uint32_t read_size;
     int ret = dmic_read(dmic_dev, 0, &current_block, &read_size, 200);
     if (ret < 0) {
+        LOG_WRN("DMIC read failed: %d", ret);
         return ret;
     }
 

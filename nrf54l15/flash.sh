@@ -25,7 +25,7 @@ fi
 
 export PATH="$NCS_PATH/bin:$PATH"
 
-BOARD="nrf54l15dk/nrf54l15/cpuapp"
+BOARD="xiao_nrf54l15/nrf54l15/cpuapp"
 BUILD_DIR="$NCS_BASE/build"
 SAMPLE_DIR="$NCS_BASE/nrf/samples/voice_bridge_nrf54l15"
 
@@ -75,7 +75,7 @@ echo "This may take a few minutes..."
 echo ""
 
 cd "$NCS_BASE"
-if west build -b "$BOARD" nrf/samples/voice_bridge_nrf54l15; then
+if west build -b "$BOARD" nrf/samples/voice_bridge_nrf54l15 -- -DBOARD_ROOT="$PROJECT_DIR"; then
     echo -e "${GREEN}Build successful!${NC}"
 else
     echo -e "${RED}Build failed!${NC}"
@@ -97,8 +97,23 @@ fi
 
 echo "Hex file: $HEX_FILE"
 
-# Use system pyocd (not NCS toolchain python) to ensure nrf54l target is available
-PYOCD_CMD="$(command -v pyocd 2>/dev/null || echo "$HOME/.pyenv/shims/pyocd")"
+# Prefer a user-installed pyocd because the NCS-bundled one may not support nrf54l.
+if [ -x "$HOME/.pyenv/shims/pyocd" ]; then
+    PYOCD_CMD="$HOME/.pyenv/shims/pyocd"
+elif [ -x "/usr/local/bin/pyocd" ]; then
+    PYOCD_CMD="/usr/local/bin/pyocd"
+elif command -v pyocd >/dev/null 2>&1; then
+    PYOCD_CMD="$(command -v pyocd)"
+else
+    echo -e "${RED}pyocd not found.${NC}"
+    exit 1
+fi
+
+if ! "$PYOCD_CMD" list --targets | grep -q '^[[:space:]]*nrf54l[[:space:]]'; then
+    echo -e "${RED}Selected pyocd does not support target nrf54l: $PYOCD_CMD${NC}"
+    exit 1
+fi
+
 "$PYOCD_CMD" flash -t nrf54l "$HEX_FILE" || {
     echo -e "${RED}pyocd flash failed. Ensure the device is connected and pyocd is installed.${NC}"
     echo "  Install: pip install pyocd"
@@ -112,6 +127,6 @@ echo -e "${GREEN}============================================${NC}"
 echo ""
 echo "Next steps:"
 echo "  1. Wait a few seconds for the device to boot"
-echo "  2. Run Mac client: cd $PROJECT_DIR/mac_client && python3 voice_bridge_recorder.py"
+echo "  2. Run Mac client: cd $PROJECT_DIR/mac_client && python3 nrf54_controller.py"
 echo "  3. Press 'r' to start recording, 's' to stop"
 echo ""

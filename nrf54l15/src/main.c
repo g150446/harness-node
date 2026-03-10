@@ -9,8 +9,8 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <string.h>
 
-#include "adpcm.h"
 #include "audio_capture.h"
 
 LOG_MODULE_REGISTER(voice_bridge, LOG_LEVEL_INF);
@@ -20,7 +20,6 @@ LOG_MODULE_REGISTER(voice_bridge, LOG_LEVEL_INF);
  * ============================================================================ */
 
 #define BLE_DEVICE_NAME     "VoiceBridge"
-#define BLE_MTU             512
 
 /* Recording packet size */
 #define PCM_PACKET_SIZE     200
@@ -49,9 +48,8 @@ LOG_MODULE_REGISTER(voice_bridge, LOG_LEVEL_INF);
  * ============================================================================ */
 
 static struct bt_conn *current_conn;
-static struct bt_conn_cb conn_callbacks;
 
-static uint8_t tx_packet[256];  /* ADPCM frame + 2-byte header */
+static uint8_t tx_packet[512];  /* PCM frame + 2-byte header */
 static uint8_t seq_num = 0;
 
 /* Recording state */
@@ -62,6 +60,32 @@ static volatile bool stop_requested = false;
 /* Audio thread */
 static K_THREAD_STACK_DEFINE(audio_stack, 4096);
 static struct k_thread audio_thread_data;
+static void stream_audio_frame(const int16_t *audio_buffer, size_t audio_size);
+
+static void generate_simulated_audio(int16_t *buffer, size_t sample_count)
+{
+    static uint32_t phase;
+    const uint32_t freq = 440;
+    const uint32_t sample_rate = audio_capture_get_sample_rate();
+
+    for (size_t i = 0; i < sample_count; i++) {
+        int32_t angle = (phase & 0xFFFF) * 360 / 0x10000;
+        int32_t sample;
+
+        if (angle < 90) {
+            sample = angle * angle / 81;
+        } else if (angle < 180) {
+            sample = 16384 - (angle - 90) * (angle - 90) / 81;
+        } else if (angle < 270) {
+            sample = -(angle - 180) * (angle - 180) / 81;
+        } else {
+            sample = -16384 + (angle - 270) * (angle - 270) / 81;
+        }
+
+        buffer[i] = (int16_t)(sample * 2);
+        phase += (freq * 0x10000) / sample_rate;
+    }
+}
 
 /* ============================================================================
  * BLE GATT Service
@@ -71,6 +95,7 @@ static struct k_thread audio_thread_data;
 static void tx_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
     LOG_INF("TX CCCD updated: %d", value);
+    printk(">>> CCCD updated: %d (1=notify enabled)\n", value);
 }
 
 /* RX Write Callback */
@@ -79,19 +104,22 @@ static ssize_t rx_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                         uint8_t flags)
 {
     const uint8_t *data = buf;
-    
+
     LOG_INF("Received command: len=%d", len);
-    
+    printk(">>> RX write: len=%d\n", len);
+
     if (len >= 1) {
         if (data[0] == 0x01) {
             LOG_INF("Start recording command");
+            printk(">>> START recording command received\n");
             recording_requested = true;
         } else if (data[0] == 0x00) {
             LOG_INF("Stop recording command");
+            printk(">>> STOP recording command received\n");
             stop_requested = true;
         }
     }
-    
+
     return len;
 }
 
@@ -99,7 +127,7 @@ static ssize_t rx_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 BT_GATT_SERVICE_DEFINE(voice_bridge_svc,
     BT_GATT_PRIMARY_SERVICE(
         BT_UUID_DECLARE_128(LBS_UUID_SERVICE)),
-    
+
     /* TX Characteristic (Notify) */
     BT_GATT_CHARACTERISTIC(
         BT_UUID_DECLARE_128(LBS_UUID_TX_CHAR),
@@ -108,7 +136,7 @@ BT_GATT_SERVICE_DEFINE(voice_bridge_svc,
         NULL, NULL, NULL),
     BT_GATT_CCC(tx_ccc_cfg_changed,
                 BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
-    
+
     /* RX Characteristic (Write) */
     BT_GATT_CHARACTERISTIC(
         BT_UUID_DECLARE_128(LBS_UUID_RX_CHAR),
@@ -116,6 +144,49 @@ BT_GATT_SERVICE_DEFINE(voice_bridge_svc,
         BT_GATT_PERM_WRITE,
         NULL, rx_write, NULL),
 );
+
+static void stream_audio_frame(const int16_t *audio_buffer, size_t audio_size)
+{
+    int ret;
+    size_t total_samples = audio_size / sizeof(int16_t);
+    size_t offset = 0;
+    size_t packets_sent = 0;
+    size_t notify_errors = 0;
+
+    while (offset < total_samples) {
+        size_t samples_to_send = total_samples - offset;
+
+        if (samples_to_send > PCM_PACKET_SIZE / sizeof(int16_t)) {
+            samples_to_send = PCM_PACKET_SIZE / sizeof(int16_t);
+        }
+
+        tx_packet[0] = seq_num++;
+        tx_packet[1] = 0xAA;
+        memcpy(&tx_packet[2], &audio_buffer[offset],
+               samples_to_send * sizeof(int16_t));
+
+        ret = bt_gatt_notify(NULL, &voice_bridge_svc.attrs[2],
+                             tx_packet, 2 + (samples_to_send * sizeof(int16_t)));
+        if (ret == -ENOMEM) {
+            k_msleep(1);
+            ret = bt_gatt_notify(NULL, &voice_bridge_svc.attrs[2],
+                                 tx_packet, 2 + (samples_to_send * sizeof(int16_t)));
+        }
+
+        if (ret == 0) {
+            packets_sent++;
+        } else {
+            notify_errors++;
+            printk("!!! bt_gatt_notify error: %d\n", ret);
+        }
+
+        offset += samples_to_send;
+        k_msleep(1);
+    }
+
+    printk("Audio: %zu samples, sent %zu packets, errors %zu\n",
+           total_samples, packets_sent, notify_errors);
+}
 
 /* ============================================================================
  * Audio Streaming Thread
@@ -130,6 +201,9 @@ static void audio_thread(void *p1, void *p2, void *p3)
     int ret;
     int16_t *audio_buffer;
     size_t audio_size;
+    bool dmic_available = false;
+    bool dmic_session_active = false;
+    static int16_t sim_buffer[320];
 
     printk("Audio thread started\n");
 
@@ -137,81 +211,82 @@ static void audio_thread(void *p1, void *p2, void *p3)
     ret = audio_capture_init();
     if (ret < 0) {
         printk("Audio init failed: %d\n", ret);
-        return;
+        printk(">>> Using simulated audio data\n");
+    } else {
+        dmic_available = true;
+        printk("Audio capture initialized\n");
     }
-
-    ret = audio_capture_start();
-    if (ret < 0) {
-        printk("Audio start failed: %d\n", ret);
-        return;
-    }
-    printk("Audio capture running\n");
-
-    /*
-     * Strategy: encode PDM frame to ADPCM, send in 18-byte chunks.
-     * Each PDM frame (20ms) = 320 samples → 160 bytes ADPCM
-     * Send as 9 packets × 20 bytes (2 hdr + 18 data) with k_msleep(2).
-     * 9 packets × 2ms = 18ms send time per 20ms frame → fits real-time.
-     */
-    #define CHUNK_SIZE 18
-
-    static adpcm_state_t enc_state;
-    static uint8_t adpcm_buf[256];
-
-    adpcm_init_state(&enc_state);
 
     while (1) {
         if (recording_requested && !is_recording) {
-            is_recording = true;
             recording_requested = false;
+            stop_requested = false;
             seq_num = 0;
-            adpcm_init_state(&enc_state);
+
+            if (dmic_available) {
+                ret = audio_capture_start();
+                if (ret < 0) {
+                    printk("Audio start failed: %d\n", ret);
+                    printk(">>> Falling back to simulated audio\n");
+                    dmic_session_active = false;
+                } else {
+                    dmic_session_active = true;
+                    printk("Audio capture running\n");
+                }
+            }
+
+            is_recording = true;
+            printk("Recording started\n");
         }
 
         if (stop_requested && is_recording) {
-            is_recording = false;
             stop_requested = false;
+            is_recording = false;
+
+            if (dmic_session_active) {
+                ret = audio_capture_stop();
+                if (ret < 0) {
+                    printk("Audio stop failed: %d\n", ret);
+                }
+                dmic_session_active = false;
+            }
+
+            printk("Recording stopped\n");
         }
 
         if (is_recording && current_conn) {
-            ret = audio_capture_get_data(&audio_buffer, &audio_size);
-            if (ret == 0 && audio_buffer != NULL && audio_size > 0) {
-                size_t total_samples = audio_size / 2;
-
-                /* Encode entire frame to ADPCM */
-                size_t adpcm_len = adpcm_encode(&enc_state,
-                    audio_buffer, total_samples, adpcm_buf);
-
-                /* Send ADPCM data in small chunks */
-                size_t offset = 0;
-                while (offset < adpcm_len) {
-                    size_t chunk = adpcm_len - offset;
-                    if (chunk > CHUNK_SIZE) {
-                        chunk = CHUNK_SIZE;
-                    }
-
-                    tx_packet[0] = seq_num++;
-                    tx_packet[1] = 0xBB;
-                    memcpy(&tx_packet[2], &adpcm_buf[offset], chunk);
-
-                    ret = bt_gatt_notify(NULL,
-                        &voice_bridge_svc.attrs[2],
-                        tx_packet, 2 + chunk);
-
-                    if (ret == -ENOMEM) {
-                        k_msleep(2);
-                        ret = bt_gatt_notify(NULL,
-                            &voice_bridge_svc.attrs[2],
-                            tx_packet, 2 + chunk);
-                    }
-
-                    offset += chunk;
-                    k_msleep(2);
+            if (dmic_session_active) {
+                ret = audio_capture_get_data(&audio_buffer, &audio_size);
+                if (ret < 0) {
+                    printk("Audio read failed: %d\n", ret);
+                    printk(">>> Falling back to simulated audio\n");
+                    (void)audio_capture_stop();
+                    dmic_session_active = false;
+                    continue;
                 }
+            } else {
+                generate_simulated_audio(sim_buffer, ARRAY_SIZE(sim_buffer));
+                audio_buffer = sim_buffer;
+                audio_size = sizeof(sim_buffer);
             }
-            /* dmic_read blocks ~20ms, giving BLE stack time */
+
+            stream_audio_frame(audio_buffer, audio_size);
+            continue;
+        }
+
+        if (!current_conn && dmic_session_active) {
+            (void)audio_capture_stop();
+            dmic_session_active = false;
+        }
+
+        if (!is_recording) {
+            k_msleep(20);
         } else {
-            k_msleep(50);
+            static int debug_count = 0;
+            if (debug_count++ % 50 == 0 && !current_conn) {
+                printk("DEBUG: Not connected (current_conn=NULL)\n");
+            }
+            k_msleep(20);
         }
     }
 }
@@ -225,8 +300,10 @@ static void exchange_func(struct bt_conn *conn, uint8_t att_err,
 {
     if (att_err) {
         LOG_ERR("MTU exchange failed: %d", att_err);
+        printk(">>> MTU exchange failed: %d\n", att_err);
     } else {
         LOG_INF("MTU exchange done");
+        printk(">>> MTU exchange done\n");
     }
 }
 
@@ -238,16 +315,21 @@ static void connected(struct bt_conn *conn, uint8_t err)
 {
     if (err) {
         LOG_ERR("Connection failed: %d", err);
+        printk(">>> Connection failed: %d\n", err);
         return;
     }
 
     LOG_INF("Connected");
-    current_conn = bt_conn_ref(conn);
+    printk(">>> Connected! current_conn set\n");
+    current_conn = conn;
 
     /* Request MTU exchange */
     int ret = bt_gatt_exchange_mtu(conn, &exchange_params);
     if (ret) {
         LOG_ERR("MTU exchange request failed: %d", ret);
+        printk(">>> MTU exchange failed: %d\n", ret);
+    } else {
+        printk(">>> MTU exchange requested\n");
     }
 
     /* Request short connection interval for audio throughput */
@@ -260,29 +342,27 @@ static void connected(struct bt_conn *conn, uint8_t err)
     ret = bt_conn_le_param_update(conn, &conn_param);
     if (ret) {
         LOG_WRN("Conn param update request failed: %d", ret);
+        printk(">>> Conn param update failed: %d\n", ret);
+    } else {
+        printk(">>> Conn param update requested\n");
     }
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
     LOG_INF("Disconnected: %d", reason);
-    
-    if (current_conn) {
-        bt_conn_unref(current_conn);
-        current_conn = NULL;
-    }
-    
+    printk(">>> Disconnected: %d\n", reason);
+
+    current_conn = NULL;
+
     is_recording = false;
+    stop_requested = true;
 }
 
 static struct bt_conn_cb conn_callbacks = {
     .connected = connected,
     .disconnected = disconnected,
 };
-
-/* ============================================================================
- * BLE Initialization
- * ============================================================================ */
 
 /* ============================================================================
  * Main Application
@@ -296,6 +376,7 @@ int main(void)
     printk("============================================\n");
     printk("Voice Bridge BLE - XIAO nRF54L15 Sense\n");
     printk("============================================\n\n");
+    printk("Starting firmware build: " __DATE__ " " __TIME__ "\n");
 
     LOG_INF("Starting Voice Bridge BLE");
 
@@ -304,10 +385,12 @@ int main(void)
     ret = bt_enable(NULL);
     if (ret) {
         LOG_ERR("BLE enable failed: %d", ret);
+        printk("!!! BLE enable failed: %d\n", ret);
         return ret;
     }
 
     LOG_INF("BLE initialized");
+    printk("BLE initialized\n");
 
     /* Register connection callbacks */
     bt_conn_cb_register(&conn_callbacks);
@@ -316,8 +399,11 @@ int main(void)
     ret = bt_set_name(BLE_DEVICE_NAME);
     if (ret) {
         LOG_ERR("Failed to set name: %d", ret);
+        printk("!!! Failed to set name: %d\n", ret);
         return ret;
     }
+
+    printk("Device name: %s\n", BLE_DEVICE_NAME);
 
     /* Start advertising */
     struct bt_data adv_data[] = {
@@ -335,10 +421,12 @@ int main(void)
                           scan_rsp, ARRAY_SIZE(scan_rsp));
     if (ret) {
         LOG_ERR("Advertising failed: %d", ret);
+        printk("!!! Advertising failed: %d\n", ret);
         return ret;
     }
 
     LOG_INF("Advertising started: %s", BLE_DEVICE_NAME);
+    printk("Advertising: %s\n", BLE_DEVICE_NAME);
 
     /* Start audio thread */
     /* Priority 14: lower than BLE stack (7) to avoid starving radio */
@@ -346,6 +434,7 @@ int main(void)
                     audio_thread, NULL, NULL, NULL, 14, 0, K_NO_WAIT);
 
     LOG_INF("Voice Bridge BLE ready");
+    printk("System ready\n");
 
     /* Keep main thread alive */
     while (1) {

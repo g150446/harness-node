@@ -23,17 +23,27 @@ voice-bridge-ble/
 │   │   └── xiao_nrf52840_sense.overlay
 │   ├── prj.conf               # Zephyr config
 │   └── west.yml               # Zephyr manifest
-├── nrf54l15/                  # Zephyr firmware (nRF54L15) - NEW!
+├── nrf54l15/                  # Zephyr firmware (nRF54L15)
 │   ├── src/
-│   │   ├── main.c             # Main application with BLE Audio
-│   │   ├── adpcm.c/h          # IMA ADPCM codec
-│   │   └── audio_capture.c/h  # PDM audio capture
+│   │   ├── main.c             # BLE service + audio streaming loop
+│   │   ├── adpcm.c/h          # ADPCM codec (互換用)
+│   │   └── audio_capture.c/h  # PDM microphone capture
 │   ├── boards/
 │   │   └── xiao_nrf54l15_sense.overlay
+│   ├── README.md              # nRF54L15 implementation notes
 │   ├── prj.conf               # Zephyr config with Audio
 │   └── west.yml               # Zephyr manifest
+├── nrf54-motion/              # Zephyr IMU motion detection test for XIAO nRF54L15 Sense
+│   ├── src/
+│   │   └── main.c             # IMU wake-up / motion interrupt test
+│   ├── boards/
+│   │   ├── xiao_nrf54l15_nrf54l15_cpuapp.overlay
+│   │   └── xiao_nrf54l15_sense.overlay
+│   ├── prj.conf               # Zephyr config for the onboard LSM6DS3TR-C
+│   └── flash.sh               # Local build + pyocd flash helper
+├── boards/seeed/xiao_nrf54l15/ # Custom XIAO nRF54L15 board definition
 ├── mac_client/                # Mac Python client (shared)
-│   ├── voice_bridge_recorder.py
+│   ├── nrf54_controller.py
 │   ├── voice_bridge_client.py
 │   └── requirements.txt
 └── README.md
@@ -84,7 +94,7 @@ pip install pyocd  # 未インストールの場合
 # ビルド
 export PATH="/opt/nordic/ncs/toolchains/b8efef2ad5/bin:$PATH"
 cd /opt/nordic/ncs/v2.9.2
-west build -b nrf54l15dk/nrf54l15/cpuapp nrf/samples/voice_bridge_nrf54l15
+west build -b xiao_nrf54l15/nrf54l15/cpuapp nrf/samples/voice_bridge_nrf54l15 -- -DBOARD_ROOT=<project_dir>
 
 # フラッシュ (pyocd 経由, ターゲット名は nrf54l)
 pyocd flash -t nrf54l build/merged.hex
@@ -97,6 +107,37 @@ pyocd flash -t nrf54l build/merged.hex
 - Better audio quality with hardware PDM interface
 
 See `nrf54l15/README.md` for details.
+
+### nRF54L15 implementation overview
+
+The working nRF54L15 path now uses a custom XIAO board definition imported from newer Zephyr board support, because NCS v2.9.2 did not include the XIAO board files by default.
+
+- `boards/seeed/xiao_nrf54l15/`
+  - Defines the real XIAO nRF54L15 hardware: UART routing, fixed regulators, IMU alias, and the onboard PDM microphone pins.
+  - Uses the correct microphone pins: `P1.12` for `PDM_CLK` and `P1.13` for `PDM_DIN`.
+- `nrf54l15/src/audio_capture.c`
+  - Initializes the DMIC device through `DT_ALIAS(dmic20)`.
+  - Configures 16 kHz / 16-bit / mono capture.
+  - Starts and stops the Zephyr DMIC stream and returns PCM buffers to the BLE thread.
+- `nrf54l15/src/main.c`
+  - Exposes the custom BLE service used by the Mac client.
+  - Starts recording on BLE write `0x01`, stops on `0x00`.
+  - Streams raw PCM frames in packets formatted as `[sequence][0xAA][PCM data...]`.
+  - Falls back to a generated 440 Hz tone only if DMIC initialization or reading fails.
+- `mac_client/nrf54_controller.py`
+  - Connects over BLE, sends start/stop commands, and stores the received PCM stream as a 16 kHz WAV file.
+  - This was updated to match the firmware sample rate, so saved files now have the correct timing.
+
+### IMU motion detection test app
+
+The repository also includes `nrf54-motion/`, a standalone Zephyr app for the Seeed XIAO nRF54L15 Sense onboard LSM6DS3TR-C IMU.
+
+```bash
+cd nrf54-motion
+./flash.sh
+```
+
+The app polls `imu0` at 26 Hz, calibrates a baseline for about 2.5 seconds after boot, and then prints `Motion detected!` messages on the serial console at 115200 baud when the board is moved. Once the board becomes still again, it logs `Motion settled` and updates the baseline to the new resting orientation.
 
 ## Firmware Setup (ESP-IDF)
 
@@ -140,7 +181,7 @@ Record audio to WAV file with control:
 
 ```bash
 cd mac_client
-python3 voice_bridge_recorder.py
+python3 nrf54_controller.py
 ```
 
 Then use commands:
@@ -150,7 +191,7 @@ Then use commands:
 
 Recorded files are saved to `mac_client/output/recording_YYYYMMDD_HHMMSS.wav`.
 
-**Note**: The recording uses 24kHz/16-bit mono PCM for better quality.
+**Note**: The nRF54L15 path records and saves `16kHz / 16-bit / mono` PCM to match the firmware output.
 
 ### Real-time Playback Mode
 
@@ -186,9 +227,16 @@ python3 serial_monitor.py --reset
 - Channels: Mono
 
 ### BLE Configuration
-- MTU Size: 512 bytes
+- MTU Size: 247 bytes on the current nRF54L15 path
 - PHY: 2M PHY (for low latency)
 - Connection Interval: 7.5ms - 15ms
+
+### PCM Packet Format (nRF54L15)
+```
+Byte 0: Sequence number (0-255)
+Byte 1: Sync byte (0xAA)
+Bytes 2..N: 16-bit little-endian PCM samples
+```
 
 ### ADPCM Frame Format
 ```
@@ -200,7 +248,7 @@ Bytes 1-60: ADPCM encoded audio data (120 samples)
 
 ### Firmware Issues
 
-1. **No audio data**: Check PDM pin connections (GPIO 41/42)
+1. **No audio data on nRF54L15**: Confirm the custom XIAO board definition is being used and that the firmware is built for `xiao_nrf54l15/nrf54l15/cpuapp`
 2. **BLE connection fails**: Reset the XIAO board
 3. **Audio quality issues**: Verify sample rate configuration
 
