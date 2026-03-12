@@ -5,7 +5,12 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/uuid.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/sensor.h>
@@ -34,6 +39,86 @@ LOG_MODULE_REGISTER(nrf54_motion, LOG_LEVEL_INF);
 #define MOTION_SETTLE_WINDOWS 4
 #define BASELINE_ALPHA 0.03
 #define REPORT_COOLDOWN_MS 700
+
+/* ============================================================================
+ * BLE UUIDs
+ * ============================================================================ */
+
+/* Motion Service UUID: 00000010-0000-1000-8000-00805f9b34fb */
+#define MOTION_UUID_SERVICE \
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
+    0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00
+
+/* TX Characteristic UUID: 00000011-0000-1000-8000-00805f9b34fb (Notify) */
+#define MOTION_UUID_TX_CHAR \
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
+    0x00, 0x10, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00
+
+#define BLE_DEVICE_NAME "MotionBridge"
+
+/* ============================================================================
+ * BLE Global State
+ * ============================================================================ */
+
+static struct bt_conn *current_conn;
+
+static void tx_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    LOG_INF("TX CCCD updated: %d", value);
+}
+
+BT_GATT_SERVICE_DEFINE(motion_svc,
+    BT_GATT_PRIMARY_SERVICE(
+        BT_UUID_DECLARE_128(MOTION_UUID_SERVICE)),
+
+    /* TX Characteristic (Notify) */
+    BT_GATT_CHARACTERISTIC(
+        BT_UUID_DECLARE_128(MOTION_UUID_TX_CHAR),
+        BT_GATT_CHRC_NOTIFY,
+        BT_GATT_PERM_READ,
+        NULL, NULL, NULL),
+    BT_GATT_CCC(tx_ccc_cfg_changed,
+                BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+);
+
+static void ble_connected(struct bt_conn *conn, uint8_t err)
+{
+    if (err) {
+        LOG_ERR("BLE connection failed: %d", err);
+        return;
+    }
+    LOG_INF("BLE connected");
+    current_conn = conn;
+}
+
+static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+    LOG_INF("BLE disconnected: %d", reason);
+    current_conn = NULL;
+}
+
+static struct bt_conn_cb conn_callbacks = {
+    .connected    = ble_connected,
+    .disconnected = ble_disconnected,
+};
+
+static void notify_motion_event(uint8_t count, double activity, double peak)
+{
+    if (!current_conn) {
+        return;
+    }
+
+    uint8_t pkt[10];
+    float act_f  = (float)activity;
+    float peak_f = (float)peak;
+
+    pkt[0] = 0x01; /* event_type: motion detected */
+    pkt[1] = count;
+    memcpy(&pkt[2], &act_f,  4);
+    memcpy(&pkt[6], &peak_f, 4);
+
+    bt_gatt_notify(NULL, &motion_svc.attrs[2], pkt, sizeof(pkt));
+}
 
 static atomic_t detected_motion_count;
 
@@ -327,6 +412,8 @@ static void process_motion_sample(void)
                     delta,
                     motion_step,
                     accel_x_ms2, accel_y_ms2, accel_z_ms2);
+            notify_motion_event((uint8_t)atomic_get(&detected_motion_count),
+                                activity, peak_step);
         }
 
         return;
@@ -345,6 +432,8 @@ static void process_motion_sample(void)
                 delta,
                 motion_step,
                 accel_x_ms2, accel_y_ms2, accel_z_ms2);
+        notify_motion_event((uint8_t)atomic_get(&detected_motion_count),
+                            activity, peak_step);
     }
 
     if (activity <= MOTION_SETTLE_ACTIVITY_MS2 &&
@@ -385,6 +474,40 @@ int main(void)
         return ret;
     }
 
+    /* Initialize BLE */
+    ret = bt_enable(NULL);
+    if (ret) {
+        LOG_ERR("BLE enable failed: %d", ret);
+        return ret;
+    }
+
+    bt_conn_cb_register(&conn_callbacks);
+
+    ret = bt_set_name(BLE_DEVICE_NAME);
+    if (ret) {
+        LOG_ERR("Failed to set BLE name: %d", ret);
+        return ret;
+    }
+
+    const struct bt_data adv_data[] = {
+        BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
+        BT_DATA_BYTES(BT_DATA_UUID128_ALL,
+                      0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+                      0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00),
+    };
+
+    const struct bt_data scan_rsp[] = {
+        BT_DATA(BT_DATA_NAME_COMPLETE, BLE_DEVICE_NAME, sizeof(BLE_DEVICE_NAME) - 1),
+    };
+
+    ret = bt_le_adv_start(BT_LE_ADV_CONN, adv_data, ARRAY_SIZE(adv_data),
+                          scan_rsp, ARRAY_SIZE(scan_rsp));
+    if (ret) {
+        LOG_ERR("BLE advertising failed: %d", ret);
+        return ret;
+    }
+
+    LOG_INF("BLE advertising started: %s", BLE_DEVICE_NAME);
     LOG_INF("Waiting for motion on %s", imu->name);
 
     while (1) {
