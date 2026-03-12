@@ -11,6 +11,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "driver/uart.h"
+#include "driver/usb_serial_jtag.h"
 
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
@@ -174,6 +175,43 @@ static void request_recording_stop(const char *source)
     is_recording = false;
     stop_requested = true;
     stop_event_pending = was_recording;
+}
+
+static void emulate_single_click(const char *source)
+{
+    ESP_LOGI(TAG, "%s: Emulating single-click", source);
+    if (is_recording || recording_requested) {
+        request_recording_stop(source);
+    } else {
+        request_recording_start(source);
+    }
+}
+
+static void emulate_double_click(const char *source)
+{
+    ESP_LOGI(TAG, "%s: Emulating double-click", source);
+    if (is_recording || recording_requested) {
+        request_recording_stop(source);
+    }
+    send_status_event(EVENT_CONVERSATION_TOGGLED, "conversation_toggled");
+}
+
+static void handle_serial_command(uint8_t command, const char *source)
+{
+    if (command == 'r' || command == 'R') {
+        request_recording_start(source);
+    } else if (command == 's' || command == 'S') {
+        request_recording_stop(source);
+    } else if (command == 'c' || command == 'C' || command == '1') {
+        emulate_single_click(source);
+    } else if (command == 'd' || command == 'D' || command == '2') {
+        emulate_double_click(source);
+    } else if (command == 'h' || command == 'H') {
+        ESP_LOGI(TAG,
+                 "%s commands: 'r'=start, 's'=stop, "
+                 "'c'/'1'=single-click, 'd'/'2'=double-click, 'h'=help",
+                 source);
+    }
 }
 
 static const char *status_to_text(system_status_t status)
@@ -980,11 +1018,7 @@ static void button_task(void *pvParameters)
                 } else {
                     TickType_t click_delta = now - first_click_tick;
                     if (click_delta <= pdMS_TO_TICKS(BUTTON_DOUBLE_CLICK_MS)) {
-                        ESP_LOGI(TAG, "Button A double-click detected");
-                        if (is_recording || recording_requested) {
-                            request_recording_stop("Button A double-click");
-                        }
-                        send_status_event(EVENT_CONVERSATION_TOGGLED, "conversation_toggled");
+                        emulate_double_click("Button A double-click");
                         click_count = 0;
                         first_click_tick = 0;
                     } else {
@@ -1000,11 +1034,7 @@ static void button_task(void *pvParameters)
             click_count = 0;
             first_click_tick = 0;
 
-            if (is_recording || recording_requested) {
-                request_recording_stop("Button A");
-            } else {
-                request_recording_start("Button A");
-            }
+            emulate_single_click("Button A");
         }
 
         vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
@@ -1017,22 +1047,24 @@ static void button_task(void *pvParameters)
 
 static void uart_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "UART task started");
+    ESP_LOGI(TAG, "Serial command task started");
 
     uint8_t uart_buf[256];
+    uint8_t usb_buf[64];
 
     while (1) {
+        int usb_len = usb_serial_jtag_read_bytes(usb_buf, sizeof(usb_buf), pdMS_TO_TICKS(20));
+        if (usb_len > 0) {
+            for (int i = 0; i < usb_len; i++) {
+                handle_serial_command(usb_buf[i], "USB Serial/JTAG");
+            }
+        }
+
         int len = uart_read_bytes(UART_PORT_NUM, uart_buf, sizeof(uart_buf), pdMS_TO_TICKS(100));
 
         if (len > 0) {
             for (int i = 0; i < len; i++) {
-                if (uart_buf[i] == 'r' || uart_buf[i] == 'R') {
-                    request_recording_start("Serial");
-                } else if (uart_buf[i] == 's' || uart_buf[i] == 'S') {
-                    request_recording_stop("Serial");
-                } else if (uart_buf[i] == 'h' || uart_buf[i] == 'H') {
-                    ESP_LOGI(TAG, "Serial commands: 'r'=start, 's'=stop, 'h'=help");
-                }
+                handle_serial_command(uart_buf[i], "UART");
             }
         }
     }
@@ -1074,8 +1106,10 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    usb_serial_jtag_driver_config_t usb_serial_jtag_config = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_serial_jtag_config));
 
-    ESP_LOGI(TAG, "UART initialized");
+    ESP_LOGI(TAG, "UART and USB Serial/JTAG initialized");
 
     esp_err_t oled_ret = init_oled();
     if (oled_ret != ESP_OK) {
@@ -1121,5 +1155,7 @@ void app_main(void)
     xTaskCreate(uart_task, "uart_task", 4096, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "Voice Bridge BLE - Initialization complete");
-    ESP_LOGI(TAG, "Button A toggles real-time recording; serial commands: 'r'=start, 's'=stop, 'h'=help");
+    ESP_LOGI(TAG,
+             "Button A toggles real-time recording; serial commands: "
+             "'r'=start, 's'=stop, 'c'/'1'=single-click, 'd'/'2'=double-click, 'h'=help");
 }

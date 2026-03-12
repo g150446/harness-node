@@ -219,6 +219,18 @@ python3 serial_monitor.py --list
 python3 serial_monitor.py --reset
 ```
 
+On the Atom Echo S3R firmware, the USB serial console at `115200` baud also accepts
+simple control commands:
+
+- `r` / `R`: request recording start
+- `s` / `S`: request recording stop
+- `c` / `C` / `1`: emulate a **single-click**
+- `d` / `D` / `2`: emulate a **double-click**
+- `h` / `H`: print command help
+
+This is useful for reproducing Handy-side BLE button handling without physically
+pressing the device button.
+
 ## Technical Specifications
 
 ### Audio Format

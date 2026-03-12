@@ -349,6 +349,8 @@ async def interactive_control(client: VoiceBridgeClient):
     print("  s / stop   - Stop recording")
     print("  R / record - Start recording via serial")
     print("  S / stop_serial - Stop recording via serial")
+    print("  c / click  - Emulate single-click via serial")
+    print("  d / double - Emulate double-click via serial")
     print("  t / status - Show status")
     print("  q / quit   - Quit")
     print()
@@ -377,10 +379,14 @@ async def interactive_control(client: VoiceBridgeClient):
                 client.start_recording()
             elif command in ['s', 'stop']:
                 client.stop_recording()
-            elif command in ['R', 'record']:
+            elif command in ['record', 'serial_start']:
                 client.send_serial_command('r')
-            elif command in ['S', 'stop_serial']:
+            elif command in ['stop_serial', 'serial_stop']:
                 client.send_serial_command('s')
+            elif command in ['c', 'click', 'single']:
+                client.send_serial_command('c')
+            elif command in ['d', 'double', 'double_click']:
+                client.send_serial_command('d')
             elif command in ['t', 'status']:
                 client.print_stats()
                 if client.recorder.is_recording:
