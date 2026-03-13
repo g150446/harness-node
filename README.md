@@ -32,7 +32,9 @@ voice-bridge-ble/
 │   │   ├── xiao_nrf54l15_nrf54l15_cpuapp.overlay
 │   │   └── xiao_nrf54l15_sense.overlay
 │   ├── prj.conf               # Zephyr config for the onboard LSM6DS3TR-C
-│   └── flash.sh               # Local build + pyocd flash helper
+│   ├── build_and_flash.sh     # Build + USB flash + OTA payload helper
+│   ├── build_and_package_ota.sh # Build + OTA payload helper (no USB flash)
+│   └── flash.sh               # Compatibility wrapper to build_and_flash.sh
 ├── boards/seeed/xiao_nrf54l15/ # Custom XIAO nRF54L15 board definition
 ├── mac_client/                # Mac Python client (shared)
 │   ├── nrf54_controller.py
@@ -126,7 +128,7 @@ The repository also includes `nrf54-motion/`, a standalone Zephyr app for the Se
 
 ```bash
 cd nrf54-motion
-./flash.sh
+./build_and_flash.sh
 ```
 
 The app polls `imu0` at 26 Hz, calibrates a baseline for about 2.5 seconds after boot, and then prints `Motion detected!` messages on the serial console at 115200 baud when the board is moved. Once the board becomes still again, it logs `Motion settled` and updates the baseline to the new resting orientation.
@@ -138,7 +140,6 @@ The app polls `imu0` at 26 Hz, calibrates a baseline for about 2.5 seconds after
 #### Prerequisites
 
 - NCS v2.9.2
-- `pyocd`
 - Python environment with `bleak`
 - `cbor2` for `mac_client/ota_updater.py`
 
@@ -149,16 +150,33 @@ python3 -m venv ../venv  # if needed
 ../venv/bin/pip install cbor2
 ```
 
-#### Basic OTA flow
+#### Case 1: the device does not yet have OTA-capable firmware
 
-1. Flash a baseline firmware over USB:
+Use USB once to install the OTA-capable firmware and generate the first OTA payload:
+
+- Requires `pyocd`
 
 ```bash
 cd nrf54-motion
-./flash.sh
+./build_and_flash.sh
 ```
 
-This builds with sysbuild + MCUboot, flashes `merged.hex`, and refreshes `nrf54-motion/ota_update.bin`.
+This command builds with sysbuild + MCUboot, flashes `merged.hex` over USB via `pyocd`, and refreshes `nrf54-motion/ota_update.bin`.
+
+After that initial USB step, later updates can use BLE OTA only.
+
+#### Case 2: the device already has OTA-capable firmware
+
+1. Build a new OTA payload without USB flashing:
+
+- `pyocd` is not required for this step
+
+```bash
+cd nrf54-motion
+./build_and_package_ota.sh
+```
+
+This command only rebuilds the firmware and refreshes `nrf54-motion/ota_update.bin`. It does **not** flash over USB.
 
 2. Make the firmware newer than the running image.
 
@@ -190,6 +208,9 @@ The `Build Info` characteristic UUID is `00000012-0000-1000-8000-00805f9b34fb`. 
 
 - OTA support described here is for `nrf54-motion/`, not `nrf54l15/`.
 - The updater currently performs upload + test boot request + reset. It does not automatically reconnect after reboot to confirm the new image.
+- Use `build_and_flash.sh` only for USB provisioning / recovery.
+- Use `build_and_package_ota.sh` when the board already has OTA-capable firmware and you only need a new OTA payload.
+- `nrf54-motion/flash.sh` still works, but it is now only a compatibility wrapper around `build_and_flash.sh`.
 - For implementation details and maintenance notes, see `docs/nrf54l15_ota_guide.md` and `docs/nrf54l15_ota_status.md`.
 
 ## Firmware Setup (ESP-IDF)

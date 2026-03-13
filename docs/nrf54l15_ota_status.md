@@ -137,6 +137,9 @@ nrf54-motion/
 ├── prj.conf                   # MCUmgr/SMP, MTU拡張, SETTINGS等
 ├── sysbuild.conf              # SB_CONFIG_BOOTLOADER_MCUBOOT=y
 ├── pm_static.yml              # パーティションレイアウト
+├── build_and_flash.sh         # USB導入用: build + pyocd flash + OTA payload更新
+├── build_and_package_ota.sh   # OTA継続更新用: build + OTA payload更新
+├── flash.sh                   # 互換ラッパー (build_and_flash.shへ委譲)
 ├── sysbuild/
 │   └── mcuboot/
 │       ├── prj.conf           # (空)
@@ -165,6 +168,28 @@ mac_client/
 ---
 
 ## OTA スクリプトの使い方
+
+### すでに OTA 対応ファームが入っている場合
+
+```bash
+cd nrf54-motion
+./build_and_package_ota.sh
+
+cd ../mac_client
+venv/bin/pip install cbor2
+venv/bin/python3 ota_updater.py ../nrf54-motion/ota_update.bin
+```
+
+### まだ OTA 対応ファームが入っていない場合
+
+```bash
+cd nrf54-motion
+./build_and_flash.sh
+```
+
+その後、以降の更新は上の OTA 手順に切り替える。
+
+### OTA 実行コマンド
 
 ```bash
 cd mac_client

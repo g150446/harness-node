@@ -29,6 +29,8 @@ nrf54-motion/
 ├── prj.conf
 ├── sysbuild.conf
 ├── pm_static.yml
+├── build_and_flash.sh
+├── build_and_package_ota.sh
 ├── flash.sh
 ├── ota_update.bin
 └── sysbuild/mcuboot/
@@ -55,13 +57,23 @@ The Build Info characteristic returns `__DATE__ " " __TIME__` from the running f
 
 ## Build artifacts
 
-`nrf54-motion/flash.sh` is the recommended entrypoint.
+There are now two recommended entrypoints, depending on what you need to do.
 
-It performs all of the following:
+### USB provisioning / recovery
 
-1. Builds with sysbuild and MCUboot enabled
-2. Flashes `merged.hex` over CMSIS-DAP / `pyocd`
-3. Copies the signed OTA payload to `nrf54-motion/ota_update.bin`
+`nrf54-motion/build_and_flash.sh`
+
+- builds with sysbuild and MCUboot enabled
+- flashes `merged.hex` over CMSIS-DAP / `pyocd`
+- refreshes `nrf54-motion/ota_update.bin`
+
+### OTA payload generation only
+
+`nrf54-motion/build_and_package_ota.sh`
+
+- builds with sysbuild and MCUboot enabled
+- refreshes `nrf54-motion/ota_update.bin`
+- does **not** flash over USB
 
 Important artifacts:
 
@@ -82,16 +94,27 @@ python3 -m venv ../venv  # if needed
 
 `cbor2` is required by `ota_updater.py`.
 
-### 2. Flash a known baseline over USB
+### Case A: board is not yet OTA-capable
+
+Flash a known baseline over USB first:
 
 ```bash
 cd nrf54-motion
-./flash.sh
+./build_and_flash.sh
 ```
 
-This ensures MCUboot and the baseline application image are in a known-good state before trying OTA.
+This ensures MCUboot and the baseline OTA-capable application image are in a known-good state before trying BLE OTA.
 
-### 3. Create the OTA image
+After this one-time provisioning step, later updates can use the OTA-only packaging path below.
+
+### Case B: board is already OTA-capable
+
+Create the OTA image without USB flashing:
+
+```bash
+cd nrf54-motion
+./build_and_package_ota.sh
+```
 
 Make your firmware change, then rebuild so that `nrf54-motion/ota_update.bin` reflects the new image.
 
@@ -209,13 +232,16 @@ For this target, build success alone is not enough. OTA-related changes should b
 
 When touching OTA-related code, verify at least these points:
 
-1. `flash.sh` still produces a signed OTA image
-2. the app still advertises as `MotionBridge`
-3. the SMP characteristic is present
-4. upload reaches 100%
-5. `Image test flag set.` appears
-6. the board reboots
-7. Build Info changes to the new image
+1. `build_and_package_ota.sh` still produces a signed OTA image without USB flashing
+2. `build_and_flash.sh` still reaches the USB flash path when needed
+3. the app still advertises as `MotionBridge`
+4. the SMP characteristic is present
+5. upload reaches 100%
+6. `Image test flag set.` appears
+7. the board reboots
+8. Build Info changes to the new image
+
+`flash.sh` is retained as a compatibility wrapper so older docs or habits do not break immediately, but it maps to the USB-flashing path (`build_and_flash.sh`), not the OTA-only packaging path.
 
 ## Related documents
 
