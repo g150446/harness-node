@@ -124,13 +124,14 @@ static struct bt_conn_cb conn_callbacks = {
     .disconnected = ble_disconnected,
 };
 
-static void notify_motion_event(uint8_t count, double activity, double peak)
+static void notify_motion_event(uint8_t count, double activity, double peak,
+                                uint32_t elapsed_time_ms)
 {
     if (!current_conn) {
         return;
     }
 
-    uint8_t pkt[10];
+    uint8_t pkt[14];
     float act_f  = (float)activity;
     float peak_f = (float)peak;
 
@@ -138,11 +139,14 @@ static void notify_motion_event(uint8_t count, double activity, double peak)
     pkt[1] = count;
     memcpy(&pkt[2], &act_f,  4);
     memcpy(&pkt[6], &peak_f, 4);
+    memcpy(&pkt[10], &elapsed_time_ms, 4);
 
     bt_gatt_notify(NULL, &motion_svc.attrs[2], pkt, sizeof(pkt));
 }
 
 static atomic_t detected_motion_count;
+
+static uint32_t last_motion_time_ms;
 
 static bool baseline_valid;
 static double baseline_x;
@@ -301,6 +305,7 @@ static void accumulate_calibration(double accel_x, double accel_y, double accel_
         previous_sample_valid = true;
         reset_step_window();
         last_report_ms = k_uptime_get();
+        last_motion_time_ms = 0;
     }
 }
 
@@ -427,15 +432,19 @@ static void process_motion_sample(void)
             last_report_ms = now_ms;
             atomic_inc(&detected_motion_count);
             pulse_led();
-            LOG_INF("Motion detected! count=%d activity=%.3f peak=%.3f delta=%.3f step=%.3f accel=(%.3f, %.3f, %.3f) m/s^2",
+            uint32_t elapsed_ms = (last_motion_time_ms == 0) ? 0 :
+                                  (now_ms - last_motion_time_ms);
+            LOG_INF("Motion detected! count=%d elapsed=%u ms activity=%.3f peak=%.3f delta=%.3f step=%.3f accel=(%.3f, %.3f, %.3f) m/s^2",
                     (int)atomic_get(&detected_motion_count),
+                    elapsed_ms,
                     activity,
                     peak_step,
                     delta,
                     motion_step,
                     accel_x_ms2, accel_y_ms2, accel_z_ms2);
             notify_motion_event((uint8_t)atomic_get(&detected_motion_count),
-                                activity, peak_step);
+                                activity, peak_step, elapsed_ms);
+            last_motion_time_ms = now_ms;
         }
 
         return;
@@ -447,15 +456,19 @@ static void process_motion_sample(void)
         last_report_ms = now_ms;
         atomic_inc(&detected_motion_count);
         pulse_led();
-        LOG_INF("Motion detected! count=%d activity=%.3f peak=%.3f delta=%.3f step=%.3f accel=(%.3f, %.3f, %.3f) m/s^2",
+        uint32_t elapsed_ms = (last_motion_time_ms == 0) ? 0 :
+                              (now_ms - last_motion_time_ms);
+        LOG_INF("Motion detected! count=%d elapsed=%u ms activity=%.3f peak=%.3f delta=%.3f step=%.3f accel=(%.3f, %.3f, %.3f) m/s^2",
                 (int)atomic_get(&detected_motion_count),
+                elapsed_ms,
                 activity,
                 peak_step,
                 delta,
                 motion_step,
                 accel_x_ms2, accel_y_ms2, accel_z_ms2);
         notify_motion_event((uint8_t)atomic_get(&detected_motion_count),
-                            activity, peak_step);
+                            activity, peak_step, elapsed_ms);
+        last_motion_time_ms = now_ms;
     }
 
     if (activity <= MOTION_SETTLE_ACTIVITY_MS2 &&

@@ -5,11 +5,12 @@ MotionBridge BLE receiver.
 Connects to a MotionBridge device and prints motion events received
 via BLE notifications.
 
-Packet format (10 bytes):
-  [0]   event_type : 0x01 = motion detected
-  [1]   count      : uint8, wraps at 255
-  [2:6] activity   : float32 LE
-  [6:10] peak      : float32 LE
+Packet format (14 bytes):
+  [0]    event_type : 0x01 = motion detected
+  [1]    count      : uint8, wraps at 255
+  [2:6]  activity   : float32 LE
+  [6:10] peak       : float32 LE
+  [10:14] elapsed_ms: uint32 LE (milliseconds since last motion event)
 """
 
 import asyncio
@@ -24,16 +25,17 @@ TX_CHAR_UUID     = "00000011-0000-1000-8000-00805f9b34fb"
 
 
 def handle_notification(sender, data: bytearray) -> None:
-    if len(data) < 10:
+    if len(data) < 14:
         print(f"[WARN] Short packet ({len(data)} bytes): {data.hex()}")
         return
 
     event_type, count = data[0], data[1]
     activity, = struct.unpack_from("<f", data, 2)
     peak,     = struct.unpack_from("<f", data, 6)
+    elapsed_ms, = struct.unpack_from("<I", data, 10)
 
     if event_type == 0x01:
-        print(f"[MOTION] count={count:3d}  activity={activity:.3f}  peak={peak:.3f}")
+        print(f"[MOTION] count={count:3d}  elapsed={elapsed_ms:6d} ms  activity={activity:.3f}  peak={peak:.3f}")
     else:
         print(f"[UNKNOWN event=0x{event_type:02x}] {data.hex()}")
 
