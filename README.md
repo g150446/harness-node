@@ -15,14 +15,6 @@ voice-bridge-ble/
 │   ├── main.c                 # Main application
 │   ├── adpcm.c/h              # IMA ADPCM codec
 │   └── CMakeLists.txt
-├── nrf52840/                  # Zephyr firmware (nRF52840)
-│   ├── src/
-│   │   ├── main.c             # Main application
-│   │   └── adpcm.c/h          # IMA ADPCM codec
-│   ├── boards/
-│   │   └── xiao_nrf52840_sense.overlay
-│   ├── prj.conf               # Zephyr config
-│   └── west.yml               # Zephyr manifest
 ├── nrf54l15/                  # Zephyr firmware (nRF54L15)
 │   ├── src/
 │   │   ├── main.c             # BLE service + audio streaming loop
@@ -51,7 +43,7 @@ voice-bridge-ble/
 
 ## Hardware Requirements
 
-- **Seeed Studio XIAO ESP32S3 Sense** or **XIAO nRF52840 Sense** or **XIAO nRF54L15 Sense**
+- **Seeed Studio XIAO ESP32S3 Sense**  or **XIAO nRF54L15 Sense**
 - **Mac** with Bluetooth 5.0 support
 
 ## Quick Start
@@ -138,6 +130,67 @@ cd nrf54-motion
 ```
 
 The app polls `imu0` at 26 Hz, calibrates a baseline for about 2.5 seconds after boot, and then prints `Motion detected!` messages on the serial console at 115200 baud when the board is moved. Once the board becomes still again, it logs `Motion settled` and updates the baseline to the new resting orientation.
+
+### nRF54L15 BLE OTA update (`nrf54-motion`)
+
+`nrf54-motion/` supports BLE OTA using MCUboot + MCUmgr/SMP. The OTA target device name is `MotionBridge`.
+
+#### Prerequisites
+
+- NCS v2.9.2
+- `pyocd`
+- Python environment with `bleak`
+- `cbor2` for `mac_client/ota_updater.py`
+
+```bash
+cd mac_client
+python3 -m venv ../venv  # if needed
+../venv/bin/pip install -r requirements.txt
+../venv/bin/pip install cbor2
+```
+
+#### Basic OTA flow
+
+1. Flash a baseline firmware over USB:
+
+```bash
+cd nrf54-motion
+./flash.sh
+```
+
+This builds with sysbuild + MCUboot, flashes `merged.hex`, and refreshes `nrf54-motion/ota_update.bin`.
+
+2. Make the firmware newer than the running image.
+
+In practice, change the firmware, or rebuild after your intended modifications so the generated signed image differs from the version already running on the board. The firmware exposes a Build Info GATT characteristic, so the build timestamp can be used to verify the switch after reboot.
+
+3. Run the OTA updater:
+
+```bash
+cd mac_client
+../venv/bin/python3 ota_updater.py ../nrf54-motion/ota_update.bin
+```
+
+Expected successful tail output:
+
+```text
+Upload complete in ...
+Querying image state...
+Setting image test flag...
+Image test flag set.
+Sending reset command...
+Device reset. MCUboot will swap slots on next boot.
+```
+
+4. Verify that the device came back on the new image.
+
+The `Build Info` characteristic UUID is `00000012-0000-1000-8000-00805f9b34fb`. Read it before and after OTA to confirm that the build timestamp changed.
+
+#### Notes
+
+- OTA support described here is for `nrf54-motion/`, not `nrf54l15/`.
+- The updater currently performs upload + test boot request + reset. It does not automatically reconnect after reboot to confirm the new image.
+- For implementation details and maintenance notes, see `docs/nrf54l15_ota_guide.md` and `docs/nrf54l15_ota_status.md`.
 
 ## Firmware Setup (ESP-IDF)
 

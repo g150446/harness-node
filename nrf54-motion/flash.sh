@@ -47,7 +47,10 @@ PYOCD_CMD=""
 for _p in "$HOME/.pyenv/shims/pyocd" "/usr/local/bin/pyocd"; do
     [ -x "$_p" ] && PYOCD_CMD="$_p" && break
 done
-command -v pyocd >/dev/null 2>&1 && PYOCD_CMD="$(command -v pyocd)"
+# fall back to PATH only when no explicit path found (avoids old NCS toolchain pyocd)
+if [ -z "$PYOCD_CMD" ]; then
+    command -v pyocd >/dev/null 2>&1 && PYOCD_CMD="$(command -v pyocd)"
+fi
 if [ -z "$PYOCD_CMD" ]; then
     echo "ERROR: pyocd not found. Install with: pip install pyocd" >&2
     exit 1
@@ -57,7 +60,7 @@ fi
 echo "Building $BOARD -> $BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 cd "$NCS_BASE"
-eval "$WEST" build -p always -b "$BOARD" "$APP_DIR" \
+eval "$WEST" build -p always --sysbuild -b "$BOARD" "$APP_DIR" \
     --build-dir "$BUILD_DIR" \
     -- -DBOARD_ROOT="$PROJECT_DIR"
 
@@ -75,6 +78,15 @@ if [ ! -f "$HEX_FILE" ]; then
 fi
 echo "Flashing $HEX_FILE with $PYOCD_CMD"
 "$PYOCD_CMD" flash -t nrf54l "$HEX_FILE"
+
+# --- OTA image ----------------------------------------------------------
+OTA_BIN="$BUILD_DIR/nrf54-motion/zephyr/zephyr.signed.bin"
+if [ -f "$OTA_BIN" ]; then
+    cp "$OTA_BIN" "$APP_DIR/ota_update.bin"
+    echo "OTA image: $APP_DIR/ota_update.bin ($(wc -c < "$APP_DIR/ota_update.bin") bytes)"
+else
+    echo "Note: $OTA_BIN not found (MCUboot not enabled or sysbuild not used)"
+fi
 
 echo ""
 echo "Flash complete. Open a serial monitor at 115200 baud:"

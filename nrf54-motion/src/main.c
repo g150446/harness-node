@@ -54,11 +54,26 @@ LOG_MODULE_REGISTER(nrf54_motion, LOG_LEVEL_INF);
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
     0x00, 0x10, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00
 
+/* Build Info Characteristic UUID: 00000012-0000-1000-8000-00805f9b34fb (Read) */
+#define MOTION_UUID_BUILD_INFO_CHAR \
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
+    0x00, 0x10, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00
+
 #define BLE_DEVICE_NAME "MotionBridge"
 
 /* ============================================================================
  * BLE Global State
  * ============================================================================ */
+
+/* Build timestamp embedded at compile time for OTA verification */
+static const char build_timestamp[] = __DATE__ " " __TIME__;
+
+static ssize_t read_build_info(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                               void *buf, uint16_t len, uint16_t offset)
+{
+    return bt_gatt_attr_read(conn, attr, buf, len, offset,
+                             build_timestamp, strlen(build_timestamp));
+}
 
 static struct bt_conn *current_conn;
 
@@ -79,6 +94,13 @@ BT_GATT_SERVICE_DEFINE(motion_svc,
         NULL, NULL, NULL),
     BT_GATT_CCC(tx_ccc_cfg_changed,
                 BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+
+    /* Build Info Characteristic (Read) - compile-time date/time for OTA verification */
+    BT_GATT_CHARACTERISTIC(
+        BT_UUID_DECLARE_128(MOTION_UUID_BUILD_INFO_CHAR),
+        BT_GATT_CHRC_READ,
+        BT_GATT_PERM_READ,
+        read_build_info, NULL, NULL),
 );
 
 static void ble_connected(struct bt_conn *conn, uint8_t err)
@@ -457,7 +479,7 @@ int main(void)
 {
     int ret;
 
-    LOG_INF("XIAO nRF54L15 Sense motion detection test starting");
+    LOG_INF("XIAO nRF54L15 Sense motion detection v2 OTA (build: %s)", build_timestamp);
 
     if (!device_is_ready(imu)) {
         LOG_ERR("IMU device %s is not ready", imu->name);
