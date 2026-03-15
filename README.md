@@ -25,6 +25,17 @@ voice-bridge-ble/
 │   ├── README.md              # nRF54L15 implementation notes
 │   ├── prj.conf               # Zephyr config with Audio
 │   └── west.yml               # Zephyr manifest
+├── nrf52-motion/              # Zephyr IMU motion detection + BLE OTA for XIAO nRF52840 Sense
+│   ├── src/
+│   │   └── main.c             # IMU motion detection + BLE notify + MCUmgr OTA
+│   ├── boards/
+│   │   └── xiao_ble_nrf52840_sense.overlay
+│   ├── sysbuild/mcuboot/      # MCUboot configuration for nested boot at 0x27000
+│   ├── prj.conf               # Zephyr config (BLE, MCUmgr, USB CDC ACM)
+│   ├── sysbuild.conf          # SB_CONFIG_BOOTLOADER_MCUBOOT=y
+│   ├── pm_static.yml          # Flash partition layout (MCUboot + OTA slots)
+│   ├── build_and_flash.sh     # Initial UF2 flash (MCUboot + app merged)
+│   └── build_and_package_ota.sh  # Build OTA binary only (no USB flash)
 ├── nrf54-motion/              # Zephyr IMU motion detection test for XIAO nRF54L15 Sense
 │   ├── src/
 │   │   └── main.c             # IMU wake-up / motion interrupt test
@@ -121,6 +132,68 @@ The working nRF54L15 path now uses a custom XIAO board definition imported from 
 - `mac_client/nrf54_controller.py`
   - Connects over BLE, sends start/stop commands, and stores the received PCM stream as a 16 kHz WAV file.
   - This was updated to match the firmware sample rate, so saved files now have the correct timing.
+
+### nRF52840 IMU motion detection + BLE OTA (`nrf52-motion`)
+
+`nrf52-motion/` は Seeed XIAO nRF52840 Sense 向けの Zephyr アプリです。`nrf54-motion/` と同じモーション検出・BLE Notify 機能に加え、MCUboot + MCUmgr/SMP による BLE OTA ファームウェア更新に対応しています。
+
+#### 初回フラッシュ（MCUboot + アプリを UF2 で書き込み）
+
+nRF52840 Sense は Adafruit UF2 ブートローダを使用します。MCUboot は Adafruit がジャンプする 0x27000 に配置されます。初回プロビジョニングでは、MCUboot + 署名済みアプリの merged UF2 を UF2 ドライブ経由で書き込みます。
+
+```bash
+cd nrf52-motion
+./build_and_flash.sh   # sysbuild ビルド後、XIAO-SENSE ドライブを待って自動コピー
+```
+
+リセットボタンをダブルタップして UF2 ブートローダに入ると (XIAO-SENSE ドライブが出現)、スクリプトが自動でフラッシュします。
+
+#### BLE OTA アップデート
+
+OTA 対応ファームウェアが稼働中の場合、以降の更新は BLE のみで完結します。
+
+**前準備（初回のみ）:**
+
+```bash
+cd mac_client
+python3 -m venv ../venv
+../venv/bin/pip install -r requirements.txt
+../venv/bin/pip install cbor2
+```
+
+**OTA バイナリをビルド:**
+
+```bash
+cd nrf52-motion
+./build_and_package_ota.sh   # ビルドして ota_update.bin を生成
+```
+
+OTA バイナリのバージョンは稼働中のファームウェアより新しくする必要があります。`prj.conf` の `CONFIG_MCUBOOT_IMGTOOL_SIGN_VERSION` を更新してからビルドしてください（例: `"0.0.2+0"`）。
+
+**BLE 経由で送信:**
+
+```bash
+cd mac_client
+../venv/bin/python3 ota_updater.py ../nrf52-motion/ota_update.bin
+```
+
+正常終了時の出力例:
+
+```text
+Scanning for 'MotionBridge'...
+Found: <address>
+Connected. MTU=244
+Upload complete in ~104s
+Querying image state...
+Setting image test flag...
+Image test flag set.
+Sending reset command...
+Device reset. MCUboot will swap slots on next boot.
+```
+
+デバイスが自動的に再起動して新しいファームウェアで動作します。転送速度は約 2 KB/s（217 KB イメージで約 104 秒）。
+
+実装詳細とトラブルシューティングは `docs/nrf52_ota_guide.md` を参照してください。
 
 ### IMU motion detection test app
 

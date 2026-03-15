@@ -1,0 +1,58 @@
+/*
+ * Device Tree Overlay for Seeed Studio XIAO nRF52840 Sense
+ *
+ * DTS partition IDs are auto-assigned in address order. We add partitions
+ * so that slot0_partition and slot1_partition receive DTS IDs that match
+ * the PM flash area IDs (PM_MCUBOOT_PRIMARY_ID=3, PM_MCUBOOT_SECONDARY_ID=6).
+ *
+ * Complete sorted partition list → DTS IDs:
+ *   0x00000 sd_partition        → 0  (board DTS)
+ *   0x27000 code_partition      → 1  (board DTS)
+ *   0x2f000 mcuboot_pad_part   → 2  = PM_MCUBOOT_PAD_ID(2)    [NEW]
+ *   0x33000 slot0_partition     → 3  = PM_MCUBOOT_PRIMARY_ID(3)[NEW] ← MCUmgr slot0
+ *   0x33200 app_part            → 4  = PM_APP_ID(4)             [NEW]
+ *   0x34000 primary_app_part    → 5  = PM_MCUBOOT_PRIMARY_APP(5)[NEW]
+ *   0x85000 slot1_partition     → 6  = PM_MCUBOOT_SECONDARY_ID(6)[NEW] ← MCUmgr slot1
+ *   0xec000 storage_partition   → 7  = PM_SETTINGS_STORAGE_ID(7)[board DTS]
+ *   0xf4000 boot_partition      → 8  = PM_ADAFRUIT_BOOT_ID(8)   [board DTS]
+ */
+
+/ {
+    aliases {
+        imu0 = &lsm6ds3tr_c;
+    };
+};
+
+&flash0 {
+    partitions {
+        /* ID 2 — matches PM_MCUBOOT_PAD_ID = 2 */
+        mcuboot_pad_part: partition@2f000 {
+            label = "mcuboot-pad";
+            reg = <0x2f000 0x200>;
+        };
+
+        /* ID 3 — matches PM_MCUBOOT_PRIMARY_ID = 3 → used by MCUmgr as slot 0 */
+        slot0_partition: partition@33000 {
+            label = "image-0";
+            reg = <0x33000 0x52000>;
+        };
+
+        /* ID 4 — matches PM_APP_ID = 4 */
+        app_part: partition@33200 {
+            label = "app";
+            reg = <0x33200 0x51e00>;
+        };
+
+        /* ID 5 — matches PM_MCUBOOT_PRIMARY_APP_ID = 5 */
+        primary_app_part: partition@34000 {
+            label = "mcuboot-primary-app";
+            reg = <0x34000 0x51000>;
+        };
+
+        /* ID 6 — matches PM_MCUBOOT_SECONDARY_ID = 6 → used by MCUmgr as slot 1 */
+        slot1_partition: partition@85000 {
+            label = "image-1";
+            reg = <0x85000 0x52000>;
+        };
+    };
+};

@@ -1,0 +1,8 @@
+# Partition Manager configuration for XIAO nRF52840 Sense
+# Reserve 0x0-0x27000 (156 KB) for the Adafruit UF2 bootloader's MBR/softdevice area,
+# so the app is placed at 0x27000 (code_partition) with the correct VMA.
+softdevice:
+  placement:
+    before: [app]
+  size: 0x27000
+  region: flash_primary
