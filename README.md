@@ -4,7 +4,7 @@ Bidirectional BLE Audio Streaming for XIAO Boards.
 
 Supports:
 - **XIAO ESP32S3 Sense** (ESP-IDF)
-- **XIAO nRF52840 Sense** (Zephyr/NCS)
+- **XIAO nRF52840 Sense** (Zephyr/NCS) — `nrf52-voice`（音声+モーション+OTA）
 - **XIAO nRF54L15 Sense** (Zephyr/NCS) - Latest!
 
 ## Project Structure
@@ -25,6 +25,19 @@ voice-bridge-ble/
 │   ├── README.md              # nRF54L15 implementation notes
 │   ├── prj.conf               # Zephyr config with Audio
 │   └── west.yml               # Zephyr manifest
+├── nrf52-voice/               # Zephyr 音声+モーション+OTA for XIAO nRF52840 Sense (VoiceBridge52)
+│   ├── src/
+│   │   ├── main.c             # BLE audio/motion service + motion→audio制御
+│   │   ├── audio_capture.c/h  # PDM マイク（RIGHT ch, mic電源有効）
+│   │   ├── adpcm.c/h          # ADPCM コーデック
+│   ├── boards/
+│   │   └── xiao_ble_nrf52840_sense.overlay  # PDM + IMU + マイク電源 + フラッシュパーティション
+│   ├── sysbuild/mcuboot/      # MCUboot 設定
+│   ├── prj.conf               # Zephyr 設定（BLE, Audio, MCUmgr, USB CDC ACM）
+│   ├── sysbuild.conf          # SB_CONFIG_BOOTLOADER_MCUBOOT=y
+│   ├── pm_static.yml          # フラッシュパーティション定義
+│   ├── build_and_flash.sh     # 初回 UF2 フラッシュ
+│   └── build_and_package_ota.sh  # OTA バイナリ生成
 ├── nrf52-motion/              # Zephyr IMU motion detection + BLE OTA for XIAO nRF52840 Sense
 │   ├── src/
 │   │   └── main.c             # IMU motion detection + BLE notify + MCUmgr OTA
@@ -48,6 +61,8 @@ voice-bridge-ble/
 │   └── flash.sh               # Compatibility wrapper to build_and_flash.sh
 ├── boards/seeed/xiao_nrf54l15/ # Custom XIAO nRF54L15 board definition
 ├── mac_client/                # Mac Python client (shared)
+│   ├── nrf52_voice_client.py  # VoiceBridge52 クライアント（手動/自動録音）
+│   ├── ota_updater.py         # BLE OTA アップデータ（VoiceBridge52 / nRF52840 用）
 │   ├── nrf54_controller.py
 │   ├── voice_bridge_client.py
 │   └── requirements.txt
@@ -65,19 +80,51 @@ voice-bridge-ble/
 
 See `esp32s3/` or the ESP-IDF section below.
 
-### For XIAO nRF52840 Sense
+### For XIAO nRF52840 Sense — VoiceBridge52 (`nrf52-voice`)
+
+PDM マイク音声 + LSM6DS3TR-C モーション検出 + BLE OTA を統合したファームウェアです。モーション検出が音声録音を自動でトリガーします。
+
+#### 初回フラッシュ（MCUboot + アプリを UF2 で書き込み）
 
 ```bash
-cd nrf52840
-west init -l .
-cd ..
-west update
-cd nrf52840
-west build -b xiao_nrf52840_sense
-west flash
+cd nrf52-voice
+./build_and_flash.sh
 ```
 
-See `nrf52840/README.md` for details.
+XIAO をリセットボタンダブルタップで UF2 ブートローダに入れると自動でフラッシュされます。
+
+#### BLE OTA アップデート（2回目以降）
+
+```bash
+cd nrf52-voice
+./build_and_package_ota.sh           # OTA バイナリをビルド
+
+cd mac_client
+source venv/bin/activate
+python3 ota_updater.py ../nrf52-voice/ota_update.bin
+```
+
+#### Mac クライアントで接続・録音
+
+```bash
+cd mac_client
+source venv/bin/activate
+python3 nrf52_voice_client.py
+```
+
+コマンド一覧:
+
+| コマンド | 動作 |
+|----------|------|
+| `r` | 手動録音開始（BLE start コマンド送信） |
+| `s` | 手動録音停止 |
+| `a` | 自動モード ON/OFF（モーション検出で録音開始/停止） |
+| `t` | ステータス表示（受信パケット数、ロス率など） |
+| `q` | 終了 |
+
+録音ファイルは `mac_client/output/nrf52voice_YYYYMMDD_HHMMSS.wav` に保存されます（16kHz / 16bit / モノラル）。
+
+詳細は `docs/nrf52_voice_guide.md` を参照してください。
 
 ### For XIAO nRF54L15 Sense (Latest - Recommended)
 

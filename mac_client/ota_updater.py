@@ -15,7 +15,7 @@ import time
 import cbor2
 from bleak import BleakClient, BleakScanner
 
-DEVICE_NAME = "MotionBridge"
+DEVICE_NAME = "VoiceBridge52"
 
 # SMP BLE service / characteristic UUIDs
 SMP_SERVICE_UUID   = "8D53DC1D-1DB7-4CD3-868B-8A527460AA84"
@@ -49,6 +49,7 @@ class SMPClient:
         self._seq = 0
         self._response: asyncio.Future | None = None
         self._buf: bytes = b""
+        self._loop = asyncio.get_event_loop()
 
     def _on_notify(self, _handle, data: bytearray) -> None:
         if not self._response or self._response.done():
@@ -59,9 +60,15 @@ class SMPClient:
             cbor_len = struct.unpack(">H", self._buf[2:4])[0]
             total_expected = SMP_HEADER_SIZE + cbor_len
             if len(self._buf) >= total_expected:
-                self._response.set_result(self._buf[:total_expected])
+                result = self._buf[:total_expected]
+                # thread-safe set_result (bleak on macOS uses a separate CB thread)
+                try:
+                    self._loop.call_soon_threadsafe(self._response.set_result, result)
+                except Exception:
+                    pass
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()   # capture the actual running loop
         await self._client.start_notify(SMP_CHAR_UUID, self._on_notify)
 
     async def send(self, op: int, group: int, cmd_id: int, payload_dict: dict) -> dict:
@@ -69,9 +76,8 @@ class SMPClient:
         frame = make_smp_frame(op, group, self._seq, cmd_id, payload)
         self._seq = (self._seq + 1) & 0xFF
 
-        loop = asyncio.get_event_loop()
         self._buf = b""
-        self._response = loop.create_future()
+        self._response = self._loop.create_future()
         await self._client.write_gatt_char(SMP_CHAR_UUID, frame, response=False)
 
         raw = await asyncio.wait_for(self._response, timeout=30.0)
@@ -102,6 +108,7 @@ async def ota_update(bin_path: str) -> None:
         print(f"Connected. MTU={client.mtu_size}", flush=True)
         smp = SMPClient(client)
         await smp.start()
+        await asyncio.sleep(0.5)  # wait for CCCD write to be acknowledged
 
         # ATT write-without-response payload = MTU - 3 (ATT header)
         # SMP frame header = 8 bytes
