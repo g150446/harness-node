@@ -10,9 +10,9 @@ This is compatible with the nRF54L15 firmware that sends PCM data
 """
 
 import asyncio
+import argparse
 import logging
 import os
-import struct
 import sys
 import wave
 import time
@@ -34,12 +34,15 @@ except ImportError:
 # ============================================================================
 
 # BLE Device name
-DEVICE_NAME = "VoiceBridge"
+DEVICE_NAME = "SpeakerBridge"
 
 # BLE Service and Characteristic UUIDs
-SERVICE_UUID = "00000000-0000-0000-0000-000000000000"
-TX_CHARACTERISTIC_UUID = "00000002-0000-1000-8000-00805f9b34fb"  # XIAO -> Mac (Notify)
-RX_CHARACTERISTIC_UUID = "00000003-0000-1000-8000-00805f9b34fb"  # Mac -> XIAO (Write)
+# The Zephyr source encodes these UUIDs as little-endian bytes, but the canonical
+# UUID strings exposed by CoreBluetooth/Bleak use the standard big-endian form.
+SERVICE_UUID = "00000010-0000-1000-8000-00805f9b34fb"
+TX_CHARACTERISTIC_UUID = "00000011-0000-1000-8000-00805f9b34fb"    # XIAO -> Mac (Notify)
+BUILD_INFO_CHARACTERISTIC_UUID = "00000012-0000-1000-8000-00805f9b34fb"
+PLAY_CHARACTERISTIC_UUID = "00000013-0000-1000-8000-00805f9b34fb"  # Mac -> XIAO (Write 0x01)
 
 # BLE configuration
 BLE_MTU_SIZE = 512
@@ -191,16 +194,37 @@ class VoiceBridgeClient:
         self._packets_received = 0
         self._serial_port: Optional[serial.Serial] = None
 
+    async def _device_has_service(self, address: str) -> bool:
+        """Connect briefly and check whether the device exposes the expected service UUID."""
+        try:
+            async with BleakClient(address, timeout=8.0) as client:
+                services = await client.get_services()
+                service_uuids = {service.uuid.lower() for service in services}
+                return SERVICE_UUID.lower() in service_uuids
+        except Exception as exc:
+            logger.debug(f"Service probe failed for {address}: {exc}")
+            return False
+
     async def find_device(self) -> Optional[str]:
         """Find the Voice Bridge device."""
         logger.info(f"Scanning for device: {self.device_name}")
 
-        devices = await BleakScanner.discover(timeout=5.0)
+        devices = await BleakScanner.discover(timeout=8.0, return_adv=True)
+        probe_candidates = []
 
-        for device in devices:
-            if device.name == self.device_name:
-                logger.info(f"Found device: {device.address}")
+        for _, (device, adv) in devices.items():
+            local_name = device.name or adv.local_name or ""
+            service_uuids = {uuid.lower() for uuid in (adv.service_uuids or [])}
+            if local_name == self.device_name or SERVICE_UUID.lower() in service_uuids:
+                logger.info(f"Found device: {device.address} ({local_name or 'unnamed'})")
                 return device.address
+            probe_candidates.append((device.address, local_name))
+
+        for address, local_name in probe_candidates:
+            logger.info(f"Probing {address} ({local_name or 'unnamed'}) for service {SERVICE_UUID}")
+            if await self._device_has_service(address):
+                logger.info(f"Found device by service probe: {address}")
+                return address
 
         logger.error("Device not found")
         return None
@@ -230,6 +254,14 @@ class VoiceBridgeClient:
 
         # Wait for BLE to stabilize
         await asyncio.sleep(0.5)
+
+    async def send_play_command(self):
+        """Trigger speaker playback via BLE."""
+        if not self.client or not self.client.is_connected:
+            raise RuntimeError("BLE client is not connected")
+
+        await self.client.write_gatt_char(PLAY_CHARACTERISTIC_UUID, bytes([0x01]), response=True)
+        logger.info("Sent speaker play command via BLE")
 
     async def disconnect(self):
         """Disconnect from the device."""
@@ -350,6 +382,7 @@ async def interactive_control(client: VoiceBridgeClient):
     print("\nCommands:")
     print("  r / start  - Start recording")
     print("  s / stop   - Stop recording")
+    print("  p / play   - Trigger speaker playback via BLE")
     print("  R / record - Start recording via serial")
     print("  S / stop_serial - Stop recording via serial")
     print("  t / status - Show status")
@@ -380,6 +413,8 @@ async def interactive_control(client: VoiceBridgeClient):
                 client.start_recording()
             elif command in ['s', 'stop']:
                 client.stop_recording()
+            elif command in ['p', 'play']:
+                await client.send_play_command()
             elif command in ['R', 'record']:
                 client.send_serial_command('r')
             elif command in ['S', 'stop_serial']:
@@ -410,6 +445,18 @@ async def interactive_control(client: VoiceBridgeClient):
 
 async def main():
     """Main entry point."""
+    parser = argparse.ArgumentParser(description="Control the nrf54 SpeakerBridge BLE firmware")
+    parser.add_argument(
+        "--play-once",
+        action="store_true",
+        help="Connect, send the BLE speaker playback command once, then exit.",
+    )
+    parser.add_argument(
+        "--address",
+        help="Explicit CoreBluetooth device identifier to connect to instead of scanning.",
+    )
+    args = parser.parse_args()
+
     print("=" * 60)
     print("Voice Bridge BLE - Mac Client (nRF54L15)")
     print("=" * 60)
@@ -419,13 +466,18 @@ async def main():
 
     try:
         # Find device
-        address = await client.find_device()
+        address = args.address or await client.find_device()
         if not address:
             print("Device not found. Make sure XIAO is powered and advertising.")
             return
 
         # Connect
         await client.connect(address)
+
+        if args.play_once:
+            await client.send_play_command()
+            await asyncio.sleep(0.5)
+            return
 
         # Start interactive control
         await interactive_control(client)
