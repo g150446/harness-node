@@ -61,7 +61,8 @@ voice-bridge-ble/
 │   └── flash.sh               # Compatibility wrapper to build_and_flash.sh
 ├── boards/seeed/xiao_nrf54l15/ # Custom XIAO nRF54L15 board definition
 ├── mac_client/                # Mac Python client (shared)
-│   ├── nrf52_voice_client.py  # VoiceBridge52 クライアント（手動/自動録音）
+│   ├── nrf52_voice_client.py  # VoiceBridge52 クライアント（手動/自動録音、ジェスチャー判別）
+│   ├── gesture_collector.py   # ジェスチャーデータ収集ツール（ARM_LIFT / DOUBLE_CLENCH）
 │   ├── ota_updater.py         # BLE OTA アップデータ（VoiceBridge52 / nRF52840 用）
 │   ├── nrf54_controller.py
 │   ├── voice_bridge_client.py
@@ -82,7 +83,7 @@ See `esp32s3/` or the ESP-IDF section below.
 
 ### For XIAO nRF52840 Sense — VoiceBridge52 (`nrf52-voice`)
 
-PDM マイク音声 + LSM6DS3TR-C モーション検出 + BLE OTA を統合したファームウェアです。モーション検出が音声録音を自動でトリガーします。
+PDM マイク音声 + LSM6DS3TR-C モーション検出 + ジェスチャー判別 + BLE OTA を統合したファームウェアです。**ARM_LIFT**（腕を持ち上げる）と **DOUBLE_CLENCH**（ダブルクレンチ）を IMU の wakeup パターンで判別します。
 
 #### 初回フラッシュ（MCUboot + アプリを UF2 で書き込み）
 

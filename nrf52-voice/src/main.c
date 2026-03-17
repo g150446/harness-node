@@ -18,7 +18,10 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/hwinfo.h>
+#include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/watchdog.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
@@ -38,6 +41,9 @@ LOG_MODULE_REGISTER(nrf52_voice, LOG_LEVEL_INF);
 #define MOTION_AUDIO_COOLDOWN_MS    2000
 
 /* IMU / motion detection */
+#define WDT_NODE                    DT_NODELABEL(wdt0)
+#define WDT_TIMEOUT_MS              5000
+
 #define IMU_NODE                    DT_ALIAS(imu0)
 #define LED0_NODE                   DT_ALIAS(led0)
 #define ACCEL_ODR_HZ                26
@@ -90,6 +96,11 @@ LOG_MODULE_REGISTER(nrf52_voice, LOG_LEVEL_INF);
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
     0x00, 0x10, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00
 
+/* Wakeup TX: 00000013-... (Notify) */
+#define MOTION_UUID_TAP_TX_CHAR \
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
+    0x00, 0x10, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00
+
 /* ============================================================================
  * Global Variables
  * ============================================================================ */
@@ -126,6 +137,23 @@ static int64_t last_audio_transition_ms;
 static K_THREAD_STACK_DEFINE(audio_stack, 4096);
 static struct k_thread audio_thread_data;
 
+/* I2C / wakeup detection */
+#define LSM6DS3_I2C_NODE        DT_BUS(DT_NODELABEL(lsm6ds3tr_c))
+#define LSM6DS3_I2C_ADDR        0x6a
+
+#define LSM6DS3_REG_WAKE_UP_SRC     0x1B
+#define LSM6DS3_REG_TAP_CFG         0x58
+#define LSM6DS3_REG_WAKE_UP_THS     0x5B
+#define LSM6DS3_REG_WAKE_UP_DUR     0x5C
+#define LSM6DS3_REG_MD1_CFG         0x5E
+
+static const struct device *const i2c_bus = DEVICE_DT_GET(LSM6DS3_I2C_NODE);
+static atomic_t detected_wakeup_count;
+
+/* Watchdog */
+static const struct device *const wdt = DEVICE_DT_GET(WDT_NODE);
+static int wdt_channel_id = -1;
+
 /* Motion detection state */
 static const struct device *const imu = DEVICE_DT_GET(IMU_NODE);
 static atomic_t detected_motion_count;
@@ -140,10 +168,16 @@ static double previous_accel_x, previous_accel_y, previous_accel_z;
 static double step_window[ACTIVITY_WINDOW_SAMPLES];
 static uint8_t step_window_index, step_window_count;
 static double step_window_sum;
+static double z_excursion_peak;  /* peak |z - baseline_z| during current motion event */
 
 #if DT_NODE_HAS_STATUS(LED0_NODE, okay)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 #endif
+
+/* Microphone power enable (P1.10, active-high) */
+#define MIC_PWR_NODE DT_NODELABEL(msm261d3526hicpm_c_en)
+static const struct gpio_dt_spec mic_pwr =
+    GPIO_DT_SPEC_GET(MIC_PWR_NODE, enable_gpios);
 
 /* ============================================================================
  * Build Info Characteristic
@@ -207,6 +241,11 @@ static void motion_tx_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t 
     LOG_INF("Motion TX CCCD updated: %d", value);
 }
 
+static void wakeup_tx_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    LOG_INF("Wakeup TX CCCD updated: %d", value);
+}
+
 BT_GATT_SERVICE_DEFINE(motion_svc,
     BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_128(MOTION_UUID_SERVICE)),
 
@@ -214,27 +253,52 @@ BT_GATT_SERVICE_DEFINE(motion_svc,
         BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_READ, NULL, NULL, NULL),
     BT_GATT_CCC(motion_tx_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 
+    BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(MOTION_UUID_TAP_TX_CHAR),
+        BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_READ, NULL, NULL, NULL),
+    BT_GATT_CCC(wakeup_tx_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+
     BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(MOTION_UUID_BUILD_INFO_CHAR),
         BT_GATT_CHRC_READ, BT_GATT_PERM_READ, read_build_info, NULL, NULL),
 );
 
+/* axes: bit2=Z, bit1=Y, bit0=X (from WAKE_UP_SRC) */
+static void notify_wakeup_event(uint8_t axes, uint8_t count)
+{
+    if (!current_conn) {
+        return;
+    }
+    uint8_t pkt[2] = { axes, count };
+    bt_gatt_notify(NULL, &motion_svc.attrs[5], pkt, sizeof(pkt));
+}
+
 /* event_type: 0x01 = motion active, 0x00 = motion settled */
+/* Packet (18 bytes):
+ *   [0]    event_type
+ *   [1]    count
+ *   [2-5]  activity (float)
+ *   [6-9]  peak (float)
+ *   [10-13] elapsed_ms (uint32)
+ *   [14-17] z_excursion_peak (float) — max |z − baseline_z| during this motion
+ */
 static void notify_motion_event(uint8_t event_type, uint8_t count,
-                                double activity, double peak, uint32_t elapsed_ms)
+                                double activity, double peak, uint32_t elapsed_ms,
+                                double z_excursion)
 {
     if (!current_conn) {
         return;
     }
 
-    uint8_t pkt[14];
-    float act_f = (float)activity;
+    uint8_t pkt[18];
+    float act_f  = (float)activity;
     float peak_f = (float)peak;
+    float zexc_f = (float)z_excursion;
 
     pkt[0] = event_type;
     pkt[1] = count;
-    memcpy(&pkt[2], &act_f, 4);
-    memcpy(&pkt[6], &peak_f, 4);
+    memcpy(&pkt[2],  &act_f,    4);
+    memcpy(&pkt[6],  &peak_f,   4);
     memcpy(&pkt[10], &elapsed_ms, 4);
+    memcpy(&pkt[14], &zexc_f,   4);
 
     bt_gatt_notify(NULL, &motion_svc.attrs[2], pkt, sizeof(pkt));
 }
@@ -270,6 +334,52 @@ static void on_motion_settled(void)
 }
 
 /* ============================================================================
+ * Reset Cause & Watchdog
+ * ============================================================================ */
+
+static void log_reset_cause(void)
+{
+    uint32_t cause = 0;
+
+    hwinfo_get_reset_cause(&cause);
+    hwinfo_clear_reset_cause();
+
+    printk("Reset cause: 0x%08x", cause);
+    if (cause & RESET_WATCHDOG)   printk(" [WATCHDOG — firmware hang]");
+    if (cause & RESET_BROWNOUT)   printk(" [BROWNOUT — low voltage/battery]");
+    if (cause & RESET_PIN)        printk(" [PIN — external reset]");
+    if (cause & RESET_SOFTWARE)   printk(" [SOFTWARE]");
+    if (cause & RESET_CPU_LOCKUP) printk(" [CPU_LOCKUP]");
+    if (cause & RESET_POR)        printk(" [POR — power-on]");
+    if (cause == 0)               printk(" [POR — power-on / battery removed]");
+    printk("\n");
+}
+
+static void configure_watchdog(void)
+{
+    if (!device_is_ready(wdt)) {
+        LOG_WRN("WDT not ready — firmware hang detection disabled");
+        return;
+    }
+    struct wdt_timeout_cfg cfg = {
+        .flags = WDT_FLAG_RESET_SOC,
+        .window = { .min = 0U, .max = WDT_TIMEOUT_MS },
+    };
+    wdt_channel_id = wdt_install_timeout(wdt, &cfg);
+    if (wdt_channel_id < 0) {
+        LOG_ERR("WDT install failed: %d", wdt_channel_id);
+        return;
+    }
+    /* Pause WDT when halted by debugger so single-stepping doesn't trigger reset */
+    if (wdt_setup(wdt, WDT_OPT_PAUSE_HALTED_BY_DBG) < 0) {
+        LOG_ERR("WDT setup failed");
+        return;
+    }
+    LOG_INF("WDT armed: %d ms timeout", WDT_TIMEOUT_MS);
+    printk("Watchdog armed (%d ms)\n", WDT_TIMEOUT_MS);
+}
+
+/* ============================================================================
  * LED
  * ============================================================================ */
 
@@ -293,6 +403,29 @@ static void pulse_led(void)
     k_msleep(80);
     gpio_pin_set_dt(&led, 0);
 #endif
+}
+
+static int configure_mic_power(void)
+{
+    if (!gpio_is_ready_dt(&mic_pwr)) {
+        LOG_ERR("Mic power GPIO not ready");
+        return -ENODEV;
+    }
+    /* Start with mic OFF; audio thread powers it on when recording starts */
+    return gpio_pin_configure_dt(&mic_pwr, GPIO_OUTPUT_INACTIVE);
+}
+
+static void mic_power_on(void)
+{
+    gpio_pin_set_dt(&mic_pwr, 1);
+    k_msleep(50);   /* wait for MEMS bias to stabilise */
+    printk("Mic power ON\n");
+}
+
+static void mic_power_off(void)
+{
+    gpio_pin_set_dt(&mic_pwr, 0);
+    printk("Mic power OFF\n");
 }
 
 /* ============================================================================
@@ -386,6 +519,41 @@ static void accumulate_calibration(double x, double y, double z)
     }
 }
 
+static int configure_wakeup_detection(void)
+{
+    if (!device_is_ready(i2c_bus)) {
+        LOG_ERR("I2C bus not ready");
+        return -ENODEV;
+    }
+
+    /* TAP_CFG: INTERRUPTS_ENABLE=1 (required for wakeup events to propagate) */
+    i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_TAP_CFG,     0x80);
+    /* WAKE_UP_THS: WK_THS=4 → 4 × (2g/64) = 125 mg threshold */
+    i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_WAKE_UP_THS, 0x04);
+    /* WAKE_UP_DUR: 1 sample at 26 Hz ≈ 38 ms (most responsive) */
+    i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_WAKE_UP_DUR, 0x00);
+    /* MD1_CFG: INT1_WU (bit5) only */
+    i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_MD1_CFG,     0x20);
+
+    printk("Wakeup configured (125mg threshold)\n");
+    return 0;
+}
+
+static void check_wakeup_src(void)
+{
+    uint8_t wu_src = 0;
+    if (i2c_reg_read_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_WAKE_UP_SRC, &wu_src) < 0) {
+        return;
+    }
+    if (!(wu_src & BIT(3))) {           /* WU_IA: no wakeup activity */
+        return;
+    }
+    uint8_t axes = wu_src & 0x07;       /* bit2=Z, bit1=Y, bit0=X */
+    uint8_t count = (uint8_t)(atomic_inc(&detected_wakeup_count) + 1);
+    printk(">>> Wakeup! axes=0x%02x count=%u\n", axes, count);
+    notify_wakeup_event(axes, count);
+}
+
 static int configure_motion_detection(void)
 {
     struct sensor_value odr = {ACCEL_ODR_HZ, 0};
@@ -452,32 +620,36 @@ static void process_motion_sample(void)
             settle_count = 0;
             active_high_count = 0;
             last_report_ms = now;
+            z_excursion_peak = abs_double(z - baseline_z);
             atomic_inc(&detected_motion_count);
             pulse_led();
 
             uint32_t elapsed = last_motion_time_ms ? (uint32_t)(now - last_motion_time_ms) : 0;
-            LOG_INF("Motion! count=%d elapsed=%u ms activity=%.3f peak=%.3f",
-                    (int)atomic_get(&detected_motion_count), elapsed, activity, peak);
+            LOG_INF("Motion! count=%d elapsed=%u ms activity=%.3f peak=%.3f z_exc=%.3f",
+                    (int)atomic_get(&detected_motion_count), elapsed, activity, peak, z_excursion_peak);
             notify_motion_event(0x01, (uint8_t)atomic_get(&detected_motion_count),
-                                activity, peak, elapsed);
+                                activity, peak, elapsed, z_excursion_peak);
             last_motion_time_ms = now;
-
-            on_motion_started();
         }
         return;
     }
 
-    /* Motion is active */
+    /* Motion is active — update running z_excursion_peak */
+    double z_dev = abs_double(z - baseline_z);
+    if (z_dev > z_excursion_peak) {
+        z_excursion_peak = z_dev;
+    }
+
     if ((activity >= MOTION_CONTINUE_ACTIVITY_MS2 || peak >= MOTION_CONTINUE_PEAK_MS2) &&
         (now - last_report_ms) >= REPORT_COOLDOWN_MS) {
         last_report_ms = now;
         atomic_inc(&detected_motion_count);
         pulse_led();
         uint32_t elapsed = last_motion_time_ms ? (uint32_t)(now - last_motion_time_ms) : 0;
-        LOG_INF("Motion! count=%d elapsed=%u ms activity=%.3f peak=%.3f",
-                (int)atomic_get(&detected_motion_count), elapsed, activity, peak);
+        LOG_INF("Motion! count=%d elapsed=%u ms activity=%.3f peak=%.3f z_exc=%.3f",
+                (int)atomic_get(&detected_motion_count), elapsed, activity, peak, z_excursion_peak);
         notify_motion_event(0x01, (uint8_t)atomic_get(&detected_motion_count),
-                            activity, peak, elapsed);
+                            activity, peak, elapsed, z_excursion_peak);
         last_motion_time_ms = now;
     }
 
@@ -496,9 +668,7 @@ static void process_motion_sample(void)
 
         uint32_t elapsed = last_motion_time_ms ? (uint32_t)(k_uptime_get() - last_motion_time_ms) : 0;
         notify_motion_event(0x00, (uint8_t)atomic_get(&detected_motion_count),
-                            activity, peak, elapsed);
-
-        on_motion_settled();
+                            activity, peak, elapsed, z_excursion_peak);
     }
 }
 
@@ -577,9 +747,11 @@ static void audio_thread(void *p1, void *p2, void *p3)
             seq_num = 0;
 
             if (dmic_available) {
+                mic_power_on();
                 ret = audio_capture_start();
                 if (ret < 0) {
                     printk("Audio start failed: %d\n", ret);
+                    mic_power_off();
                     dmic_session_active = false;
                 } else {
                     dmic_session_active = true;
@@ -600,6 +772,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
                 if (ret < 0) {
                     printk("Audio stop failed: %d\n", ret);
                 }
+                mic_power_off();
                 dmic_session_active = false;
             }
 
@@ -622,6 +795,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
 
         if (!current_conn && dmic_session_active) {
             (void)audio_capture_stop();
+            mic_power_off();
             dmic_session_active = false;
         }
 
@@ -713,6 +887,8 @@ int main(void)
     printk("Build: %s\n", build_timestamp);
     printk("============================================\n\n");
 
+    log_reset_cause();
+
     LOG_INF("Starting VoiceBridge52");
 
     if (!device_is_ready(imu)) {
@@ -723,8 +899,14 @@ int main(void)
     ret = configure_led();
     if (ret < 0) LOG_WRN("LED setup failed: %d", ret);
 
+    ret = configure_mic_power();
+    if (ret < 0) LOG_WRN("Mic power GPIO setup failed: %d", ret);
+
     ret = configure_motion_detection();
     if (ret < 0) return ret;
+
+    ret = configure_wakeup_detection();
+    if (ret < 0) LOG_WRN("Wakeup detection setup failed: %d", ret);
 
     ret = bt_enable(NULL);
     if (ret) { LOG_ERR("BLE enable failed: %d", ret); return ret; }
@@ -764,10 +946,17 @@ int main(void)
         }
     }
 
-    /* Main loop: poll IMU */
+    /* Arm watchdog after image confirmation — main loop must kick every POLL_INTERVAL_MS */
+    configure_watchdog();
+
+    /* Main loop: poll IMU and check tap events */
     while (1) {
         k_sleep(K_MSEC(POLL_INTERVAL_MS));
+        if (wdt_channel_id >= 0) {
+            wdt_feed(wdt, wdt_channel_id);
+        }
         process_motion_sample();
+        check_wakeup_src();
     }
 
     return 0;

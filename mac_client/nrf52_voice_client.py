@@ -38,6 +38,7 @@ AUDIO_RX_UUID = "00000003-0000-1000-8000-00805f9b34fb"  # Write
 
 # Motion Service UUIDs
 MOTION_TX_UUID = "00000011-0000-1000-8000-00805f9b34fb"  # Notify
+WAKEUP_TX_UUID = "00000013-0000-1000-8000-00805f9b34fb"  # Notify
 
 BLE_MTU_SIZE = 512
 
@@ -137,6 +138,40 @@ class WAVRecorder:
 # BLE Client
 # ============================================================================
 
+# ============================================================================
+# Gesture Classifier
+# ============================================================================
+#
+# 判別ロジック（gesture_collector.py の実測データから導出）
+#
+# 判別アルゴリズム（SETTLED時に評価）:
+#
+#   ダブルクレンチ: 2回目のクレンチがMOTION ACTIVE検出より後に来る
+#     → ACTIVE後にwakeupが1回以上発生する
+#
+#   arm_lift: 腕を持ち上げる動作でwakeupが複数発生することがあるが、
+#     それらはすべてACTIVEの前（動作開始時の同一モーションから）
+#     → ACTIVE後にwakeupは発生しない
+#
+def classify_gesture(activity: float, peak: float,
+                     z_excursion: float = 0.0,
+                     wakeups_after_active: int = 0) -> str:
+    """
+    Returns: "ARM_LIFT" | "DOUBLE_CLENCH"
+
+    判定ロジック（SETTLED時のみ呼び出す）:
+      MOTION ACTIVE受信後にwakeupが1回以上あれば DOUBLE_CLENCH。
+      arm_liftではACTIVE後にwakeupは発生しない。
+    """
+    if wakeups_after_active >= 1:
+        return "DOUBLE_CLENCH"
+    return "ARM_LIFT"
+
+
+# ============================================================================
+# BLE Client
+# ============================================================================
+
 class VoiceBridge52Client:
     def __init__(self):
         self.client: Optional[BleakClient] = None
@@ -149,6 +184,17 @@ class VoiceBridge52Client:
         # Auto mode: motion triggers recording
         self.auto_mode = False
 
+        # Disconnect tracking (battery death vs firmware crash)
+        self._connect_time: Optional[float] = None
+        self._disconnect_time: Optional[float] = None
+        self._address: Optional[str] = None
+
+        # Gesture classification state
+        self._last_wakeup_axes: int = 0
+        self._last_wakeup_time: float = 0.0
+        self._wakeup_log: list = []          # [timestamp, ...] — all wakeup times
+        self._motion_start_time: Optional[float] = None  # time of first ACTIVE in gesture
+
     async def find_device(self) -> Optional[str]:
         print(f"Scanning for '{DEVICE_NAME}'...")
         devices = await BleakScanner.discover(timeout=5.0)
@@ -159,16 +205,32 @@ class VoiceBridge52Client:
         print("  Device not found.")
         return None
 
+    def _on_disconnected(self, client: "BleakClient"):
+        elapsed = time.time() - (self._connect_time or time.time())
+        self._disconnect_time = time.time()
+        self.is_connected = False
+        print(f"\n  [DISCONNECT] After {elapsed:.0f}s connected")
+        if self.recorder.is_recording:
+            self.recorder.stop_recording()
+
     async def connect(self, address: str):
         print(f"Connecting to {address}...")
-        self.client = BleakClient(address, mtu_size=BLE_MTU_SIZE, timeout=10.0)
+        self._address = address
+        self.client = BleakClient(
+            address,
+            mtu_size=BLE_MTU_SIZE,
+            timeout=10.0,
+            disconnected_callback=self._on_disconnected,
+        )
         await self.client.connect()
+        self._connect_time = time.time()
         self.is_connected = True
         print(f"  Connected (MTU={self.client.mtu_size})")
 
         await self.client.start_notify(AUDIO_TX_UUID, self._on_audio)
         await self.client.start_notify(MOTION_TX_UUID, self._on_motion)
-        print("  Notifications enabled (audio + motion)")
+        await self.client.start_notify(WAKEUP_TX_UUID, self._on_wakeup)
+        print("  Notifications enabled (audio + motion + wakeup)")
         await asyncio.sleep(0.5)
 
     async def disconnect(self):
@@ -176,6 +238,7 @@ class VoiceBridge52Client:
             try:
                 await self.client.stop_notify(AUDIO_TX_UUID)
                 await self.client.stop_notify(MOTION_TX_UUID)
+                await self.client.stop_notify(WAKEUP_TX_UUID)
             except Exception:
                 pass
             await self.client.disconnect()
@@ -204,9 +267,28 @@ class VoiceBridge52Client:
         activity = struct.unpack_from('<f', data, 2)[0]
         peak = struct.unpack_from('<f', data, 6)[0]
         elapsed_ms = struct.unpack_from('<I', data, 10)[0]
+        z_excursion = struct.unpack_from('<f', data, 14)[0] if len(data) >= 18 else 0.0
 
         state = "ACTIVE" if event_type == 0x01 else "SETTLED"
-        print(f"  [MOTION {state}] count={count} activity={activity:.2f} peak={peak:.2f} elapsed={elapsed_ms}ms")
+
+        if event_type == 0x01:
+            # Record start of gesture (first ACTIVE only)
+            if self._motion_start_time is None:
+                self._motion_start_time = time.time()
+            print(f"  [MOTION {state}] count={count} activity={activity:.2f} peak={peak:.2f} "
+                  f"z_exc={z_excursion:.2f} elapsed={elapsed_ms}ms")
+        else:
+            # SETTLED: count wakeups that arrived AFTER the first ACTIVE event
+            if self._motion_start_time is not None:
+                wakeups_after_active = sum(1 for t in self._wakeup_log
+                                           if t > self._motion_start_time)
+            else:
+                wakeups_after_active = 0
+            gesture = classify_gesture(activity, peak, z_excursion, wakeups_after_active)
+            print(f"  [MOTION {state}] count={count} activity={activity:.2f} peak={peak:.2f} "
+                  f"z_exc={z_excursion:.2f} elapsed={elapsed_ms}ms "
+                  f"wakeups_after={wakeups_after_active} → [{gesture}]")
+            self._motion_start_time = None
 
         if self.auto_mode:
             if event_type == 0x01 and not self.recorder.is_recording:
@@ -225,6 +307,24 @@ class VoiceBridge52Client:
                         await self.client.write_gatt_char(AUDIO_RX_UUID, bytes([0x00]))
                 except Exception as e:
                     logger.error(f"BLE stop failed: {e}")
+
+    def _on_wakeup(self, sender, data: bytes):
+        if len(data) < 2:
+            return
+        axes = data[0]
+        count = data[1]
+        now = time.time()
+        self._last_wakeup_axes = axes
+        self._last_wakeup_time = now
+        self._wakeup_log.append(now)
+        # Trim entries older than 15s
+        self._wakeup_log = [t for t in self._wakeup_log if now - t < 15.0]
+        axis_str = "".join([
+            "Z" if axes & 0x04 else "",
+            "Y" if axes & 0x02 else "",
+            "X" if axes & 0x01 else "",
+        ]) or "?"
+        print(f"  [WAKEUP] axes={axis_str} count={count}")
 
     async def _send_ble_start(self):
         try:
@@ -326,7 +426,38 @@ async def main():
             return
 
         await client.connect(address)
-        await interactive_control(client)
+
+        # Run interactive control; it exits on 'q' or when the connection drops
+        control_task = asyncio.create_task(interactive_control(client))
+
+        # Wait for either the user quitting or an unexpected disconnect
+        while not control_task.done():
+            if not client.is_connected:
+                print("  [RECONNECT] Waiting for device to reappear...")
+                control_task.cancel()
+                try:
+                    await control_task
+                except asyncio.CancelledError:
+                    pass
+
+                # Poll until device reappears (battery recharge / reboot)
+                reconnect_address = None
+                while reconnect_address is None:
+                    await asyncio.sleep(3.0)
+                    print(f"  [RECONNECT] Scanning for '{DEVICE_NAME}'...")
+                    try:
+                        reconnect_address = await client.find_device()
+                    except Exception:
+                        pass
+
+                gap = time.time() - (client._disconnect_time or time.time())
+                print(f"  [RECONNECT] Device found after {gap:.0f}s offline — reconnecting")
+                await client.connect(reconnect_address)
+                control_task = asyncio.create_task(interactive_control(client))
+
+            await asyncio.sleep(0.5)
+
+        await control_task  # propagate any exception
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
