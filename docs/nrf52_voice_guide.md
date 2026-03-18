@@ -138,7 +138,7 @@ BLE 切断時   → audio_capture_stop()
 2. `TILT` 通知の `since_wakeup < 2000ms` なら「有効な TILT」とみなす。
 3. 直近 `2000ms` 以内に `DOUBLE_CLENCH` があり、かつ有効な `TILT` が来たら録音開始。
 4. 録音開始後 `5000ms` は停止トリガーを無視する。
-5. 録音開始後 `2000ms` 未満では最低録音時間のため停止しない。
+5. 録音開始後 `1000ms` 未満では最低録音時間のため停止しない。
 6. `5000ms` 経過後に `MOTION ACTIVE` が来ると録音停止。
 
 ### 運用上の注意
@@ -252,7 +252,7 @@ TILT_WAKEUP_MAX_MS = 2000
 DOUBLE_CLENCH_TILT_MAX_MS = 2000
 GESTURE_EVENT_RETENTION_S = 5.0
 RECORDING_WAKEUP_GRACE_MS = 5000
-MIN_RECORDING_DURATION_MS = 2000
+MIN_RECORDING_DURATION_MS = 1000
 ```
 
 ---

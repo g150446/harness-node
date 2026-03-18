@@ -129,7 +129,7 @@ python3 nrf52_voice_client.py
 - `DOUBLE_CLENCH` は `MOTION ACTIVE` の後に最初の `WAKEUP` が来た時点で即時認識。
 - `TILT` は `since_wakeup < 2000ms` のときだけ「有効な TILT」として扱う。
 - 直近 `2000ms` 以内の `DOUBLE_CLENCH` がある状態で有効な `TILT` を受けると録音開始。
-- 録音停止は `WAKEUP` ではなく `MOTION ACTIVE`。ただし開始後 `5000ms` は停止イベントを無視し、さらに `2000ms` 未満では最低録音時間のため停止しない。
+- 録音停止は `WAKEUP` ではなく `MOTION ACTIVE`。ただし開始後 `5000ms` は停止イベントを無視し、さらに `1000ms` 未満では最低録音時間のため停止しない。
 
 **ログの見かた**
 
