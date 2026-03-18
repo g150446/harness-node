@@ -123,7 +123,41 @@ python3 nrf52_voice_client.py
 | `t` | ステータス表示（受信パケット数、ロス率など） |
 | `q` | 終了 |
 
+**現在の自動録音フロー**
+
+- 自動モードはデフォルトで ON。
+- `DOUBLE_CLENCH` は `MOTION ACTIVE` の後に最初の `WAKEUP` が来た時点で即時認識。
+- `TILT` は `since_wakeup < 2000ms` のときだけ「有効な TILT」として扱う。
+- 直近 `2000ms` 以内の `DOUBLE_CLENCH` がある状態で有効な `TILT` を受けると録音開始。
+- 録音停止は `WAKEUP` ではなく `MOTION ACTIVE`。ただし開始後 `5000ms` は停止イベントを無視し、さらに `2000ms` 未満では最低録音時間のため停止しない。
+
+**ログの見かた**
+
+- `[TILT] ... since_wakeup=136ms` は直前の `WAKEUP` からの経過時間。
+- `[DOUBLE_CLENCH] ... since_tilt=412ms` は直近の有効な `TILT` からの経過時間。
+- `since_wakeup=N/A` / `since_tilt=N/A` は、必要な相手イベントがまだ時間窓内に存在しないことを示す。
+- `[AUTO] ... ignored (grace .../5000ms)` は停止イベントを 5 秒猶予で無視したことを示す。
+
 録音ファイルは `mac_client/output/nrf52voice_YYYYMMDD_HHMMSS.wav` に保存されます（16kHz / 16bit / モノラル）。
+
+**保守・運用でよく使うコマンド**
+
+```bash
+# firmware build
+cd /opt/nordic/ncs/v2.9.2
+/opt/nordic/ncs/toolchains/b8efef2ad5/bin/python3 -m west build -p always --sysbuild \
+  -b xiao_ble/nrf52840/sense /Users/g150446/projects/voice-harness/voice-bridge-ble/nrf52-voice \
+  --build-dir $HOME/nrf52-voice-build \
+  -- -DBOARD_ROOT=/Users/g150446/projects/voice-harness/voice-bridge-ble
+
+# OTA upload
+cd /Users/g150446/projects/voice-harness/voice-bridge-ble/mac_client
+../venv/bin/python3 ota_updater.py $HOME/nrf52-voice-build/nrf52-voice/zephyr/zephyr.signed.bin
+
+# client syntax check
+cd /Users/g150446/projects/voice-harness/voice-bridge-ble
+venv/bin/python3 -m py_compile mac_client/nrf52_voice_client.py
+```
 
 詳細は `docs/nrf52_voice_guide.md` を参照してください。
 

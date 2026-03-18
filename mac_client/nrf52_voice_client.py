@@ -39,8 +39,14 @@ AUDIO_RX_UUID = "00000003-0000-1000-8000-00805f9b34fb"  # Write
 # Motion Service UUIDs
 MOTION_TX_UUID = "00000011-0000-1000-8000-00805f9b34fb"  # Notify
 WAKEUP_TX_UUID = "00000013-0000-1000-8000-00805f9b34fb"  # Notify
+TILT_TX_UUID   = "00000014-0000-1000-8000-00805f9b34fb"  # Notify
 
 BLE_MTU_SIZE = 512
+TILT_WAKEUP_MAX_MS = 2000
+DOUBLE_CLENCH_TILT_MAX_MS = 2000
+GESTURE_EVENT_RETENTION_S = 5.0
+RECORDING_WAKEUP_GRACE_MS = 5000
+MIN_RECORDING_DURATION_MS = 2000
 
 # Audio config (must match firmware)
 SAMPLE_RATE = 16000
@@ -181,8 +187,8 @@ class VoiceBridge52Client:
         self._packets_received = 0
         self._packet_loss = 0
 
-        # Auto mode: motion triggers recording
-        self.auto_mode = False
+        # Auto mode: qualified tilt + double clench starts recording; later motion active stops it
+        self.auto_mode = True
 
         # Disconnect tracking (battery death vs firmware crash)
         self._connect_time: Optional[float] = None
@@ -194,6 +200,12 @@ class VoiceBridge52Client:
         self._last_wakeup_time: float = 0.0
         self._wakeup_log: list = []          # [timestamp, ...] — all wakeup times
         self._motion_start_time: Optional[float] = None  # time of first ACTIVE in gesture
+        self._qualified_tilt_times: list = []
+        self._double_clench_times: list = []
+        self._double_clench_count = 0
+        self._active_gesture_had_post_active_wakeup = False
+        self._gesture_recording_active = False
+        self._gesture_recording_started_at: Optional[float] = None
 
     async def find_device(self) -> Optional[str]:
         print(f"Scanning for '{DEVICE_NAME}'...")
@@ -209,9 +221,11 @@ class VoiceBridge52Client:
         elapsed = time.time() - (self._connect_time or time.time())
         self._disconnect_time = time.time()
         self.is_connected = False
+        self._gesture_recording_active = False
+        self._clear_gesture_events()
         print(f"\n  [DISCONNECT] After {elapsed:.0f}s connected")
         if self.recorder.is_recording:
-            self.recorder.stop_recording()
+            self.stop_recording(force=True)
 
     async def connect(self, address: str):
         print(f"Connecting to {address}...")
@@ -230,7 +244,10 @@ class VoiceBridge52Client:
         await self.client.start_notify(AUDIO_TX_UUID, self._on_audio)
         await self.client.start_notify(MOTION_TX_UUID, self._on_motion)
         await self.client.start_notify(WAKEUP_TX_UUID, self._on_wakeup)
-        print("  Notifications enabled (audio + motion + wakeup)")
+        await self.client.start_notify(TILT_TX_UUID, self._on_tilt)
+        print("  Notifications enabled (audio + motion + wakeup + tilt)")
+        print(f"  Gesture mode: {'ON' if self.auto_mode else 'OFF'} "
+              f"(qualifying TILT starts recording only if a DOUBLE_CLENCH occurred within the previous {DOUBLE_CLENCH_TILT_MAX_MS}ms; later MOTION ACTIVE stops)")
         await asyncio.sleep(0.5)
 
     async def disconnect(self):
@@ -239,6 +256,7 @@ class VoiceBridge52Client:
                 await self.client.stop_notify(AUDIO_TX_UUID)
                 await self.client.stop_notify(MOTION_TX_UUID)
                 await self.client.stop_notify(WAKEUP_TX_UUID)
+                await self.client.stop_notify(TILT_TX_UUID)
             except Exception:
                 pass
             await self.client.disconnect()
@@ -270,13 +288,25 @@ class VoiceBridge52Client:
         z_excursion = struct.unpack_from('<f', data, 14)[0] if len(data) >= 18 else 0.0
 
         state = "ACTIVE" if event_type == 0x01 else "SETTLED"
+        event_time = time.time()
 
         if event_type == 0x01:
             # Record start of gesture (first ACTIVE only)
             if self._motion_start_time is None:
-                self._motion_start_time = time.time()
+                self._motion_start_time = event_time
+                self._active_gesture_had_post_active_wakeup = False
             print(f"  [MOTION {state}] count={count} activity={activity:.2f} peak={peak:.2f} "
                   f"z_exc={z_excursion:.2f} elapsed={elapsed_ms}ms")
+            if self.auto_mode and self._gesture_recording_active and self.recorder.is_recording:
+                recording_age_ms = self._recording_age_ms(event_time)
+                if recording_age_ms < RECORDING_WAKEUP_GRACE_MS:
+                    print("  [AUTO] MOTION ACTIVE during gesture recording ignored "
+                          f"(grace {recording_age_ms}ms/{RECORDING_WAKEUP_GRACE_MS}ms)")
+                else:
+                    print("  [AUTO] MOTION ACTIVE detected after grace period → stop recording")
+                    self._gesture_recording_active = False
+                    self._clear_gesture_events()
+                    self.stop_recording()
         else:
             # SETTLED: count wakeups that arrived AFTER the first ACTIVE event
             if self._motion_start_time is not None:
@@ -286,27 +316,10 @@ class VoiceBridge52Client:
                 wakeups_after_active = 0
             gesture = classify_gesture(activity, peak, z_excursion, wakeups_after_active)
             print(f"  [MOTION {state}] count={count} activity={activity:.2f} peak={peak:.2f} "
-                  f"z_exc={z_excursion:.2f} elapsed={elapsed_ms}ms "
-                  f"wakeups_after={wakeups_after_active} → [{gesture}]")
+                   f"z_exc={z_excursion:.2f} elapsed={elapsed_ms}ms "
+                   f"wakeups_after={wakeups_after_active} → [{gesture}]")
             self._motion_start_time = None
-
-        if self.auto_mode:
-            if event_type == 0x01 and not self.recorder.is_recording:
-                print("  [AUTO] Motion detected → start recording")
-                self.recorder.start_recording()
-                try:
-                    if self.client and self.client.is_connected:
-                        await self.client.write_gatt_char(AUDIO_RX_UUID, bytes([0x01]))
-                except Exception as e:
-                    logger.error(f"BLE start failed: {e}")
-            elif event_type == 0x00 and self.recorder.is_recording:
-                print("  [AUTO] Motion settled → stop recording")
-                self.recorder.stop_recording()
-                try:
-                    if self.client and self.client.is_connected:
-                        await self.client.write_gatt_char(AUDIO_RX_UUID, bytes([0x00]))
-                except Exception as e:
-                    logger.error(f"BLE stop failed: {e}")
+            self._active_gesture_had_post_active_wakeup = False
 
     def _on_wakeup(self, sender, data: bytes):
         if len(data) < 2:
@@ -326,6 +339,46 @@ class VoiceBridge52Client:
         ]) or "?"
         print(f"  [WAKEUP] axes={axis_str} count={count}")
 
+        if self._motion_start_time is not None and not self._active_gesture_had_post_active_wakeup:
+            self._active_gesture_had_post_active_wakeup = True
+            self._double_clench_count += 1
+            self._double_clench_times.append(now)
+            self._trim_gesture_events(now)
+            since_tilt_ms = self._latest_qualified_tilt_delta_ms(now)
+            since_tilt = f"{since_tilt_ms}ms" if since_tilt_ms is not None else "N/A"
+            print(f"  [DOUBLE_CLENCH] count={self._double_clench_count} since_tilt={since_tilt}")
+
+    def _on_tilt(self, sender, data: bytes):
+        if len(data) < 2:
+            return
+        tilt_src = data[0]
+        count = data[1]
+        active = "YES" if (tilt_src & 0x20) else "NO"
+        now = time.time()
+        since_wakeup_ms: Optional[int]
+        if self._last_wakeup_time > 0.0:
+            since_wakeup_ms = int((now - self._last_wakeup_time) * 1000)
+            wakeup_delta = f"{since_wakeup_ms}ms"
+        else:
+            since_wakeup_ms = None
+            wakeup_delta = "N/A"
+        print(f"  [TILT] active={active} src=0x{tilt_src:02x} count={count} "
+              f"since_wakeup={wakeup_delta}")
+
+        if (active == "YES" and since_wakeup_ms is not None and
+                since_wakeup_ms < TILT_WAKEUP_MAX_MS):
+            self._qualified_tilt_times.append(now)
+            self._trim_gesture_events(now)
+            since_double_clench_ms = self._latest_double_clench_delta_ms(now)
+            if (self.auto_mode and since_double_clench_ms is not None and
+                    not self.recorder.is_recording and not self._gesture_recording_active):
+                print("  [AUTO] Qualified tilt matched recent DOUBLE_CLENCH "
+                      f"(since_double_clench={since_double_clench_ms}ms) → start recording")
+                if self.start_recording():
+                    self._gesture_recording_active = True
+                    self._gesture_recording_started_at = now
+                    self._clear_gesture_events()
+
     async def _send_ble_start(self):
         try:
             if self.client and self.client.is_connected:
@@ -340,12 +393,60 @@ class VoiceBridge52Client:
         except Exception as e:
             logger.error(f"BLE stop failed: {e}")
 
-    def start_recording(self):
-        self.recorder.start_recording()
+    def _trim_gesture_events(self, now: float):
+        self._qualified_tilt_times = [t for t in self._qualified_tilt_times
+                                      if now - t <= GESTURE_EVENT_RETENTION_S]
+        self._double_clench_times = [t for t in self._double_clench_times
+                                     if now - t <= GESTURE_EVENT_RETENTION_S]
+
+    def _clear_gesture_events(self):
+        self._qualified_tilt_times.clear()
+        self._double_clench_times.clear()
+
+    def _latest_qualified_tilt_delta_ms(self, now: float) -> Optional[int]:
+        matching_tilts = [t for t in self._qualified_tilt_times if 0.0 <= now - t <= GESTURE_EVENT_RETENTION_S]
+        if not matching_tilts:
+            return None
+        latest_tilt = max(matching_tilts)
+        delta_ms = int((now - latest_tilt) * 1000)
+        if delta_ms <= DOUBLE_CLENCH_TILT_MAX_MS:
+            return delta_ms
+        return None
+
+    def _latest_double_clench_delta_ms(self, now: float) -> Optional[int]:
+        matching_clenches = [t for t in self._double_clench_times if 0.0 <= now - t <= GESTURE_EVENT_RETENTION_S]
+        if not matching_clenches:
+            return None
+        latest_clench = max(matching_clenches)
+        delta_ms = int((now - latest_clench) * 1000)
+        if delta_ms <= DOUBLE_CLENCH_TILT_MAX_MS:
+            return delta_ms
+        return None
+
+    def _recording_age_ms(self, now: Optional[float] = None) -> int:
+        if not self.recorder.is_recording:
+            return 0
+        current_time = now if now is not None else time.time()
+        start_time = self._gesture_recording_started_at or self.recorder.start_time or current_time
+        return int((current_time - start_time) * 1000)
+
+    def start_recording(self) -> bool:
+        if not self.recorder.start_recording():
+            return False
         t = asyncio.create_task(self._send_ble_start())
         t.add_done_callback(lambda _: None)  # keep reference alive
+        return True
 
-    def stop_recording(self):
+    def stop_recording(self, force: bool = False):
+        recording_age_ms = self._recording_age_ms()
+        if (not force and self.recorder.is_recording and
+                recording_age_ms < MIN_RECORDING_DURATION_MS):
+            print("  [AUTO] Stop ignored "
+                  f"(minimum {recording_age_ms}ms/{MIN_RECORDING_DURATION_MS}ms)")
+            return
+        self._gesture_recording_active = False
+        self._gesture_recording_started_at = None
+        self._clear_gesture_events()
         self.recorder.stop_recording()
         t = asyncio.create_task(self._send_ble_stop())
         t.add_done_callback(lambda _: None)  # keep reference alive
@@ -357,7 +458,8 @@ class VoiceBridge52Client:
             rate = self._packet_loss / (self._packets_received + self._packet_loss) * 100
             print(f"  Loss rate:        {rate:.1f}%")
         print(f"  Recording:        {'YES ({:.1f}s)'.format(self.recorder.get_duration()) if self.recorder.is_recording else 'NO'}")
-        print(f"  Auto mode:        {'ON' if self.auto_mode else 'OFF'}")
+        print(f"  Gesture mode:     {'ON' if self.auto_mode else 'OFF'}")
+        print(f"  Gesture rec:      {'YES' if self._gesture_recording_active else 'NO'}")
 
 
 # ============================================================================
@@ -372,7 +474,7 @@ async def interactive_control(client: VoiceBridge52Client):
     print("Commands:")
     print("  r  - Manual: start recording")
     print("  s  - Manual: stop recording")
-    print("  a  - Toggle auto mode (motion-triggered recording)")
+    print("  a  - Toggle gesture mode (tilt + DOUBLE_CLENCH starts, MOTION ACTIVE stops)")
     print("  t  - Show status")
     print("  q  - Quit")
     print()
@@ -392,7 +494,7 @@ async def interactive_control(client: VoiceBridge52Client):
                 client.stop_recording()
             elif cmd == 'a':
                 client.auto_mode = not client.auto_mode
-                print(f"  Auto mode: {'ON' if client.auto_mode else 'OFF'}")
+                print(f"  Gesture mode: {'ON' if client.auto_mode else 'OFF'}")
             elif cmd == 't':
                 client.print_stats()
             elif cmd == '':

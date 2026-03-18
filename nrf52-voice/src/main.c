@@ -46,8 +46,9 @@ LOG_MODULE_REGISTER(nrf52_voice, LOG_LEVEL_INF);
 
 #define IMU_NODE                    DT_ALIAS(imu0)
 #define LED0_NODE                   DT_ALIAS(led0)
-#define ACCEL_ODR_HZ                26
-#define POLL_INTERVAL_MS            100
+#define ACCEL_ODR_HZ                52
+#define MOTION_SAMPLE_INTERVAL_MS   100
+#define EVENT_POLL_INTERVAL_MS      25
 #define CALIBRATION_SAMPLES         25
 #define ACTIVITY_WINDOW_SAMPLES     4
 #define MOTION_ENTRY_ACTIVITY_MS2   8.0
@@ -101,6 +102,11 @@ LOG_MODULE_REGISTER(nrf52_voice, LOG_LEVEL_INF);
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
     0x00, 0x10, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00
 
+/* Tilt TX: 00000014-... (Notify) */
+#define MOTION_UUID_TILT_TX_CHAR \
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
+    0x00, 0x10, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00
+
 /* ============================================================================
  * Global Variables
  * ============================================================================ */
@@ -141,14 +147,24 @@ static struct k_thread audio_thread_data;
 #define LSM6DS3_I2C_NODE        DT_BUS(DT_NODELABEL(lsm6ds3tr_c))
 #define LSM6DS3_I2C_ADDR        0x6a
 
-#define LSM6DS3_REG_WAKE_UP_SRC     0x1B
-#define LSM6DS3_REG_TAP_CFG         0x58
-#define LSM6DS3_REG_WAKE_UP_THS     0x5B
-#define LSM6DS3_REG_WAKE_UP_DUR     0x5C
-#define LSM6DS3_REG_MD1_CFG         0x5E
+#define LSM6DS3_REG_WAKE_UP_SRC         0x1B
+#define LSM6DS3_REG_CTRL10_C            0x19
+#define LSM6DS3_REG_FUNC_SRC1           0x53
+#define LSM6DS3_REG_TAP_CFG             0x58
+#define LSM6DS3_REG_WAKE_UP_THS         0x5B
+#define LSM6DS3_REG_WAKE_UP_DUR         0x5C
+#define LSM6DS3_REG_MD1_CFG             0x5E
+#define LSM6DS3_CTRL10_C_FUNC_EN          BIT(2)
+#define LSM6DS3_CTRL10_C_TILT_EN          BIT(3)
+#define LSM6DS3_FUNC_SRC1_TILT_IA         BIT(5)
+#define LSM6DS3_MD1_CFG_INT1_TILT         BIT(1)
+#define LSM6DS3_MD1_CFG_INT1_WU           BIT(5)
+#define LSM6DS3_TAP_CFG_LIR               BIT(0)
+#define LSM6DS3_TAP_CFG_INTERRUPTS_ENABLE BIT(7)
 
 static const struct device *const i2c_bus = DEVICE_DT_GET(LSM6DS3_I2C_NODE);
 static atomic_t detected_wakeup_count;
+static atomic_t detected_tilt_count;
 
 /* Watchdog */
 static const struct device *const wdt = DEVICE_DT_GET(WDT_NODE);
@@ -246,6 +262,11 @@ static void wakeup_tx_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t 
     LOG_INF("Wakeup TX CCCD updated: %d", value);
 }
 
+static void tilt_tx_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    LOG_INF("Tilt TX CCCD updated: %d", value);
+}
+
 BT_GATT_SERVICE_DEFINE(motion_svc,
     BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_128(MOTION_UUID_SERVICE)),
 
@@ -256,6 +277,11 @@ BT_GATT_SERVICE_DEFINE(motion_svc,
     BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(MOTION_UUID_TAP_TX_CHAR),
         BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_READ, NULL, NULL, NULL),
     BT_GATT_CCC(wakeup_tx_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+
+    /* Tilt TX (standard tilt detection) — attrs[7]=decl, attrs[8]=value, attrs[9]=CCCD */
+    BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(MOTION_UUID_TILT_TX_CHAR),
+        BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_READ, NULL, NULL, NULL),
+    BT_GATT_CCC(tilt_tx_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 
     BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(MOTION_UUID_BUILD_INFO_CHAR),
         BT_GATT_CHRC_READ, BT_GATT_PERM_READ, read_build_info, NULL, NULL),
@@ -269,6 +295,16 @@ static void notify_wakeup_event(uint8_t axes, uint8_t count)
     }
     uint8_t pkt[2] = { axes, count };
     bt_gatt_notify(NULL, &motion_svc.attrs[5], pkt, sizeof(pkt));
+}
+
+/* tilt_src mirrors FUNC_SRC1, where bit5 is tilt_ia */
+static void notify_tilt_event(uint8_t tilt_src, uint8_t count)
+{
+    if (!current_conn) {
+        return;
+    }
+    uint8_t pkt[2] = { tilt_src, count };
+    bt_gatt_notify(NULL, &motion_svc.attrs[8], pkt, sizeof(pkt));
 }
 
 /* event_type: 0x01 = motion active, 0x00 = motion settled */
@@ -521,21 +557,42 @@ static void accumulate_calibration(double x, double y, double z)
 
 static int configure_wakeup_detection(void)
 {
+    uint8_t tap_cfg = LSM6DS3_TAP_CFG_INTERRUPTS_ENABLE | LSM6DS3_TAP_CFG_LIR;
+    uint8_t ctrl10_c = LSM6DS3_CTRL10_C_FUNC_EN | LSM6DS3_CTRL10_C_TILT_EN;
+    uint8_t md1_cfg = LSM6DS3_MD1_CFG_INT1_WU | LSM6DS3_MD1_CFG_INT1_TILT;
+
     if (!device_is_ready(i2c_bus)) {
         LOG_ERR("I2C bus not ready");
         return -ENODEV;
     }
 
-    /* TAP_CFG: INTERRUPTS_ENABLE=1 (required for wakeup events to propagate) */
-    i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_TAP_CFG,     0x80);
+    /* TAP_CFG: enable interrupt routing and latch sources until read */
+    if (i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_TAP_CFG, tap_cfg) < 0) {
+        LOG_ERR("Failed to write TAP_CFG");
+        return -EIO;
+    }
     /* WAKE_UP_THS: WK_THS=4 → 4 × (2g/64) = 125 mg threshold */
-    i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_WAKE_UP_THS, 0x04);
+    if (i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_WAKE_UP_THS, 0x04) < 0) {
+        LOG_ERR("Failed to write WAKE_UP_THS");
+        return -EIO;
+    }
     /* WAKE_UP_DUR: 1 sample at 26 Hz ≈ 38 ms (most responsive) */
-    i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_WAKE_UP_DUR, 0x00);
-    /* MD1_CFG: INT1_WU (bit5) only */
-    i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_MD1_CFG,     0x20);
+    if (i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_WAKE_UP_DUR, 0x00) < 0) {
+        LOG_ERR("Failed to write WAKE_UP_DUR");
+        return -EIO;
+    }
 
-    printk("Wakeup configured (125mg threshold)\n");
+    if (i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_CTRL10_C, ctrl10_c) < 0) {
+        LOG_ERR("Failed to enable tilt detection");
+        return -EIO;
+    }
+
+    if (i2c_reg_write_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_MD1_CFG, md1_cfg) < 0) {
+        LOG_ERR("Failed to route wakeup/tilt interrupt");
+        return -EIO;
+    }
+
+    printk("Wakeup + tilt configured (125mg wakeup)\n");
     return 0;
 }
 
@@ -552,6 +609,23 @@ static void check_wakeup_src(void)
     uint8_t count = (uint8_t)(atomic_inc(&detected_wakeup_count) + 1);
     printk(">>> Wakeup! axes=0x%02x count=%u\n", axes, count);
     notify_wakeup_event(axes, count);
+}
+
+static void check_tilt_src(void)
+{
+    uint8_t func_src1 = 0;
+
+    if (i2c_reg_read_byte(i2c_bus, LSM6DS3_I2C_ADDR, LSM6DS3_REG_FUNC_SRC1, &func_src1) < 0) {
+        return;
+    }
+
+    if (!(func_src1 & LSM6DS3_FUNC_SRC1_TILT_IA)) {
+        return;
+    }
+
+    uint8_t count = (uint8_t)(atomic_inc(&detected_tilt_count) + 1);
+    printk(">>> Tilt! func_src1=0x%02x count=%u\n", func_src1, count);
+    notify_tilt_event(func_src1, count);
 }
 
 static int configure_motion_detection(void)
@@ -573,9 +647,10 @@ static int configure_motion_detection(void)
     if (ret == -ENOTSUP) LOG_WRN("SLOPE_DUR not supported");
     else if (ret < 0) { LOG_ERR("duration set failed: %d", ret); return ret; }
 
-    LOG_INF("Motion detection ready: ODR=%d Hz, poll=%d ms", ACCEL_ODR_HZ, POLL_INTERVAL_MS);
+    LOG_INF("Motion detection ready: ODR=%d Hz, motion_sample=%d ms, event_poll=%d ms",
+            ACCEL_ODR_HZ, MOTION_SAMPLE_INTERVAL_MS, EVENT_POLL_INTERVAL_MS);
     LOG_INF("Calibrating for %.1f s; keep the board still",
-            (double)(CALIBRATION_SAMPLES * POLL_INTERVAL_MS) / 1000.0);
+            (double)(CALIBRATION_SAMPLES * MOTION_SAMPLE_INTERVAL_MS) / 1000.0);
     return 0;
 }
 
@@ -946,17 +1021,23 @@ int main(void)
         }
     }
 
-    /* Arm watchdog after image confirmation — main loop must kick every POLL_INTERVAL_MS */
+    /* Arm watchdog after image confirmation — main loop must kick every EVENT_POLL_INTERVAL_MS */
     configure_watchdog();
 
-    /* Main loop: poll IMU and check tap events */
+    /* Main loop: check wakeup/tilt faster than full motion processing to reduce tilt latency */
+    int64_t last_motion_sample_ms = k_uptime_get();
     while (1) {
-        k_sleep(K_MSEC(POLL_INTERVAL_MS));
+        k_sleep(K_MSEC(EVENT_POLL_INTERVAL_MS));
         if (wdt_channel_id >= 0) {
             wdt_feed(wdt, wdt_channel_id);
         }
-        process_motion_sample();
         check_wakeup_src();
+        check_tilt_src();
+        int64_t now_ms = k_uptime_get();
+        if ((now_ms - last_motion_sample_ms) >= MOTION_SAMPLE_INTERVAL_MS) {
+            last_motion_sample_ms = now_ms;
+            process_motion_sample();
+        }
     }
 
     return 0;
