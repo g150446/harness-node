@@ -137,14 +137,14 @@ BLE 切断時   → audio_capture_stop()
 1. `MOTION ACTIVE` 中に最初の `WAKEUP` が来ると `DOUBLE_CLENCH` とみなす。
 2. `TILT` 通知の `since_wakeup < 2000ms` なら「有効な TILT」とみなす。
 3. 直近 `2000ms` 以内に `DOUBLE_CLENCH` があり、かつ有効な `TILT` が来たら録音開始。
-4. 録音開始後 `5000ms` は停止トリガーを無視する。
+4. 録音開始後 `1000ms` は停止トリガーを無視する。
 5. 録音開始後 `1000ms` 未満では最低録音時間のため停止しない。
-6. `5000ms` 経過後に `MOTION ACTIVE` が来ると録音停止。
+6. `1000ms` 経過後に `MOTION ACTIVE` が来ると録音停止。
 
 ### 運用上の注意
 
 - 手動録音 (`r` / `s`) は引き続き利用できる。
-- `MOTION ACTIVE` 停止に変えたため、録音終了動作の確認では「軽く持ち上げて即終了」ではなく、5 秒以上録音した後に明確なモーションを入れる。
+- `MOTION ACTIVE` 停止に変えたため、録音終了動作の確認では少なくとも 1 秒以上録音した後に明確なモーションを入れる。
 - 切断時は最低録音時間に関係なく強制停止して WAV をクローズする。
 
 ---
@@ -212,7 +212,7 @@ TILT が届き、直前 WAKEUP から 2000ms 未満
 有効な TILT の時点で、直前 2000ms 以内に DOUBLE_CLENCH がある
   → 自動録音開始
 
-録音開始から 5000ms 経過後に MOTION ACTIVE
+録音開始から 1000ms 経過後に MOTION ACTIVE
   → 自動録音停止
 ```
 
@@ -229,7 +229,7 @@ TILT が届き、直前 WAKEUP から 2000ms 未満
 [TILT] active=YES src=0x20 count=172 since_wakeup=136ms
 [DOUBLE_CLENCH] count=12 since_tilt=412ms
 [AUTO] Qualified tilt matched recent DOUBLE_CLENCH (since_double_clench=412ms) → start recording
-[AUTO] MOTION ACTIVE during gesture recording ignored (grace 1834ms/5000ms)
+[AUTO] MOTION ACTIVE during gesture recording ignored (grace 834ms/1000ms)
 [AUTO] MOTION ACTIVE detected after grace period → stop recording
 ```
 
@@ -251,7 +251,7 @@ python3 gesture_collector.py
 TILT_WAKEUP_MAX_MS = 2000
 DOUBLE_CLENCH_TILT_MAX_MS = 2000
 GESTURE_EVENT_RETENTION_S = 5.0
-RECORDING_WAKEUP_GRACE_MS = 5000
+RECORDING_WAKEUP_GRACE_MS = 1000
 MIN_RECORDING_DURATION_MS = 1000
 ```
 
@@ -288,8 +288,8 @@ venv/bin/python3 -m py_compile mac_client/nrf52_voice_client.py
 1. クライアント起動後、`Gesture mode: ON` を確認。
 2. `DOUBLE_CLENCH` ログが先に出ることを確認。
 3. その後の有効な `TILT` で録音開始することを確認。
-4. 開始後 5 秒未満の `MOTION ACTIVE` では停止しないことを確認。
-5. 5 秒経過後の `MOTION ACTIVE` で停止し、`mac_client/output/` に WAV が保存されることを確認。
+4. 開始後 1 秒未満の `MOTION ACTIVE` では停止しないことを確認。
+5. 1 秒経過後の `MOTION ACTIVE` で停止し、`mac_client/output/` に WAV が保存されることを確認。
 
 ---
 
