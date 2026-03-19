@@ -45,7 +45,6 @@ BLE_MTU_SIZE = 512
 TILT_WAKEUP_MAX_MS = 2000
 DOUBLE_CLENCH_TILT_MAX_MS = 2000
 GESTURE_EVENT_RETENTION_S = 5.0
-RECORDING_WAKEUP_GRACE_MS = 1000
 MIN_RECORDING_DURATION_MS = 1000
 
 # Audio config (must match firmware)
@@ -297,16 +296,6 @@ class VoiceBridge52Client:
                 self._active_gesture_had_post_active_wakeup = False
             print(f"  [MOTION {state}] count={count} activity={activity:.2f} peak={peak:.2f} "
                   f"z_exc={z_excursion:.2f} elapsed={elapsed_ms}ms")
-            if self.auto_mode and self._gesture_recording_active and self.recorder.is_recording:
-                recording_age_ms = self._recording_age_ms(event_time)
-                if recording_age_ms < RECORDING_WAKEUP_GRACE_MS:
-                    print("  [AUTO] MOTION ACTIVE during gesture recording ignored "
-                          f"(grace {recording_age_ms}ms/{RECORDING_WAKEUP_GRACE_MS}ms)")
-                else:
-                    print("  [AUTO] MOTION ACTIVE detected after grace period → stop recording")
-                    self._gesture_recording_active = False
-                    self._clear_gesture_events()
-                    self.stop_recording()
         else:
             # SETTLED: count wakeups that arrived AFTER the first ACTIVE event
             if self._motion_start_time is not None:
@@ -364,6 +353,13 @@ class VoiceBridge52Client:
             wakeup_delta = "N/A"
         print(f"  [TILT] active={active} src=0x{tilt_src:02x} count={count} "
               f"since_wakeup={wakeup_delta}")
+
+        if active == "YES" and self.auto_mode and self._gesture_recording_active and self.recorder.is_recording:
+            print("  [AUTO] TILT detected during gesture recording → stop recording")
+            self._gesture_recording_active = False
+            self._clear_gesture_events()
+            self.stop_recording()
+            return
 
         if (active == "YES" and since_wakeup_ms is not None and
                 since_wakeup_ms < TILT_WAKEUP_MAX_MS):
