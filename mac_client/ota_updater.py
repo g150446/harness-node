@@ -15,7 +15,7 @@ import time
 import cbor2
 from bleak import BleakClient, BleakScanner
 
-DEVICE_NAME = "VoiceBridge52"
+DEVICE_NAME = "MotionBridge"   # default; override with --device flag
 
 # SMP BLE service / characteristic UUIDs
 SMP_SERVICE_UUID   = "8D53DC1D-1DB7-4CD3-868B-8A527460AA84"
@@ -191,11 +191,15 @@ async def ota_update(bin_path: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <ota_update.bin>", file=sys.stderr)
-        sys.exit(1)
-
-    asyncio.run(ota_update(sys.argv[1]))
+    import argparse
+    global DEVICE_NAME
+    parser = argparse.ArgumentParser(description="BLE OTA firmware updater (SMP)")
+    parser.add_argument("bin", help="Path to ota_update.bin")
+    parser.add_argument("--device", default=DEVICE_NAME,
+                        help=f"BLE device name to target (default: {DEVICE_NAME})")
+    args = parser.parse_args()
+    DEVICE_NAME = args.device
+    asyncio.run(ota_update(args.bin))
 
 
 if __name__ == "__main__":

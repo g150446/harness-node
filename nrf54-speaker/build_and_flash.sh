@@ -23,9 +23,12 @@ if [ -z "$PYOCD_CMD" ]; then
     exit 1
 fi
 
-HEX_FILE="$BUILD_DIR/nrf54-speaker/zephyr/zephyr.hex"
+HEX_FILE="$BUILD_DIR/zephyr/zephyr.hex"
 if [ ! -f "$HEX_FILE" ]; then
     HEX_FILE="$BUILD_DIR/merged.hex"
+fi
+if [ ! -f "$HEX_FILE" ]; then
+    HEX_FILE="$BUILD_DIR/nrf54-speaker/zephyr/zephyr.hex"
 fi
 if [ ! -f "$HEX_FILE" ]; then
     echo "ERROR: Expected hex not found under $BUILD_DIR" >&2

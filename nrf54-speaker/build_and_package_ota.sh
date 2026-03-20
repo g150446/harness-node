@@ -42,7 +42,7 @@ echo "west: $WEST"
 echo "Building $BOARD -> $BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 cd "$NCS_BASE"
-eval "$WEST" build -p always -b "$BOARD" "$APP_DIR" \
+eval "$WEST" build -p always --sysbuild -b "$BOARD" "$APP_DIR" \
     --build-dir "$BUILD_DIR" \
     -- -DBOARD_ROOT="$PROJECT_DIR"
 
@@ -52,7 +52,8 @@ if [ -f "$OTA_BIN" ]; then
     echo "OTA payload refreshed: $APP_DIR/ota_update.bin ($(wc -c < "$APP_DIR/ota_update.bin") bytes)"
     echo "To send OTA: cd mac_client && python3 ota_updater.py ../nrf54-speaker/ota_update.bin"
 else
-    echo "Note: No signed OTA payload (MCUboot not configured) — USB flash only."
+    echo "ERROR: Signed OTA payload not found at $OTA_BIN" >&2
+    exit 1
 fi
 
 echo ""

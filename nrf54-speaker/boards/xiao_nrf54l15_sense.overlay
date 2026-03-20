@@ -1,0 +1,11 @@
+/ {
+    chosen {
+        zephyr,console = &uart20;
+        zephyr,shell-uart = &uart20;
+    };
+};
+
+&uart20 {
+    status = "okay";
+    current-speed = <115200>;
+};

@@ -1,70 +1,110 @@
 # nrf54-speaker 保守・運用ガイド
 
-Seeed XIAO nRF54L15 Sense + M5Stack SPK2 (MAX98357A) で 440 Hz 正弦波を I2S 再生するファームウェア。
+Seeed XIAO nRF54L15 Sense + M5Stack SPK2 (MAX98357A) でインターネットラジオを BLE 経由でリアルタイム再生するシステム。
+
+---
+
+## システム概要
+
+```
+インターネットラジオ (MP3 ストリーム)
+    │
+    ▼  ffmpeg subprocess (Mac)
+  16kHz モノラル 16-bit PCM
+    │
+    ▼  BLE Write Without Response  [seq:1][0xAA:1][PCM:238 bytes]
+  nRF54L15 GATT Audio RX characteristic ("SpeakerBridge")
+    │
+    ▼  Ring buffer (16384 bytes = ~500ms)
+  I2S feeder スレッド (mono → stereo upmix, underrun → silence)
+    │
+    ▼  i2s20 → MAX98357A → スピーカー
+```
+
+**BLE デバイス名**: `SpeakerBridge`
+**実効サンプルレート**: 15873 Hz (nRF54L15 の MCLK 制約による実際のレート)
+**BLE スループット**: MTU=244, DLE=251 → ~31 KB/s
 
 ---
 
 ## ハードウェア配線
 
-| XIAO ピン | SoC | SPK2 | 用途 |
-|-----------|-----|------|------|
-| 2 (GND)   | GND     | GND (pin2) | グランド共通 |
-| 3 (3V3)   | 3V3_OUT | 3V3 (pin7) | IC 電源 3.3V |
-| 4 (D0)    | P1.04   | BCLK (pin3) | I2S ビットクロック |
-| 5 (D1)    | P1.05   | LRCLK (pin4) | I2S ワードセレクト |
-| 6 (D2)    | P1.06   | SDATA (pin5) | I2S データ |
+| XIAO ピン | SoC    | SPK2        | 用途                |
+|-----------|--------|-------------|---------------------|
+| GND (2)   | GND    | GND (pin2)  | グランド共通         |
+| 3V3 (3)   | 3V3OUT | 3V3 (pin7)  | IC 電源 3.3V        |
+| D0 (4)    | P1.04  | BCLK (pin3) | I2S ビットクロック   |
+| D1 (5)    | P1.05  | LRCK (pin4) | I2S ワードセレクト   |
+| D2 (6)    | P1.06  | SDATA (pin5)| I2S データ           |
 
-> **注意**: SPK2 の 5VIN (pin8) は **接続不要**。3V3 (pin7) に 3.3V を供給する。
-> SD_MODE は SPK2 基板上で 10kΩ プルアップ済みのため配線不要。
-> MCLK は MAX98357A では不要。
+> **重要**: SPK2 の 5VIN (pin8) は**接続不要**。SD_MODE は基板上 10kΩ プルアップ済みで配線不要。
 
 ---
 
-## ビルド・書き込み
+## クイックスタート
 
-### 初回 or USB 書き込み
+### 1. 依存ツールのインストール
+
+```bash
+# Mac
+brew install ffmpeg
+pip install pyocd
+cd mac_client && pip install bleak
+```
+
+### 2. ファームウェアの書き込み（初回 / USB）
 
 ```bash
 cd nrf54-speaker
 ./build_and_flash.sh
 ```
 
-pyocd が必要:
-
-```bash
-pip install pyocd
-```
-
-### BLE OTA 更新
-
-```bash
-cd nrf54-speaker
-./build_and_package_ota.sh
-cd ../mac_client
-python3 ota_updater.py ../nrf54-speaker/ota_update.bin
-```
-
-> OTA は MCUboot が不要なシンプル構成のため、このプロジェクトでは OTA 非対応。
-> `build_and_package_ota.sh` はビルドのみ行い、signed binary がなければ警告を出して終了する。
-
-### シリアルモニタ
+### 3. シリアルモニタで起動確認
 
 ```bash
 screen $(ls /dev/tty.usbmodem* | head -1) 115200
 ```
 
-正常起動時の出力:
-
+正常起動時:
 ```
-I2S configured OK, starting 440 Hz tone
+nrf54-speaker BLE audio bridge (build: Mar 20 2026 ...)
+I2S configured at 16000 Hz
+I2S started
+BLE advertising as SpeakerBridge
 ```
 
-エラー例:
+### 4. Mac からストリーミング再生
 
+```bash
+cd mac_client
+python3 speaker_client.py                                    # デフォルト: Capital Radio
+python3 speaker_client.py http://your.radio.stream/path      # 任意の URL
 ```
-I2S device not ready       ← overlay/ピン設定が間違っている
-I2S configure failed: -22  ← i2s_config の設定値が不正
-slab alloc timeout: -11    ← I2S TX が詰まっている（ピン不一致が多い）
+
+正常動作時の表示:
+```
+Connected to SpeakerBridge (MTU=244)
+Streaming: 133.4 pkt/s, 31.0 KB/s  (queue=30)
+```
+
+シリアルモニタ側:
+```
+BLE connected
+audio RX: 501 pkts, ring=12000/16384 bytes   ← ring が満杯にならず変動していれば正常
+```
+
+---
+
+## BLE OTA アップデート
+
+```bash
+# ビルドのみ
+cd nrf54-speaker
+./build_and_package_ota.sh
+
+# OTA 転送
+cd ../mac_client
+python3 ota_updater.py ../nrf54-speaker/ota_update.bin --device SpeakerBridge
 ```
 
 ---
@@ -73,151 +113,149 @@ slab alloc timeout: -11    ← I2S TX が詰まっている（ピン不一致が
 
 ```
 nrf54-speaker/
-├── CMakeLists.txt               # Zephyr ビルド設定
-├── prj.conf                     # Kconfig
+├── CMakeLists.txt
+├── prj.conf                              # Kconfig (BLE + I2S + MCUmgr)
+├── sysbuild.conf                         # MCUboot 有効化
+├── sysbuild/
+│   └── mcuboot/boards/
+│       └── xiao_nrf54l15_nrf54l15_cpuapp.conf  # MCUboot 用 nRF54L15 設定
 ├── boards/
-│   └── xiao_nrf54l15_nrf54l15_cpuapp.overlay  # I2S20 ピン設定
+│   └── xiao_nrf54l15_nrf54l15_cpuapp.overlay   # I2S20 ピン + UART コンソール
 ├── src/
-│   └── main.c                   # 440Hz 正弦波ループ再生
-├── build_and_flash.sh           # ビルド + USB 書き込み
-└── build_and_package_ota.sh     # ビルドのみ
+│   └── main.c                            # BLE GATT + I2S feeder
+├── build_and_flash.sh                    # ビルド + USB フラッシュ
+├── build_and_package_ota.sh             # ビルド + OTA バイナリ生成
+└── ota_update.bin                        # 最新の OTA ペイロード
+
+mac_client/
+├── speaker_client.py                     # BLE オーディオストリーミングクライアント
+└── ota_updater.py                        # BLE OTA アップデーター (--device SpeakerBridge)
 ```
+
+---
+
+## パケット仕様
+
+| フィールド | サイズ | 値       |
+|-----------|--------|----------|
+| seq       | 1 byte | 0x00〜FF (ループ) |
+| magic     | 1 byte | 0xAA     |
+| PCM data  | 238 bytes | 16kHz モノラル 16-bit LE |
+| 合計      | 240 bytes | ≤ MTU-3 = 241 bytes |
+
+**送信レート**: 238 / (15873 × 2) ≒ **7.498ms / パケット = 133.4 pkt/s**
+
+---
+
+## GATT プロファイル
+
+| 項目 | UUID |
+|------|------|
+| Speaker Service   | `00000020-0000-1000-8000-00805f9b34fb` |
+| Audio RX char     | `00000021-...` Write / Write Without Response |
+| Build Info char   | `00000022-...` Read (ビルドタイムスタンプ) |
+
+BLE 接続時に接続インターバル 7.5〜10ms を要求（スループット確保のため）。
 
 ---
 
 ## 重要な技術的知見
 
-### 1. I2S20 は Port 1 (P1) ピンしか使えない【最重要】
+### 1. I2S20 は Port 1 (P1) ピン専用【最重要】
 
-nRF54L15 の `i2s20` は **グローバルドメイン** のペリフェラル (0x500DD000) であり、
-グローバルドメインの GPIO はすべて **Port 1 (P1)** に接続されている。
+nRF54L15 の `i2s20` はグローバルドメイン (0x500DD000) のペリフェラル。
+グローバルドメインの GPIO はすべて **Port 1 (P1)** に接続されており、
+Port 2 (P2) のピンを割り当てても BCLK が生成されず音が出ない。
 
-Port 2 (P2) はローカルドメイン専用であり、`i2s20` に P2 ピンを割り当てても
-ピンマックスが無効になり BCLK が生成されない。初期化は成功するが音は出ない。
+```
+P0, P1 → グローバルドメイン → I2S20 ○
+P2     → ローカルドメイン専用 → I2S20 ✗
+```
 
-| Port | 用途 | I2S20 対応 |
-|------|------|----------|
-| P0   | グローバルドメイン | ○ |
-| P1   | グローバルドメイン | ○ ← 今回使用 |
-| P2   | ローカルドメイン専用 | **✗ 使用不可** |
-
-**旧配線 (D8/D9/D10 = P2 系) では絶対に動作しない。**
-
-参考: NCS の公式テストオーバーレイ
+公式テストオーバーレイ参考:
 `/opt/nordic/ncs/v2.9.2/zephyr/tests/drivers/i2s/*/boards/nrf54l15dk_nrf54l15_cpuapp.overlay`
-→ P1.08/P1.09/P1.11/P1.12 を使用している
 
-### 2. nRF54L15 の I2S ノードは `i2s20`
+### 2. I2S の実際のサンプルレートは 15873 Hz
 
-nRF52 では `i2s0` だが、nRF54L15 では `i2s20`。
+ファームウェアの設定値は 16000 Hz だが、nRF54L15 の MCLK 制約により
+実際の出力は **15873 Hz** になる。Mac 側のペーシングはこれに合わせること。
 
-- `main.c`: `DT_NODELABEL(i2s20)`
-- overlay: `&i2s20 { ... }`
-- pinctrl: `i2s20_default`
+```python
+# speaker_client.py
+I2S_ACTUAL_HZ = 15873
+PACKET_INTERVAL = CHUNK_BYTES / (I2S_ACTUAL_HZ * 2)  # 7.498ms
+```
 
-### 3. pyocd のターゲット名は `nrf54l`
+### 3. BLE MTU とパケットサイズの制約
+
+```
+MTU = 244
+最大ペイロード = MTU - 3 = 241 bytes
+パケット構成 = 1 (seq) + 1 (magic) + 238 (PCM) = 240 bytes  ≤ 241 ✓
+
+240 bytes を超えると CoreBluetooth が書き込みをサイレントドロップする
+```
+
+### 4. I2S feeder スラブタイムアウト問題
+
+**症状**: `ring=16384/16384` が変わらない、音が出ない
+**原因**: I2S ドライバがスラブを全保持したまま返さなくなる → feeder が `k_mem_slab_alloc(K_FOREVER)` でデッドロック
+**対処**: `K_FOREVER` を `K_MSEC(200)` に変更し、タイムアウト時に `i2s_recover()` を呼ぶ
+
+```c
+// src/main.c i2s_feeder_thread 内
+int ret = k_mem_slab_alloc(&i2s_tx_slab, &slab, K_MSEC(200));
+if (ret < 0) {
+    LOG_ERR("slab alloc timeout, recovering I2S");
+    i2s_recover(dev);  // DROP → PREPARE → START
+    continue;
+}
+```
+
+### 5. BLE 接続時にリングバッファをリセット
+
+再接続時に前セッションの古いデータが残っていると初期バーストで ring が溢れる。
+`ble_connected()` で `ring_buf_reset()` を呼ぶことで解消。
+
+### 6. リングバッファのオーバーフロー保護を入れない
+
+`ring_buf_space_get()` でチェックしてドロップすると、初期バースト時に
+全パケットがドロップされて完全無音になる。`ring_buf_put()` を無条件で呼ぶ
+（Zephyr の実装が収まる分だけ書く）。
+
+### 7. pyocd のターゲット名
 
 ```bash
-pyocd flash -t nrf54l <hex_file>
-```
-
-`nrf54l15` は認識されない。
-
-### 4. ピンコントロールは全ピンを単一グループに
-
-```dts
-group1 {
-    psels = <NRF_PSEL(I2S_SCK_M, 1, 4)>,
-            <NRF_PSEL(I2S_LRCK_M, 1, 5)>,
-            <NRF_PSEL(I2S_SDOUT, 1, 6)>;
-};
-```
-
-3つに分けると `pinctrl_apply_state` でエラーになる場合がある。
-
-### 5. TX バッファカウントは余裕を持たせる
-
-```kconfig
-CONFIG_I2S_NRFX_TX_BLOCK_COUNT=8
-```
-
-デフォルト値だと `slab alloc timeout` が発生しやすい。
-
-### 6. サンプルレートは 48000 Hz 固定
-
-nRF54L15 の HFXO から割り切れるサンプルレートは 48000 Hz が安定。
-44100 Hz は若干の誤差が生じる可能性がある。
-
----
-
-## デバッグ手順
-
-### I2S が動作しているか確認する方法
-
-起動直後にシリアルログで以下を確認:
-
-1. `I2S configured OK` が出ているか → OK なら初期化成功
-2. `slab alloc timeout: -11` が出続けているか → TX が詰まっている（ピン不一致）
-3. ログが出ない / `I2S device not ready` → overlay の `i2s20` 設定が誤り
-
-### TX が詰まっているときのチェックリスト
-
-- [ ] ピンが P1 系か（P2 系では動作しない）
-- [ ] SPK2 の BCLK/LRCLK/SDATA の接続順が正しいか
-- [ ] GND が XIAO と SPK2 の間で共通になっているか
-- [ ] 3V3 が SPK2 の pin7 (3V3) に接続されているか（5VIN ではない）
-- [ ] overlay で `spi00` や他のペリフェラルが同じピンを使っていないか
-
-### シリアルログの取り方（ロストなし）
-
-```bash
-# リセットと同時にシリアルを開く
-pyocd reset -t nrf54l & python3 -c "
-import serial, time
-s = serial.Serial('$(ls /dev/tty.usbmodem* | head -1)', 115200, timeout=5)
-time.sleep(0.1)
-while True:
-    l = s.readline()
-    if not l: break
-    print(l.decode(errors='replace'), end='')
-"
+pyocd flash -t nrf54l <hex_file>   # ○
+pyocd flash -t nrf54l15 ...        # ✗ (認識されない)
 ```
 
 ---
 
-## 設定ファイル詳細
+## トラブルシューティング
 
-### prj.conf
+### 音が出ない
 
-```kconfig
-CONFIG_I2S=y
-CONFIG_LOG=y
-CONFIG_LOG_DEFAULT_LEVEL=3
-CONFIG_I2S_NRFX_TX_BLOCK_COUNT=8
-```
+| シリアルログ | 原因 | 対処 |
+|-------------|------|------|
+| `ring=16384/16384` が変わらない | I2S feeder デッドロック | ファームを `K_MSEC(200)` 版にアップデート |
+| `ring=` が 0 のまま | BLE パケットが届いていない | speaker_client.py の UUID / MTU を確認 |
+| `slab alloc timeout, recovering I2S` が繰り返す | I2S ハードウェア異常 | デバイスを再起動 |
+| `bad packet` ログ | パケット形式の不一致 | magic byte が 0xAA か確認 |
 
-### boards/xiao_nrf54l15_nrf54l15_cpuapp.overlay
+### 音が割れる / 途切れる
 
-```dts
-/* I2S20 only works with Port 1 pins on nRF54L15 (hardware restriction).
- * Using D0/D1/D2 (P1.04/05/06) — rewire SPK2 from D8-D10 to D0-D2.
- */
+| 症状 | 原因 | 対処 |
+|------|------|------|
+| 断続的にブツブツ | BLE コネクションインターバルが長い | `bt_conn_le_param_update(6, 8, ...)` で 7.5ms を確保 |
+| 最初の数秒だけ割れる | 初期バーストで ring が一時的に溢れる | queue=30 の pre-buffer が安定するまで待つ |
+| `queue=0` が続く | ffmpeg が遅い / ネットワーク不安定 | URL を変えるかローカルファイルで試す |
 
-&pinctrl {
-    i2s20_default: i2s20_default {
-        group1 {
-            psels = <NRF_PSEL(I2S_SCK_M, 1, 4)>,
-                    <NRF_PSEL(I2S_LRCK_M, 1, 5)>,
-                    <NRF_PSEL(I2S_SDOUT, 1, 6)>;
-        };
-    };
-};
+### BLE が見つからない
 
-&i2s20 {
-    status = "okay";
-    pinctrl-0 = <&i2s20_default>;
-    pinctrl-names = "default";
-};
+```bash
+# デバイスが "SpeakerBridge" でアドバタイズしているか確認
+# iPhone の LightBlue アプリ等でスキャン
 ```
 
 ---
@@ -226,13 +264,6 @@ CONFIG_I2S_NRFX_TX_BLOCK_COUNT=8
 
 - NCS: v2.9.2
 - ボード: `xiao_nrf54l15/nrf54l15/cpuapp`
-- pyocd: `pip install pyocd` でインストール
 - ホスト OS: macOS
+- Python: 3.x, bleak, ffmpeg
 - 確認日: 2026-03-20
-
----
-
-## 旧デバッグ記録
-
-旧バージョン（D8/D9/D10 使用・音が出なかった経緯）は
-`docs/nrf54-speaker_debug_summary.md` を参照。
