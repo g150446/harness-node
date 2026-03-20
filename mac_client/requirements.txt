@@ -2,3 +2,4 @@ bleak>=0.20.0
 numpy>=1.24.0
 pyaudio>=0.2.13
 pyserial>=3.5
+webrtcvad-wheels>=2.0.10

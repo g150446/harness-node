@@ -210,7 +210,7 @@ TILT が届き、直前 WAKEUP から 2000ms 未満
 有効な TILT の時点で、直前 2000ms 以内に DOUBLE_CLENCH がある
   → 自動録音開始
 
-録音開始から 1000ms 経過後に MOTION ACTIVE
+録音中に TILT が届く（since_wakeup 条件なし）
   → 自動録音停止
 ```
 
@@ -227,8 +227,12 @@ TILT が届き、直前 WAKEUP から 2000ms 未満
 [TILT] active=YES src=0x20 count=172 since_wakeup=136ms
 [DOUBLE_CLENCH] count=12 since_tilt=412ms
 [AUTO] Qualified tilt matched recent DOUBLE_CLENCH (since_double_clench=412ms) → start recording
-[AUTO] MOTION ACTIVE during gesture recording ignored (grace 834ms/1000ms)
-[AUTO] MOTION ACTIVE detected after grace period → stop recording
+[WAV] Recording: nrf52voice_20260320_101443.wav
+  ... (発話)
+[TILT] active=YES src=0x20 count=173 since_wakeup=842ms
+[AUTO] TILT detected during recording → stop recording (gesture_active=True)
+[WAV] Saved 4.2s (86400 bytes) → nrf52voice_20260320_101443.wav
+[VAD] Speech detected (ratio=42.3%) → keep
 ```
 
 ### データ収集ツール
@@ -246,11 +250,14 @@ python3 gesture_collector.py
 ### 主要定数（`mac_client/nrf52_voice_client.py`）
 
 ```python
-TILT_WAKEUP_MAX_MS = 2000
-DOUBLE_CLENCH_TILT_MAX_MS = 2000
-GESTURE_EVENT_RETENTION_S = 5.0
-RECORDING_WAKEUP_GRACE_MS = 1000
-MIN_RECORDING_DURATION_MS = 1000
+TILT_WAKEUP_MAX_MS = 2000          # TILT が有効とみなされる WAKEUP からの最大経過時間
+DOUBLE_CLENCH_TILT_MAX_MS = 2000   # TILT が録音開始と紐付けられる DOUBLE_CLENCH からの最大経過時間
+GESTURE_EVENT_RETENTION_S = 5.0    # ジェスチャーイベントを保持する時間窓
+MIN_RECORDING_DURATION_MS = 1000   # 手動停止の最小録音時間（スクリプト終了時は無視）
+
+VAD_AGGRESSIVENESS = 2             # VAD 感度 0-3（数値が大きいほど無音判定が厳格）
+VAD_FRAME_MS = 30                  # VAD フレーム長（10/20/30ms のみ）
+VAD_SPEECH_RATIO_THRESHOLD = 0.10  # 発語フレーム割合の閾値（これ未満なら破棄）
 ```
 
 ---
@@ -286,8 +293,9 @@ venv/bin/python3 -m py_compile mac_client/nrf52_voice_client.py
 1. クライアント起動後、`Gesture mode: ON` を確認。
 2. `DOUBLE_CLENCH` ログが先に出ることを確認。
 3. その後の有効な `TILT` で録音開始することを確認。
-4. 開始後 1 秒未満の `MOTION ACTIVE` では停止しないことを確認。
-5. 1 秒経過後の `MOTION ACTIVE` で停止し、`mac_client/output/` に WAV が保存されることを確認。
+4. 発話しながら録音し、`TILT` で停止すると `[VAD] Speech detected → keep` が出て WAV が保存されることを確認。
+5. 発話せずに録音し、`TILT` で停止すると `[VAD] No speech detected → discard` が出て WAV が削除されることを確認。
+6. スクリプトを Ctrl+C で終了した場合も同様に VAD が実行されることを確認。
 
 ---
 
@@ -484,6 +492,54 @@ for (int i = 0; i < 80; i++) {
 ### 常時 PDM 駆動は避けること
 
 PDM を常時駆動してアイドル時に drain するアプローチは **slab が枯渇して DMA がストールする** ため機能しない。録音ごとに `DMIC_TRIGGER_START`/`STOP` を実行し、start 時に DC 収束を待つのが正しい実装。
+
+---
+
+## VAD（音声区間検出）
+
+録音停止後に **webrtcvad-wheels** を用いた VAD を実行し、発語が検出されない録音を自動破棄する。
+
+### 採用理由
+
+nRF52840 側での VAD は PDM の DC オフセット収束期間の影響で誤検知が多いため、Mac クライアント（Python）側で実装。Google WebRTC 由来の VAD ライブラリ `webrtcvad` は 16kHz 16-bit PCM モノラルにネイティブ対応しており、本システムの音声フォーマットと完全一致する。
+
+### 動作フロー
+
+```
+TILT / Ctrl+C / 手動 's' で stop_recording() が呼ばれる
+  ↓
+recorder.stop_recording()  → WAV ファイルを close・確定
+  ↓
+check_voice_activity(wav_path)  → 30ms フレーム単位で VAD 判定
+  ├─ speech_ratio ≥ 10% → [VAD] Speech detected → ファイル保持
+  └─ speech_ratio <  10% → [VAD] No speech detected → os.remove() で削除
+  ↓
+_send_ble_stop()  → firmware に停止コマンド
+```
+
+### インストール
+
+```bash
+pip install webrtcvad-wheels
+```
+
+`requirements.txt` に `webrtcvad-wheels>=2.0.10` として記載済み。
+
+### ログ例
+
+```text
+[WAV] Saved 4.2s (86400 bytes) → nrf52voice_20260320_101443.wav
+[VAD] Speech detected (ratio=42.3%) → keep
+
+[WAV] Saved 1.1s (22400 bytes) → nrf52voice_20260320_101512.wav
+[VAD] No speech detected (ratio=0.0%) → discard
+```
+
+### 注意事項
+
+- VAD は**同期処理**のため、長い録音では若干イベントループをブロックする（数百 ms 程度）。
+- VAD に例外が発生した場合はファイルをそのまま保持し、警告ログを出力する（録音データは失わない）。
+- スクリプト終了時（Ctrl+C）も `force=True` で VAD が実行される。
 
 ---
 

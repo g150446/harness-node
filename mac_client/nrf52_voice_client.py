@@ -47,6 +47,10 @@ DOUBLE_CLENCH_TILT_MAX_MS = 2000
 GESTURE_EVENT_RETENTION_S = 5.0
 MIN_RECORDING_DURATION_MS = 1000
 
+VAD_AGGRESSIVENESS = 2             # 0-3、2が汎用的
+VAD_FRAME_MS = 30                  # webrtcvad は 10/20/30ms のみ許可
+VAD_SPEECH_RATIO_THRESHOLD = 0.10  # 10%以上のフレームで発語検出→録音保持
+
 # Audio config (must match firmware)
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2   # 16-bit
@@ -158,6 +162,37 @@ class WAVRecorder:
 #     それらはすべてACTIVEの前（動作開始時の同一モーションから）
 #     → ACTIVE後にwakeupは発生しない
 #
+def check_voice_activity(wav_path: str) -> tuple[bool, float]:
+    """WAVファイルを読み込み、発語フレームの割合を返す。
+    Returns (speech_detected: bool, speech_ratio: float)
+    """
+    import webrtcvad
+    import wave as wave_mod
+
+    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+    with wave_mod.open(wav_path, 'rb') as wf:
+        sample_rate = wf.getframerate()
+        sample_width = wf.getsampwidth()
+        n_channels = wf.getnchannels()
+        frame_samples = int(sample_rate * VAD_FRAME_MS / 1000)
+        frame_bytes = frame_samples * sample_width * n_channels
+
+        speech_frames = 0
+        total_frames = 0
+        while True:
+            raw = wf.readframes(frame_samples)
+            if len(raw) < frame_bytes:
+                break
+            total_frames += 1
+            if vad.is_speech(raw, sample_rate):
+                speech_frames += 1
+
+    if total_frames == 0:
+        return False, 0.0
+    ratio = speech_frames / total_frames
+    return ratio >= VAD_SPEECH_RATIO_THRESHOLD, ratio
+
+
 def classify_gesture(activity: float, peak: float,
                      z_excursion: float = 0.0,
                      wakeups_after_active: int = 0) -> str:
@@ -354,8 +389,9 @@ class VoiceBridge52Client:
         print(f"  [TILT] active={active} src=0x{tilt_src:02x} count={count} "
               f"since_wakeup={wakeup_delta}")
 
-        if active == "YES" and self.auto_mode and self._gesture_recording_active and self.recorder.is_recording:
-            print("  [AUTO] TILT detected during gesture recording → stop recording")
+        if active == "YES" and self.auto_mode and self.recorder.is_recording:
+            print("  [AUTO] TILT detected during recording → stop recording"
+                  f" (gesture_active={self._gesture_recording_active})")
             self._gesture_recording_active = False
             self._clear_gesture_events()
             self.stop_recording()
@@ -444,8 +480,24 @@ class VoiceBridge52Client:
         self._gesture_recording_started_at = None
         self._clear_gesture_events()
         self.recorder.stop_recording()
-        t = asyncio.create_task(self._send_ble_stop())
-        t.add_done_callback(lambda _: None)  # keep reference alive
+
+        # VADチェック: 発語なしなら WAV を削除
+        if self.recorder._filename and os.path.exists(self.recorder._filename):
+            try:
+                speech_detected, ratio = check_voice_activity(self.recorder._filename)
+                if speech_detected:
+                    print(f"  [VAD] Speech detected (ratio={ratio:.1%}) → keep")
+                else:
+                    print(f"  [VAD] No speech detected (ratio={ratio:.1%}) → discard")
+                    os.remove(self.recorder._filename)
+            except Exception as e:
+                logger.warning(f"  [VAD] check failed, keeping file: {e}")
+
+        try:
+            t = asyncio.create_task(self._send_ble_stop())
+            t.add_done_callback(lambda _: None)  # keep reference alive
+        except RuntimeError:
+            pass  # event loop shutting down (e.g. Ctrl-C in finally block)
 
     def print_stats(self):
         print(f"  Packets received: {self._packets_received}")
@@ -561,7 +613,7 @@ async def main():
         print("\nInterrupted.")
     finally:
         if client.recorder.is_recording:
-            client.stop_recording()
+            client.stop_recording(force=True)
             await asyncio.sleep(0.5)
         client.print_stats()
         await client.disconnect()
