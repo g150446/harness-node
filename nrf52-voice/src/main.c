@@ -49,6 +49,8 @@ LOG_MODULE_REGISTER(nrf52_voice, LOG_LEVEL_INF);
 #define ACCEL_ODR_HZ                52
 #define MOTION_SAMPLE_INTERVAL_MS   100
 #define EVENT_POLL_INTERVAL_MS      25
+#define IDLE_SLEEP_TIMEOUT_MS       30000   /* 30s idle → low-power mode */
+#define SLEEP_POLL_INTERVAL_MS      1000    /* polling interval in low-power mode */
 #define CALIBRATION_SAMPLES         25
 #define ACTIVITY_WINDOW_SAMPLES     4
 #define MOTION_ENTRY_ACTIVITY_MS2   8.0
@@ -107,6 +109,11 @@ LOG_MODULE_REGISTER(nrf52_voice, LOG_LEVEL_INF);
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
     0x00, 0x10, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00
 
+/* Power State TX: 00000015-... (Notify) */
+#define MOTION_UUID_POWER_STATE_TX_CHAR \
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
+    0x00, 0x10, 0x00, 0x00, 0x15, 0x00, 0x00, 0x00
+
 /* ============================================================================
  * Global Variables
  * ============================================================================ */
@@ -128,6 +135,10 @@ static const struct bt_data scan_rsp[] = {
 };
 
 static struct bt_conn *current_conn;
+
+/* Low-power mode */
+static volatile bool low_power_mode;
+static int64_t last_event_time_ms;
 
 /* Audio state */
 static uint8_t tx_packet[512];
@@ -190,6 +201,9 @@ static double z_excursion_peak;  /* peak |z - baseline_z| during current motion 
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 #endif
 
+/* Forward declarations */
+static void reset_idle_timer(void);
+
 /* Microphone power enable (P1.10, active-high) */
 #define MIC_PWR_NODE DT_NODELABEL(msm261d3526hicpm_c_en)
 static const struct gpio_dt_spec mic_pwr =
@@ -223,6 +237,7 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
     const uint8_t *data = buf;
 
     if (len >= 1) {
+        reset_idle_timer();
         if (data[0] == 0x01) {
             printk(">>> Manual START command\n");
             recording_requested = true;
@@ -267,6 +282,11 @@ static void tilt_tx_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t va
     LOG_INF("Tilt TX CCCD updated: %d", value);
 }
 
+static void power_state_tx_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    LOG_INF("Power State TX CCCD updated: %d", value);
+}
+
 BT_GATT_SERVICE_DEFINE(motion_svc,
     BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_128(MOTION_UUID_SERVICE)),
 
@@ -283,9 +303,34 @@ BT_GATT_SERVICE_DEFINE(motion_svc,
         BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_READ, NULL, NULL, NULL),
     BT_GATT_CCC(tilt_tx_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 
+    /* Power State TX — attrs[10]=decl, attrs[11]=value, attrs[12]=CCCD */
+    BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(MOTION_UUID_POWER_STATE_TX_CHAR),
+        BT_GATT_CHRC_NOTIFY, BT_GATT_PERM_READ, NULL, NULL, NULL),
+    BT_GATT_CCC(power_state_tx_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+
+    /* Build Info — attrs[13]=decl, attrs[14]=value */
     BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(MOTION_UUID_BUILD_INFO_CHAR),
         BT_GATT_CHRC_READ, BT_GATT_PERM_READ, read_build_info, NULL, NULL),
 );
+
+/* state: 0x01 = entering low-power, 0x00 = waking up */
+static void notify_power_state(uint8_t state)
+{
+    if (!current_conn) {
+        return;
+    }
+    bt_gatt_notify(NULL, &motion_svc.attrs[11], &state, 1);
+}
+
+static void reset_idle_timer(void)
+{
+    last_event_time_ms = k_uptime_get();
+    if (low_power_mode) {
+        low_power_mode = false;
+        printk(">>> Waking from low-power mode\n");
+        notify_power_state(0x00);
+    }
+}
 
 /* axes: bit2=Z, bit1=Y, bit0=X (from WAKE_UP_SRC) */
 static void notify_wakeup_event(uint8_t axes, uint8_t count)
@@ -345,6 +390,7 @@ static void notify_motion_event(uint8_t event_type, uint8_t count,
 
 static void on_motion_started(void)
 {
+    reset_idle_timer();
     int64_t now = k_uptime_get();
 
     if ((now - last_audio_transition_ms) >= MOTION_AUDIO_COOLDOWN_MS) {
@@ -608,6 +654,7 @@ static void check_wakeup_src(void)
     uint8_t axes = wu_src & 0x07;       /* bit2=Z, bit1=Y, bit0=X */
     uint8_t count = (uint8_t)(atomic_inc(&detected_wakeup_count) + 1);
     printk(">>> Wakeup! axes=0x%02x count=%u\n", axes, count);
+    reset_idle_timer();
     notify_wakeup_event(axes, count);
 }
 
@@ -625,6 +672,7 @@ static void check_tilt_src(void)
 
     uint8_t count = (uint8_t)(atomic_inc(&detected_tilt_count) + 1);
     printk(">>> Tilt! func_src1=0x%02x count=%u\n", func_src1, count);
+    reset_idle_timer();
     notify_tilt_event(func_src1, count);
 }
 
@@ -874,7 +922,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
             dmic_session_active = false;
         }
 
-        k_msleep(20);
+        k_msleep(low_power_mode ? SLEEP_POLL_INTERVAL_MS : 20);
     }
 }
 
@@ -903,6 +951,7 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     LOG_INF("BLE connected");
     printk(">>> Connected!\n");
     current_conn = conn;
+    reset_idle_timer();
 
     int ret = bt_gatt_exchange_mtu(conn, &exchange_params);
     if (ret) {
@@ -928,6 +977,8 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
     current_conn = NULL;
     is_recording = false;
     stop_requested = true;
+    low_power_mode = false;
+    last_event_time_ms = k_uptime_get();
 
     /* Restart advertising so the device stays discoverable */
     int ret = bt_le_adv_start(BT_LE_ADV_CONN, adv_data, ARRAY_SIZE(adv_data),
@@ -1003,6 +1054,7 @@ int main(void)
 
     LOG_INF("VoiceBridge52 ready");
     printk("System ready. Calibrating IMU...\n");
+    last_event_time_ms = k_uptime_get();
 
     /* Auto-confirm the running image after advertising starts successfully.
      * A 3-second delay is used as a basic sanity check that the firmware
@@ -1027,13 +1079,26 @@ int main(void)
     /* Main loop: check wakeup/tilt faster than full motion processing to reduce tilt latency */
     int64_t last_motion_sample_ms = k_uptime_get();
     while (1) {
-        k_sleep(K_MSEC(EVENT_POLL_INTERVAL_MS));
+        int32_t poll_ms = low_power_mode ? SLEEP_POLL_INTERVAL_MS : EVENT_POLL_INTERVAL_MS;
+        k_sleep(K_MSEC(poll_ms));
+
         if (wdt_channel_id >= 0) {
             wdt_feed(wdt, wdt_channel_id);
         }
+
         check_wakeup_src();
         check_tilt_src();
+
         int64_t now_ms = k_uptime_get();
+
+        /* Idle timeout: enter low-power mode after 30s with no events */
+        if (!low_power_mode && !is_recording &&
+            (now_ms - last_event_time_ms) >= IDLE_SLEEP_TIMEOUT_MS) {
+            low_power_mode = true;
+            printk(">>> Entering low-power mode (idle 30s)\n");
+            notify_power_state(0x01);
+        }
+
         if ((now_ms - last_motion_sample_ms) >= MOTION_SAMPLE_INTERVAL_MS) {
             last_motion_sample_ms = now_ms;
             process_motion_sample();

@@ -37,9 +37,10 @@ AUDIO_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"  # Notify
 AUDIO_RX_UUID = "00000003-0000-1000-8000-00805f9b34fb"  # Write
 
 # Motion Service UUIDs
-MOTION_TX_UUID = "00000011-0000-1000-8000-00805f9b34fb"  # Notify
-WAKEUP_TX_UUID = "00000013-0000-1000-8000-00805f9b34fb"  # Notify
-TILT_TX_UUID   = "00000014-0000-1000-8000-00805f9b34fb"  # Notify
+MOTION_TX_UUID      = "00000011-0000-1000-8000-00805f9b34fb"  # Notify
+WAKEUP_TX_UUID      = "00000013-0000-1000-8000-00805f9b34fb"  # Notify
+TILT_TX_UUID        = "00000014-0000-1000-8000-00805f9b34fb"  # Notify
+POWER_STATE_TX_UUID = "00000015-0000-1000-8000-00805f9b34fb"  # Notify
 
 BLE_MTU_SIZE = 512
 TILT_WAKEUP_MAX_MS = 2000
@@ -279,7 +280,8 @@ class VoiceBridge52Client:
         await self.client.start_notify(MOTION_TX_UUID, self._on_motion)
         await self.client.start_notify(WAKEUP_TX_UUID, self._on_wakeup)
         await self.client.start_notify(TILT_TX_UUID, self._on_tilt)
-        print("  Notifications enabled (audio + motion + wakeup + tilt)")
+        await self.client.start_notify(POWER_STATE_TX_UUID, self._on_power_state)
+        print("  Notifications enabled (audio + motion + wakeup + tilt + power_state)")
         print(f"  Gesture mode: {'ON' if self.auto_mode else 'OFF'} "
               f"(qualifying TILT starts recording only if a DOUBLE_CLENCH occurred within the previous {DOUBLE_CLENCH_TILT_MAX_MS}ms; later MOTION ACTIVE stops)")
         await asyncio.sleep(0.5)
@@ -291,6 +293,7 @@ class VoiceBridge52Client:
                 await self.client.stop_notify(MOTION_TX_UUID)
                 await self.client.stop_notify(WAKEUP_TX_UUID)
                 await self.client.stop_notify(TILT_TX_UUID)
+                await self.client.stop_notify(POWER_STATE_TX_UUID)
             except Exception:
                 pass
             await self.client.disconnect()
@@ -410,6 +413,15 @@ class VoiceBridge52Client:
                     self._gesture_recording_active = True
                     self._gesture_recording_started_at = now
                     self._clear_gesture_events()
+
+    def _on_power_state(self, sender, data: bytes):
+        if len(data) < 1:
+            return
+        state = data[0]
+        if state == 0x01:
+            print("  [SLEEP] Device entering low-power mode")
+        else:
+            print("  [SLEEP] Device waking up from low-power mode")
 
     async def _send_ble_start(self):
         try:
