@@ -23,12 +23,9 @@ if [ -z "$PYOCD_CMD" ]; then
     exit 1
 fi
 
-HEX_FILE="$BUILD_DIR/zephyr/zephyr.hex"
+HEX_FILE="$BUILD_DIR/nrf54-speaker/zephyr/zephyr.hex"
 if [ ! -f "$HEX_FILE" ]; then
     HEX_FILE="$BUILD_DIR/merged.hex"
-fi
-if [ ! -f "$HEX_FILE" ]; then
-    HEX_FILE="$BUILD_DIR/nrf54-speaker/zephyr/zephyr.hex"
 fi
 if [ ! -f "$HEX_FILE" ]; then
     echo "ERROR: Expected hex not found under $BUILD_DIR" >&2
@@ -42,4 +39,4 @@ echo ""
 echo "Done: built firmware, refreshed the OTA payload, and flashed over USB."
 echo "Serial monitor at 115200 baud:"
 echo "  screen \$(ls /dev/tty.usbmodem* | head -1) 115200"
-echo "Expected log on motion: 'Motion detected! count=N ... -> audio playback'"
+echo "Expected: no 'I2S configure failed' errors; 440Hz tone from speaker."
