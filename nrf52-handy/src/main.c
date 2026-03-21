@@ -62,7 +62,7 @@ LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
 
 /* IMU / motion detection */
 #define IMU_NODE                    DT_ALIAS(imu0)
-#define ACCEL_ODR_HZ                52
+#define ACCEL_ODR_HZ                416   /* 416 Hz for tap detection resolution */
 #define MOTION_SAMPLE_INTERVAL_MS   25
 #define CALIBRATION_SAMPLES         25
 #define ACTIVITY_WINDOW_SAMPLES     4
@@ -79,10 +79,9 @@ LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
 #define MOTION_DURATION_SAMPLES     2
 
 /* Gesture classifier thresholds */
-#define GESTURE_ACTIVE_Z_MIN_MS2    (-3.0f)  /* motion_active z must be <= this */
-#define GESTURE_ACTIVE_Z_MAX_MS2    3.0f     /* motion_active z must be >= this */
-#define GESTURE_SETTLE_Z_MIN_MS2    8.0f     /* motion_settled z must be >= this */
-#define GESTURE_WINDOW_MS           2000     /* max ms between active and settle */
+#define GESTURE_ACTIVE_Z_ABS_MAX_MS2 5.0f   /* |motion_active z| must be < this */
+#define GESTURE_SETTLE_Z_MIN_MS2     8.0f   /* motion_settled z must be >= this */
+#define GESTURE_WINDOW_MS            2000   /* max ms between active and settle */
 
 /* ============================================================================
  * BLE UUIDs (Handy-compatible)
@@ -135,7 +134,7 @@ static K_THREAD_STACK_DEFINE(audio_stack, 4096);
 static struct k_thread audio_thread_data;
 
 /* IMU device */
-static const struct device *const imu = DEVICE_DT_GET(IMU_NODE);
+static const struct device *const imu     = DEVICE_DT_GET(IMU_NODE);
 
 /* Gesture state */
 static int64_t motion_active_start_ms;
@@ -484,13 +483,13 @@ static void on_motion_settled(float z)
     }
 
     int64_t elapsed = k_uptime_get() - motion_active_start_ms;
-    bool active_z_ok  = (gesture_active_z >= GESTURE_ACTIVE_Z_MIN_MS2 &&
-                         gesture_active_z <= GESTURE_ACTIVE_Z_MAX_MS2);
+    float active_z_abs = gesture_active_z < 0.0f ? -gesture_active_z : gesture_active_z;
+    bool active_z_ok  = (active_z_abs < GESTURE_ACTIVE_Z_ABS_MAX_MS2);
     bool settle_z_ok  = (z >= GESTURE_SETTLE_Z_MIN_MS2);
     bool window_ok    = (elapsed <= GESTURE_WINDOW_MS);
 
-    printk(">>> Gesture check: active_z=%.2f settle_z=%.2f elapsed=%lld ms\n",
-           (double)gesture_active_z, (double)z, (long long)elapsed);
+    printk(">>> Gesture check: active_z=%.2f(|%.2f|<5) settle_z=%.2f elapsed=%lld ms\n",
+           (double)gesture_active_z, (double)active_z_abs, (double)z, (long long)elapsed);
 
     if (active_z_ok && settle_z_ok && window_ok) {
         printk(">>> Gesture MATCH → recording_start\n");

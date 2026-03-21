@@ -174,40 +174,7 @@ Reset cause: 0x00080000 [CPU_LOCKUP]
 
 ---
 
-## 5. タップ検出 BLE 通知
-
-### BLE Characteristic
-
-| UUID | プロパティ | 内容 |
-|------|-----------|------|
-| `00000013-0000-1000-8000-00805f9b34fb` | Notify | タップイベント通知（2 バイト） |
-
-**パケット形式:**
-
-```
-Byte 0: tap_type   0x01 = シングルタップ / 0x02 = ダブルタップ
-Byte 1: count      累積タップ数（8bit ロールオーバー）
-```
-
-### LSM6DS3TR-C 設定（直接 I2C アクセス）
-
-Zephyr の `lsm6dsl` ドライバはタップトリガーを未サポートのため、I2C レジスタを直接制御。
-
-| レジスタ | アドレス | 値 | 目的 |
-|----------|----------|----|------|
-| `CTRL1_XL` | 0x10 | `0x60` | ODR=416Hz（タップ検出に必須。26Hz では動作しない） |
-| `CTRL6_C` | 0x15 | bit4=0 | 高性能モード有効（Zephyr ドライバが無効にするため再有効化） |
-| `TAP_CFG` | 0x58 | `0x8F` | INTERRUPTS_ENABLE=1, XYZ_EN=1, LIR=1 |
-| `TAP_THS_6D` | 0x59 | `0x04` | 閾値 250mg |
-| `INT_DUR2` | 0x5A | `0x7A` | DUR=7, QUIET=2, SHOCK=2 |
-| `WAKE_UP_THS` | 0x5B | `0x82` | SINGLE_DOUBLE_TAP=1, WK_THS=2 |
-| `MD1_CFG` | 0x5E | `0x48` | TAP を INT1 にルーティング（TAP_SRC 読み出しに必須） |
-
-**重要:** 上記 3 条件（ODR=416Hz、高性能モード有効、MD1_CFG 設定）をすべて満たさないと `TAP_SRC` が常に `0x00` になる。
-
----
-
-## 6. Mac クライアント 自動再接続
+## 5. Mac クライアント 自動再接続
 
 ### 変更内容（`mac_client/nrf52_voice_client.py`）
 
