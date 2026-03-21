@@ -82,6 +82,7 @@ LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
 #define GESTURE_ACTIVE_Z_ABS_MAX_MS2 5.0f   /* |motion_active z| must be < this */
 #define GESTURE_SETTLE_Z_MIN_MS2     8.0f   /* motion_settled z must be >= this */
 #define GESTURE_WINDOW_MS            2000   /* max ms between active and settle */
+#define GESTURE_WAKE_ACTIVE_Z_MIN_MS2  6.0f  /* sleep wake直後: active z must be > this */
 
 /* Light sleep */
 #define LIGHT_SLEEP_TIMEOUT_MS       10000  /* enter light sleep after 10s of no motion */
@@ -148,6 +149,7 @@ static float gesture_active_z;
 static atomic_t detected_motion_count;
 static uint32_t last_motion_time_ms;
 static bool imu_sleeping;
+static bool just_woke_from_sleep;
 static bool baseline_valid;
 static double baseline_x, baseline_y, baseline_z;
 static uint8_t calibration_count, active_high_count, settle_count;
@@ -473,6 +475,7 @@ static void on_motion_started(float z)
 {
     if (imu_sleeping) {
         imu_sleeping = false;
+        just_woke_from_sleep = true;
         printk(">>> Wake from light sleep\n");
         send_event_packet(0x21);
         if (current_conn) {
@@ -505,7 +508,10 @@ static void on_motion_settled(float z)
 
     int64_t elapsed = k_uptime_get() - motion_active_start_ms;
     float active_z_abs = gesture_active_z < 0.0f ? -gesture_active_z : gesture_active_z;
-    bool active_z_ok  = (active_z_abs < GESTURE_ACTIVE_Z_ABS_MAX_MS2);
+    bool active_z_ok  = just_woke_from_sleep
+        ? (gesture_active_z > GESTURE_WAKE_ACTIVE_Z_MIN_MS2)
+        : (active_z_abs < GESTURE_ACTIVE_Z_ABS_MAX_MS2);
+    just_woke_from_sleep = false;
     bool settle_z_ok  = (z >= GESTURE_SETTLE_Z_MIN_MS2);
     bool window_ok    = (elapsed <= GESTURE_WINDOW_MS);
 

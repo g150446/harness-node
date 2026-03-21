@@ -100,15 +100,19 @@ nrf52-handy/
 
 ジェスチャー判定はファームウェア内で完結します。以下の 3 条件がすべて成立したとき `recording_requested = true` となり、DMIC 録音を開始して `0x01` イベントを送信します。
 
-| 条件 | 判定内容 | しきい値 |
-|------|---------|---------|
-| 1. `motion_active` の z 値 | 腕が水平に近い状態でモーション開始 | `-3.0 ≤ z ≤ +3.0 m/s²` |
-| 2. `motion_settled` の z 値 | 静定時に腕が上がっている | `z ≥ 8.0 m/s²` |
-| 3. 経過時間 | active → settled の間隔 | `≤ 2000 ms` |
+| 条件 | 判定内容 | しきい値（通常） | しきい値（sleep wake 直後） |
+|------|---------|----------------|--------------------------|
+| 1. `motion_active` の z 値 | 腕の姿勢チェック | `\|z\| < 5.0 m/s²` | `z > 6.0 m/s²`（腕が持ち上がっている方向のみ） |
+| 2. `motion_settled` の z 値 | 静定時に腕が上がっている | `z ≥ 8.0 m/s²` | 同左 |
+| 3. 経過時間 | active → settled の間隔 | `≤ 2000 ms` | 同左 |
+
+> **sleep wake 直後の挙動**: スリープ解除後の最初の `motion_settled` のみ条件 1 を `z > 6.0` に差し替えます。
+> 腕を持ち上げる動き（z 正方向が大きい）以外は録音トリガーにならず、誤検知を抑制します。
+> 2 回目以降のモーションからは通常条件（`|z| < 5.0`）に戻ります。
 
 **シーケンス例（腕を持ち上げるジェスチャー）:**
 
-1. 腕が横方向に動き始める → `motion_active` 検出（z が ±3.0 以内）
+1. 腕が横方向に動き始める → `motion_active` 検出（通常: z が ±5.0 以内 / wake 直後: z > 6.0）
 2. 腕を持ち上げて静止する → `motion_settled` 検出（z ≥ 8.0）
 3. 1→2 の経過時間が 2000 ms 以内
 4. 3 条件成立 → 録音開始 + `0x01` 送信
@@ -147,9 +151,9 @@ nrf52-handy/
 
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
-| `GESTURE_ACTIVE_Z_MIN` | -3.0 m/s² | motion_active 時の z 軸下限 |
-| `GESTURE_ACTIVE_Z_MAX` | +3.0 m/s² | motion_active 時の z 軸上限 |
-| `GESTURE_SETTLE_Z_MIN` | 8.0 m/s² | motion_settled 時の z 軸下限 |
+| `GESTURE_ACTIVE_Z_ABS_MAX_MS2` | 5.0 m/s² | motion_active 時の z 絶対値上限（通常） |
+| `GESTURE_WAKE_ACTIVE_Z_MIN_MS2` | 6.0 m/s² | motion_active 時の z 下限（sleep wake 直後のみ） |
+| `GESTURE_SETTLE_Z_MIN_MS2` | 8.0 m/s² | motion_settled 時の z 軸下限 |
 | `GESTURE_WINDOW_MS` | 2000 ms | active → settled の最大許容時間 |
 
 ---
