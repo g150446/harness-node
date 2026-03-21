@@ -83,6 +83,10 @@ LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
 #define GESTURE_SETTLE_Z_MIN_MS2     8.0f   /* motion_settled z must be >= this */
 #define GESTURE_WINDOW_MS            2000   /* max ms between active and settle */
 
+/* Light sleep */
+#define LIGHT_SLEEP_TIMEOUT_MS       10000  /* enter light sleep after 10s of no motion */
+#define LIGHT_SLEEP_POLL_MS          200    /* IMU poll interval during light sleep */
+
 /* ============================================================================
  * BLE UUIDs (Handy-compatible)
  * ============================================================================ */
@@ -143,6 +147,7 @@ static float gesture_active_z;
 /* Motion detection state */
 static atomic_t detected_motion_count;
 static uint32_t last_motion_time_ms;
+static bool imu_sleeping;
 static bool baseline_valid;
 static double baseline_x, baseline_y, baseline_z;
 static uint8_t calibration_count, active_high_count, settle_count;
@@ -171,6 +176,7 @@ typedef enum {
     LED_CONNECTED,
     LED_RECORDING,
     LED_ERROR,
+    LED_SLEEP,
 } led_state_t;
 
 static led_state_t current_led_state = LED_BOOT;
@@ -235,6 +241,9 @@ static void led_set_state(led_state_t state)
         rgb_set(true, false, false); /* Red ON to start */
         blink_on = true;
         blink_next_ms = k_uptime_get() + ERROR_BLINK_MS;
+        break;
+    case LED_SLEEP:
+        rgb_set(false, false, false); /* All off */
         break;
     }
 }
@@ -426,7 +435,7 @@ static void accumulate_calibration(double x, double y, double z)
         previous_sample_valid = true;
         reset_step_window();
         last_report_ms = k_uptime_get();
-        last_motion_time_ms = 0;
+        last_motion_time_ms = (uint32_t)k_uptime_get();
     }
 }
 
@@ -462,6 +471,16 @@ static int configure_motion_detection(void)
 
 static void on_motion_started(float z)
 {
+    if (imu_sleeping) {
+        imu_sleeping = false;
+        printk(">>> Wake from light sleep\n");
+        if (current_conn) {
+            led_set_state(is_recording ? LED_RECORDING : LED_CONNECTED);
+        } else {
+            led_set_state(LED_ADVERTISING);
+        }
+    }
+
     motion_active_start_ms = k_uptime_get();
     gesture_active_z = z;
     send_event_packet_f32(0x10, z);
@@ -475,6 +494,7 @@ static void on_motion_started(float z)
 
 static void on_motion_settled(float z)
 {
+    last_motion_time_ms = (uint32_t)k_uptime_get();
     send_event_packet_f32(0x11, z);
     printk(">>> Motion settled z=%.2f\n", (double)z);
 
@@ -788,6 +808,13 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     LOG_INF("BLE connected");
     printk(">>> Connected!\n");
     current_conn = conn;
+
+    if (imu_sleeping) {
+        imu_sleeping = false;
+        printk(">>> Wake from light sleep (BLE connect)\n");
+        last_motion_time_ms = (uint32_t)k_uptime_get();
+    }
+
     led_set_state(LED_CONNECTED);
 
     int ret = bt_gatt_exchange_mtu(conn, &exchange_params);
@@ -927,11 +954,21 @@ int main(void)
 
         int64_t now_ms = k_uptime_get();
 
-        /* IMU motion detection */
+        /* IMU motion detection (reduced rate during light sleep) */
+        int64_t imu_poll_ms = imu_sleeping ? LIGHT_SLEEP_POLL_MS : MOTION_SAMPLE_INTERVAL_MS;
         if (device_is_ready(imu) &&
-            (now_ms - last_motion_sample_ms) >= MOTION_SAMPLE_INTERVAL_MS) {
+            (now_ms - last_motion_sample_ms) >= imu_poll_ms) {
             last_motion_sample_ms = now_ms;
             process_motion_sample();
+        }
+
+        /* Enter light sleep after LIGHT_SLEEP_TIMEOUT_MS of no motion */
+        if (!imu_sleeping && !is_recording &&
+            (now_ms - (int64_t)last_motion_time_ms) >= LIGHT_SLEEP_TIMEOUT_MS) {
+            printk(">>> Light sleep: no motion for %lld ms\n",
+                   (long long)(now_ms - (int64_t)last_motion_time_ms));
+            imu_sleeping = true;
+            led_set_state(LED_SLEEP);
         }
 
         led_tick();
