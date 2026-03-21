@@ -1,0 +1,59 @@
+# Partition Manager static configuration for XIAO nRF52840 Sense
+# MCUboot-based OTA layout.
+#
+# Flash layout (1 MB total):
+#   0x000000  softdevice   156 KB  (Adafruit MBR + reserved, not managed)
+#   0x027000  mcuboot       48 KB  ← Adafruit jumps here → MCUboot
+#   0x033000  mcuboot_pad    0.5 KB
+#   0x033200  app (dynamic, placed within mcuboot_primary)
+#   0x033000  mcuboot_primary  328 KB  (pad + app)
+#   0x085000  mcuboot_secondary 328 KB  ← OTA candidate slot
+#   0x0D7000  settings_storage 116 KB
+#   0x0F4000  adafruit_boot   48 KB  (Adafruit UF2 bootloader, not touched)
+#   0x100000  end
+
+softdevice:
+  address: 0x0
+  size: 0x27000
+  region: flash_primary
+
+mcuboot:
+  address: 0x27000
+  size: 0xc000
+  region: flash_primary
+
+mcuboot_pad:
+  address: 0x33000
+  size: 0x200
+  region: flash_primary
+
+mcuboot_primary:
+  orig_span: &id001
+  - mcuboot_pad
+  - app
+  span: *id001
+  address: 0x33000
+  region: flash_primary
+  size: 0x52000
+
+mcuboot_primary_app:
+  orig_span: &id002
+  - app
+  span: *id002
+  address: 0x33200
+  size: 0x51e00
+
+mcuboot_secondary:
+  address: 0x85000
+  size: 0x52000
+  region: flash_primary
+
+settings_storage:
+  address: 0xd7000
+  size: 0x1d000
+  region: flash_primary
+
+adafruit_boot:
+  address: 0xf4000
+  size: 0xc000
+  region: flash_primary

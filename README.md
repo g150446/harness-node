@@ -25,7 +25,20 @@ voice-bridge-ble/
 │   ├── README.md              # nRF54L15 implementation notes
 │   ├── prj.conf               # Zephyr config with Audio
 │   └── west.yml               # Zephyr manifest
-├── nrf52-voice/               # Zephyr 音声+モーション+OTA for XIAO nRF52840 Sense (VoiceBridge52)
+├── nrf52-handy/               # Zephyr ジェスチャートリガー音声+OTA for XIAO nRF52840 Sense (XIAOVoice) ← 現行
+│   ├── src/
+│   │   ├── main.c             # BLE サービス + ジェスチャー検出 + DMIC 制御
+│   │   ├── audio_capture.c/h  # DMIC キャプチャ（16 kHz / 16-bit / モノラル）
+│   │   └── adpcm.c/h          # ADPCM コーデック（互換用）
+│   ├── boards/
+│   │   └── xiao_ble_nrf52840_sense.overlay  # PDM + IMU + マイク電源 + フラッシュパーティション
+│   ├── sysbuild/mcuboot/      # MCUboot 設定
+│   ├── prj.conf               # Zephyr 設定（BLE, Audio, MCUmgr）
+│   ├── sysbuild.conf          # SB_CONFIG_BOOTLOADER_MCUBOOT=y
+│   ├── pm_static.yml          # フラッシュパーティション定義
+│   ├── build_and_flash.sh     # 初回 UF2 フラッシュ
+│   └── build_and_package_ota.sh  # OTA バイナリ生成（→ ota_update.bin）
+├── nrf52-voice/               # Zephyr 音声+モーション+OTA for XIAO nRF52840 Sense (VoiceBridge52) ← レガシー
 │   ├── src/
 │   │   ├── main.c             # BLE audio/motion service + motion→audio制御
 │   │   ├── audio_capture.c/h  # PDM マイク（RIGHT ch, mic電源有効）
@@ -61,9 +74,11 @@ voice-bridge-ble/
 │   └── flash.sh               # Compatibility wrapper to build_and_flash.sh
 ├── boards/seeed/xiao_nrf54l15/ # Custom XIAO nRF54L15 board definition
 ├── mac_client/                # Mac Python client (shared)
-│   ├── nrf52_voice_client.py  # VoiceBridge52 クライアント（手動/自動録音、ジェスチャー判別）
+│   ├── nrf52_voice_client.py  # XIAOVoice BLE クライアント（自動録音、ジェスチャーイベント表示）
+│   ├── gesture_monitor.py     # ジェスチャーイベントモニター（タイムスタンプ付き、録音なし）
+│   ├── gesture_classifier.py  # オフライン CSV ジェスチャー分類器（検証用）
 │   ├── gesture_collector.py   # ジェスチャーデータ収集ツール（ARM_LIFT / DOUBLE_CLENCH）
-│   ├── ota_updater.py         # BLE OTA アップデータ（VoiceBridge52 / nRF52840 用）
+│   ├── ota_updater.py         # BLE OTA アップデータ（XIAOVoice / nRF52840 用）
 │   ├── nrf54_controller.py
 │   ├── voice_bridge_client.py
 │   └── requirements.txt
@@ -81,28 +96,40 @@ voice-bridge-ble/
 
 See `esp32s3/` or the ESP-IDF section below.
 
-### For XIAO nRF52840 Sense — VoiceBridge52 (`nrf52-voice`)
+### For XIAO nRF52840 Sense — XIAOVoice (`nrf52-handy`)
 
-PDM マイク音声 + LSM6DS3TR-C モーション検出 + ジェスチャー判別 + BLE OTA を統合したファームウェアです。**ARM_LIFT**（腕を持ち上げる）と **DOUBLE_CLENCH**（ダブルクレンチ）を IMU の wakeup パターンで判別します。
+PDM マイク音声 + LSM6DS3TR-C ジェスチャー検出 + BLE OTA を統合したファームウェアです。腕を水平から持ち上げるジェスチャーで録音を自動開始・停止します。ジェスチャー判別は **ファームウェア側で完結** しており、Mac クライアントは BLE イベント（`0x01` / `0x02`）を受け取るだけです。
+
+詳細は `docs/nrf52_handy_guide.md` を参照してください。
+
+#### ジェスチャー検出アルゴリズム（概要）
+
+録音開始は以下の 3 条件がすべて成立したとき:
+
+1. `motion_active` 時の z 軸加速度が −3.0 〜 +3.0 m/s²（腕が水平に近い状態でモーション開始）
+2. `motion_settled` 時の z 軸加速度が ≥ 8.0 m/s²（腕が上がった状態で静定）
+3. active → settled の経過時間が ≤ 2000 ms
+
+録音停止は、録音中に次の `motion_active` が検出されたとき。
 
 #### 初回フラッシュ（MCUboot + アプリを UF2 で書き込み）
 
 ```bash
-cd nrf52-voice
+cd nrf52-handy
 ./build_and_flash.sh
 ```
 
-XIAO をリセットボタンダブルタップで UF2 ブートローダに入れると自動でフラッシュされます。
+XIAO のリセットボタンをダブルタップして UF2 ブートローダに入ると（XIAO-SENSE ドライブが出現）、スクリプトが自動でフラッシュします。
 
-#### BLE OTA アップデート（2回目以降）
+#### BLE OTA アップデート（2 回目以降）
 
 ```bash
-cd nrf52-voice
-./build_and_package_ota.sh           # OTA バイナリをビルド
+cd nrf52-handy
+./build_and_package_ota.sh           # OTA バイナリをビルド → ota_update.bin
 
 cd mac_client
 source venv/bin/activate
-python3 ota_updater.py ../nrf52-voice/ota_update.bin
+python3 ota_updater.py --device XIAOVoice ../nrf52-handy/ota_update.bin
 ```
 
 #### Mac クライアントで接続・録音
@@ -113,52 +140,47 @@ source venv/bin/activate
 python3 nrf52_voice_client.py
 ```
 
-コマンド一覧:
+`0x01` イベント受信で WAV 録音を自動開始、`0x02` 受信で自動停止します。motion_active / motion_settled イベントと z 値も表示されます。
 
-| コマンド | 動作 |
-|----------|------|
-| `r` | 手動録音開始（BLE start コマンド送信） |
-| `s` | 手動録音停止 |
-| `a` | 自動モード ON/OFF（モーション検出で録音開始/停止） |
-| `t` | ステータス表示（受信パケット数、ロス率など） |
-| `q` | 終了 |
+録音ファイルは `mac_client/output/nrf52voice_YYYYMMDD_HHMMSS.wav` に保存されます（16 kHz / 16-bit / モノラル）。
 
-**現在の自動録音フロー**
-
-ジェスチャー判別は **ファームウェア側の状態機械** で完結する。Mac クライアントは BLE Audio 通知の開始を検知して WAV 録音を開始・停止するだけ。
-
-ジェスチャー認識シーケンス（いずれかのパターン）:
-
-- **tilt → clench（HELD 中 tilt 先着）**: 腕を持ち上げ静止 → tilt 検出（pending 記録）→ クレンチ → 録音開始
-- **clench → tilt**: 腕を持ち上げ静止 → クレンチ → settle (READY) → tilt → 録音開始
-- **clench + tilt 同時**: CLENCHED 中に tilt 先着 (pending) → settle → 録音開始
-
-録音停止: 録音中に tilt ジェスチャーで停止。
-
-詳細は `docs/nrf52_voice_guide.md` を参照。
-
-録音ファイルは `mac_client/output/nrf52voice_YYYYMMDD_HHMMSS.wav` に保存されます（16kHz / 16bit / モノラル）。
-
-**保守・運用でよく使うコマンド**
+#### ジェスチャーモニター（録音なし）
 
 ```bash
-# firmware build
-cd /opt/nordic/ncs/v2.9.2
-/opt/nordic/ncs/toolchains/b8efef2ad5/bin/python3 -m west build -p always --sysbuild \
-  -b xiao_ble/nrf52840/sense /Users/g150446/projects/voice-harness/voice-bridge-ble/nrf52-voice \
-  --build-dir $HOME/nrf52-voice-build \
-  -- -DBOARD_ROOT=/Users/g150446/projects/voice-harness/voice-bridge-ble
+cd mac_client
+source venv/bin/activate
+python3 gesture_monitor.py
+```
 
-# OTA upload
-cd /Users/g150446/projects/voice-harness/voice-bridge-ble/mac_client
-../venv/bin/python3 ota_updater.py $HOME/nrf52-voice-build/nrf52-voice/zephyr/zephyr.signed.bin
+BLE イベントをタイムスタンプ付きで表示するだけのミニマルモニターです。ジェスチャー動作確認やデバッグに使用します。
 
-# client syntax check
-cd /Users/g150446/projects/voice-harness/voice-bridge-ble
-venv/bin/python3 -m py_compile mac_client/nrf52_voice_client.py
+---
+
+<details>
+<summary>レガシー: VoiceBridge52 (<code>nrf52-voice</code>)</summary>
+
+`nrf52-voice/` は旧ファームウェアです。nRF52840 Sense 向けには `nrf52-handy/` の使用を推奨します。`nrf52-voice/` は ARM_LIFT / DOUBLE_CLENCH の 2 ジェスチャーを IMU の wakeup パターンで判別する方式でした。
+
+初回フラッシュ:
+
+```bash
+cd nrf52-voice
+./build_and_flash.sh
+```
+
+BLE OTA:
+
+```bash
+cd nrf52-voice
+./build_and_package_ota.sh
+cd mac_client
+source venv/bin/activate
+python3 ota_updater.py ../nrf52-voice/ota_update.bin
 ```
 
 詳細は `docs/nrf52_voice_guide.md` を参照してください。
+
+</details>
 
 ### For XIAO nRF54L15 Sense (Latest - Recommended)
 

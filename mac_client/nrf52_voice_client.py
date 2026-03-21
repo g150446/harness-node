@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Voice Bridge BLE - Mac Client for nRF52840 Sense (VoiceBridge52)
+Voice Bridge BLE - Mac Client for nRF52840 Sense (XIAOVoice)
 
-Connects to XIAO nRF52840 Sense running nrf52-voice firmware.
-Receives audio notifications and motion event notifications via BLE.
+Connects to XIAO nRF52840 Sense running nrf52-handy firmware.
+Receives audio and IMU event notifications via BLE.
 
-Auto mode: motion detection triggers WAV recording start/stop automatically.
-Manual mode: 'r'/'s' commands send BLE RX write to start/stop audio.
+Recording start/stop: controlled by gesture events from the device.
+  0x01 recording_start → WAV recording begins automatically
+  0x02 recording_stop  → WAV recording ends and file is saved
+  0x10 motion_active   → displayed (z-value shown)
+  0x11 motion_settled  → displayed (z-value shown)
 """
 
 import asyncio
@@ -30,7 +33,7 @@ except ImportError:
 # Configuration
 # ============================================================================
 
-DEVICE_NAME = "VoiceBridge52"
+DEVICE_NAME = "XIAOVoice"
 
 # Audio Service UUIDs
 AUDIO_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"  # Notify
@@ -43,14 +46,6 @@ TILT_TX_UUID        = "00000014-0000-1000-8000-00805f9b34fb"  # Notify
 POWER_STATE_TX_UUID = "00000015-0000-1000-8000-00805f9b34fb"  # Notify
 
 BLE_MTU_SIZE = 512
-TILT_WAKEUP_MAX_MS = 2000
-DOUBLE_CLENCH_TILT_MAX_MS = 2000
-GESTURE_EVENT_RETENTION_S = 5.0
-MIN_RECORDING_DURATION_MS = 1000
-
-VAD_AGGRESSIVENESS = 2             # 0-3、2が汎用的
-VAD_FRAME_MS = 30                  # webrtcvad は 10/20/30ms のみ許可
-VAD_SPEECH_RATIO_THRESHOLD = 0.10  # 10%以上のフレームで発語検出→録音保持
 
 # Audio config (must match firmware)
 SAMPLE_RATE = 16000
@@ -59,6 +54,7 @@ CHANNELS = 1
 
 PACKET_HEADER_SIZE = 2
 PACKET_SYNC_BYTE = 0xAA
+AUDIO_SILENCE_TIMEOUT = 1.5  # seconds
 
 
 # ============================================================================
@@ -148,71 +144,6 @@ class WAVRecorder:
 # BLE Client
 # ============================================================================
 
-# ============================================================================
-# Gesture Classifier
-# ============================================================================
-#
-# 判別ロジック（gesture_collector.py の実測データから導出）
-#
-# 判別アルゴリズム（SETTLED時に評価）:
-#
-#   ダブルクレンチ: 2回目のクレンチがMOTION ACTIVE検出より後に来る
-#     → ACTIVE後にwakeupが1回以上発生する
-#
-#   arm_lift: 腕を持ち上げる動作でwakeupが複数発生することがあるが、
-#     それらはすべてACTIVEの前（動作開始時の同一モーションから）
-#     → ACTIVE後にwakeupは発生しない
-#
-def check_voice_activity(wav_path: str) -> tuple[bool, float]:
-    """WAVファイルを読み込み、発語フレームの割合を返す。
-    Returns (speech_detected: bool, speech_ratio: float)
-    """
-    import webrtcvad
-    import wave as wave_mod
-
-    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-    with wave_mod.open(wav_path, 'rb') as wf:
-        sample_rate = wf.getframerate()
-        sample_width = wf.getsampwidth()
-        n_channels = wf.getnchannels()
-        frame_samples = int(sample_rate * VAD_FRAME_MS / 1000)
-        frame_bytes = frame_samples * sample_width * n_channels
-
-        speech_frames = 0
-        total_frames = 0
-        while True:
-            raw = wf.readframes(frame_samples)
-            if len(raw) < frame_bytes:
-                break
-            total_frames += 1
-            if vad.is_speech(raw, sample_rate):
-                speech_frames += 1
-
-    if total_frames == 0:
-        return False, 0.0
-    ratio = speech_frames / total_frames
-    return ratio >= VAD_SPEECH_RATIO_THRESHOLD, ratio
-
-
-def classify_gesture(activity: float, peak: float,
-                     z_excursion: float = 0.0,
-                     wakeups_after_active: int = 0) -> str:
-    """
-    Returns: "ARM_LIFT" | "DOUBLE_CLENCH"
-
-    判定ロジック（SETTLED時のみ呼び出す）:
-      MOTION ACTIVE受信後にwakeupが1回以上あれば DOUBLE_CLENCH。
-      arm_liftではACTIVE後にwakeupは発生しない。
-    """
-    if wakeups_after_active >= 1:
-        return "DOUBLE_CLENCH"
-    return "ARM_LIFT"
-
-
-# ============================================================================
-# BLE Client
-# ============================================================================
-
 class VoiceBridge52Client:
     def __init__(self):
         self.client: Optional[BleakClient] = None
@@ -222,33 +153,40 @@ class VoiceBridge52Client:
         self._packets_received = 0
         self._packet_loss = 0
 
-        # Auto mode: qualified tilt + double clench starts recording; later motion active stops it
-        self.auto_mode = True
-
-        # Disconnect tracking (battery death vs firmware crash)
+        # Disconnect tracking
         self._connect_time: Optional[float] = None
         self._disconnect_time: Optional[float] = None
         self._address: Optional[str] = None
 
-        # Gesture classification state
-        self._last_wakeup_axes: int = 0
-        self._last_wakeup_time: float = 0.0
-        self._wakeup_log: list = []          # [timestamp, ...] — all wakeup times
-        self._motion_start_time: Optional[float] = None  # time of first ACTIVE in gesture
-        self._qualified_tilt_times: list = []
-        self._double_clench_times: list = []
-        self._double_clench_count = 0
-        self._active_gesture_had_post_active_wakeup = False
-        self._gesture_recording_active = False
-        self._gesture_recording_started_at: Optional[float] = None
+        # Device-initiated recording detection
+        self._last_audio_time: float = 0.0
+        self._audio_silence_task = None
 
     async def find_device(self) -> Optional[str]:
         print(f"Scanning for '{DEVICE_NAME}'...")
-        devices = await BleakScanner.discover(timeout=5.0)
-        for d in devices:
-            if d.name == DEVICE_NAME:
-                print(f"  Found: {d.address}")
-                return d.address
+        audio_svc_uuid = "00000001-0000-1000-8000-00805f9b34fb"
+        found_addr: Optional[str] = None
+        found_label: Optional[str] = None
+
+        def on_detection(device, adv):
+            nonlocal found_addr, found_label
+            if found_addr:
+                return
+            local_name = adv.local_name or device.name or ""
+            uuids = [str(u).lower() for u in adv.service_uuids]
+            if local_name == DEVICE_NAME or audio_svc_uuid in uuids:
+                found_addr = device.address
+                found_label = f"local_name={local_name!r} cached_name={device.name!r}"
+
+        async with BleakScanner(detection_callback=on_detection):
+            for _ in range(80):
+                await asyncio.sleep(0.1)
+                if found_addr:
+                    break
+
+        if found_addr:
+            print(f"  Found: {found_addr} ({found_label})")
+            return found_addr
         print("  Device not found.")
         return None
 
@@ -256,11 +194,9 @@ class VoiceBridge52Client:
         elapsed = time.time() - (self._connect_time or time.time())
         self._disconnect_time = time.time()
         self.is_connected = False
-        self._gesture_recording_active = False
-        self._clear_gesture_events()
         print(f"\n  [DISCONNECT] After {elapsed:.0f}s connected")
         if self.recorder.is_recording:
-            self.stop_recording(force=True)
+            self.recorder.stop_recording()
 
     async def connect(self, address: str):
         print(f"Connecting to {address}...")
@@ -277,30 +213,44 @@ class VoiceBridge52Client:
         print(f"  Connected (MTU={self.client.mtu_size})")
 
         await self.client.start_notify(AUDIO_TX_UUID, self._on_audio)
-        await self.client.start_notify(MOTION_TX_UUID, self._on_motion)
-        await self.client.start_notify(WAKEUP_TX_UUID, self._on_wakeup)
-        await self.client.start_notify(TILT_TX_UUID, self._on_tilt)
-        await self.client.start_notify(POWER_STATE_TX_UUID, self._on_power_state)
-        print("  Notifications enabled (audio + motion + wakeup + tilt + power_state)")
-        print(f"  Gesture mode: {'ON' if self.auto_mode else 'OFF'} "
-              f"(qualifying TILT starts recording only if a DOUBLE_CLENCH occurred within the previous {DOUBLE_CLENCH_TILT_MAX_MS}ms; later MOTION ACTIVE stops)")
+        print("  Notifications enabled (audio)")
+        self._audio_silence_task = asyncio.create_task(self._audio_silence_monitor())
         await asyncio.sleep(0.5)
 
     async def disconnect(self):
         if self.client:
-            try:
-                await self.client.stop_notify(AUDIO_TX_UUID)
-                await self.client.stop_notify(MOTION_TX_UUID)
-                await self.client.stop_notify(WAKEUP_TX_UUID)
-                await self.client.stop_notify(TILT_TX_UUID)
-                await self.client.stop_notify(POWER_STATE_TX_UUID)
-            except Exception:
-                pass
+            for uuid in [AUDIO_TX_UUID, MOTION_TX_UUID, WAKEUP_TX_UUID,
+                         TILT_TX_UUID, POWER_STATE_TX_UUID]:
+                try:
+                    await self.client.stop_notify(uuid)
+                except Exception:
+                    pass
             await self.client.disconnect()
             self.is_connected = False
             print("Disconnected.")
 
     def _on_audio(self, sender, data: bytes):
+        if len(data) < 2:
+            return
+        # イベントパケット: [0x00][0x55][event_code][optional f32 z]
+        if data[0] == 0x00 and len(data) >= 3 and data[1] == 0x55:
+            code = data[2]
+            if code == 0x01:
+                print("  [EVT] recording_start → auto-start WAV")
+                self.recorder.start_recording()
+            elif code == 0x02:
+                print("  [EVT] recording_stop → save WAV")
+                self.recorder.stop_recording()
+                self._last_audio_time = 0.0
+            elif code == 0x10:
+                z = struct.unpack_from('<f', data, 3)[0] if len(data) >= 7 else float('nan')
+                print(f"  [EVT] motion_active  z={z:+.2f}")
+            elif code == 0x11:
+                z = struct.unpack_from('<f', data, 3)[0] if len(data) >= 7 else float('nan')
+                print(f"  [EVT] motion_settled z={z:+.2f}")
+            else:
+                print(f"  [EVT] 0x{code:02x}")
+            return
         if len(data) < PACKET_HEADER_SIZE:
             return
         seq = data[0]
@@ -312,53 +262,41 @@ class VoiceBridge52Client:
                 self._packet_loss += 1
         self._last_seq = seq
         self._packets_received += 1
+        self._last_audio_time = time.time()
+
+        # デバイス主導で録音が始まった場合、自動的にWAV録音を開始
+        if not self.recorder.is_recording:
+            print("  [REC] Device-initiated recording detected → auto-start WAV")
+            self.recorder.start_recording()
+
         self.recorder.write_samples(data[PACKET_HEADER_SIZE:])
 
-    async def _on_motion(self, sender, data: bytes):
+    def _on_motion(self, sender, data: bytes):
         if len(data) < 14:
             return
-        event_type = data[0]   # 0x01 = motion active, 0x00 = motion settled
+        event_type = data[0]
         count = data[1]
         activity = struct.unpack_from('<f', data, 2)[0]
         peak = struct.unpack_from('<f', data, 6)[0]
         elapsed_ms = struct.unpack_from('<I', data, 10)[0]
         z_excursion = struct.unpack_from('<f', data, 14)[0] if len(data) >= 18 else 0.0
 
-        state = "ACTIVE" if event_type == 0x01 else "SETTLED"
-        event_time = time.time()
-
         if event_type == 0x01:
-            # Record start of gesture (first ACTIVE only)
-            if self._motion_start_time is None:
-                self._motion_start_time = event_time
-                self._active_gesture_had_post_active_wakeup = False
-            print(f"  [MOTION {state}] count={count} activity={activity:.2f} peak={peak:.2f} "
-                  f"z_exc={z_excursion:.2f} elapsed={elapsed_ms}ms")
+            elapsed_label = f"since_last_settle={elapsed_ms}ms"
+            state = "ACTIVE"
         else:
-            # SETTLED: count wakeups that arrived AFTER the first ACTIVE event
-            if self._motion_start_time is not None:
-                wakeups_after_active = sum(1 for t in self._wakeup_log
-                                           if t > self._motion_start_time)
-            else:
-                wakeups_after_active = 0
-            gesture = classify_gesture(activity, peak, z_excursion, wakeups_after_active)
-            print(f"  [MOTION {state}] count={count} activity={activity:.2f} peak={peak:.2f} "
-                   f"z_exc={z_excursion:.2f} elapsed={elapsed_ms}ms "
-                   f"wakeups_after={wakeups_after_active} → [{gesture}]")
-            self._motion_start_time = None
-            self._active_gesture_had_post_active_wakeup = False
+            elapsed_label = f"motion_duration={elapsed_ms}ms"
+            state = "SETTLED"
+        print(f"  [MOTION {state}] count={count} activity={activity:.2f} peak={peak:.2f} "
+              f"z_exc={z_excursion:.2f} {elapsed_label}")
+        if event_type == 0x00 and elapsed_ms <= 450:
+            print(f"  [GESTURE] clench-like settle → possible READY state")
 
     def _on_wakeup(self, sender, data: bytes):
         if len(data) < 2:
             return
         axes = data[0]
         count = data[1]
-        now = time.time()
-        self._last_wakeup_axes = axes
-        self._last_wakeup_time = now
-        self._wakeup_log.append(now)
-        # Trim entries older than 15s
-        self._wakeup_log = [t for t in self._wakeup_log if now - t < 15.0]
         axis_str = "".join([
             "Z" if axes & 0x04 else "",
             "Y" if axes & 0x02 else "",
@@ -366,53 +304,16 @@ class VoiceBridge52Client:
         ]) or "?"
         print(f"  [WAKEUP] axes={axis_str} count={count}")
 
-        if self._motion_start_time is not None and not self._active_gesture_had_post_active_wakeup:
-            self._active_gesture_had_post_active_wakeup = True
-            self._double_clench_count += 1
-            self._double_clench_times.append(now)
-            self._trim_gesture_events(now)
-            since_tilt_ms = self._latest_qualified_tilt_delta_ms(now)
-            since_tilt = f"{since_tilt_ms}ms" if since_tilt_ms is not None else "N/A"
-            print(f"  [DOUBLE_CLENCH] count={self._double_clench_count} since_tilt={since_tilt}")
-
     def _on_tilt(self, sender, data: bytes):
         if len(data) < 2:
             return
         tilt_src = data[0]
         count = data[1]
+        elapsed_ms = struct.unpack_from('<I', data, 2)[0] if len(data) >= 6 else 0
         active = "YES" if (tilt_src & 0x20) else "NO"
-        now = time.time()
-        since_wakeup_ms: Optional[int]
-        if self._last_wakeup_time > 0.0:
-            since_wakeup_ms = int((now - self._last_wakeup_time) * 1000)
-            wakeup_delta = f"{since_wakeup_ms}ms"
-        else:
-            since_wakeup_ms = None
-            wakeup_delta = "N/A"
-        print(f"  [TILT] active={active} src=0x{tilt_src:02x} count={count} "
-              f"since_wakeup={wakeup_delta}")
-
-        if active == "YES" and self.auto_mode and self.recorder.is_recording:
-            print("  [AUTO] TILT detected during recording → stop recording"
-                  f" (gesture_active={self._gesture_recording_active})")
-            self._gesture_recording_active = False
-            self._clear_gesture_events()
-            self.stop_recording()
-            return
-
-        if (active == "YES" and since_wakeup_ms is not None and
-                since_wakeup_ms < TILT_WAKEUP_MAX_MS):
-            self._qualified_tilt_times.append(now)
-            self._trim_gesture_events(now)
-            since_double_clench_ms = self._latest_double_clench_delta_ms(now)
-            if (self.auto_mode and since_double_clench_ms is not None and
-                    not self.recorder.is_recording and not self._gesture_recording_active):
-                print("  [AUTO] Qualified tilt matched recent DOUBLE_CLENCH "
-                      f"(since_double_clench={since_double_clench_ms}ms) → start recording")
-                if self.start_recording():
-                    self._gesture_recording_active = True
-                    self._gesture_recording_started_at = now
-                    self._clear_gesture_events()
+        print(f"  [TILT] active={active} src=0x{tilt_src:02x} count={count} since_motion_active={elapsed_ms}ms")
+        if elapsed_ms <= 1500:
+            print(f"  [GESTURE] Tilt within gesture window")
 
     def _on_power_state(self, sender, data: bytes):
         if len(data) < 1:
@@ -422,6 +323,16 @@ class VoiceBridge52Client:
             print("  [SLEEP] Device entering low-power mode")
         else:
             print("  [SLEEP] Device waking up from low-power mode")
+
+    async def _audio_silence_monitor(self):
+        """録音中にaudioパケットが途絶えたら自動でWAVを閉じる"""
+        while True:
+            await asyncio.sleep(0.5)
+            if self.recorder.is_recording and self._last_audio_time > 0:
+                if time.time() - self._last_audio_time > AUDIO_SILENCE_TIMEOUT:
+                    print("  [REC] Audio silence detected → auto-stop WAV")
+                    self.recorder.stop_recording()
+                    self._last_audio_time = 0.0
 
     async def _send_ble_start(self):
         try:
@@ -437,79 +348,21 @@ class VoiceBridge52Client:
         except Exception as e:
             logger.error(f"BLE stop failed: {e}")
 
-    def _trim_gesture_events(self, now: float):
-        self._qualified_tilt_times = [t for t in self._qualified_tilt_times
-                                      if now - t <= GESTURE_EVENT_RETENTION_S]
-        self._double_clench_times = [t for t in self._double_clench_times
-                                     if now - t <= GESTURE_EVENT_RETENTION_S]
-
-    def _clear_gesture_events(self):
-        self._qualified_tilt_times.clear()
-        self._double_clench_times.clear()
-
-    def _latest_qualified_tilt_delta_ms(self, now: float) -> Optional[int]:
-        matching_tilts = [t for t in self._qualified_tilt_times if 0.0 <= now - t <= GESTURE_EVENT_RETENTION_S]
-        if not matching_tilts:
-            return None
-        latest_tilt = max(matching_tilts)
-        delta_ms = int((now - latest_tilt) * 1000)
-        if delta_ms <= DOUBLE_CLENCH_TILT_MAX_MS:
-            return delta_ms
-        return None
-
-    def _latest_double_clench_delta_ms(self, now: float) -> Optional[int]:
-        matching_clenches = [t for t in self._double_clench_times if 0.0 <= now - t <= GESTURE_EVENT_RETENTION_S]
-        if not matching_clenches:
-            return None
-        latest_clench = max(matching_clenches)
-        delta_ms = int((now - latest_clench) * 1000)
-        if delta_ms <= DOUBLE_CLENCH_TILT_MAX_MS:
-            return delta_ms
-        return None
-
-    def _recording_age_ms(self, now: Optional[float] = None) -> int:
-        if not self.recorder.is_recording:
-            return 0
-        current_time = now if now is not None else time.time()
-        start_time = self._gesture_recording_started_at or self.recorder.start_time or current_time
-        return int((current_time - start_time) * 1000)
-
     def start_recording(self) -> bool:
         if not self.recorder.start_recording():
             return False
         t = asyncio.create_task(self._send_ble_start())
-        t.add_done_callback(lambda _: None)  # keep reference alive
+        t.add_done_callback(lambda _: None)
         return True
 
-    def stop_recording(self, force: bool = False):
-        recording_age_ms = self._recording_age_ms()
-        if (not force and self.recorder.is_recording and
-                recording_age_ms < MIN_RECORDING_DURATION_MS):
-            print("  [AUTO] Stop ignored "
-                  f"(minimum {recording_age_ms}ms/{MIN_RECORDING_DURATION_MS}ms)")
-            return
-        self._gesture_recording_active = False
-        self._gesture_recording_started_at = None
-        self._clear_gesture_events()
+    def stop_recording(self):
+        """手動停止: WAV閉じ + BLE stop コマンド送信"""
         self.recorder.stop_recording()
-
-        # VADチェック: 発語なしなら WAV を削除
-        if self.recorder._filename and os.path.exists(self.recorder._filename):
-            try:
-                speech_detected, ratio = check_voice_activity(self.recorder._filename)
-                if speech_detected:
-                    print(f"  [VAD] Speech detected (ratio={ratio:.1%}) → keep")
-                else:
-                    print(f"  [VAD] No speech detected (ratio={ratio:.1%}) → discard")
-                    os.remove(self.recorder._filename)
-            except Exception as e:
-                logger.warning(f"  [VAD] check failed, keeping file: {e}")
-
         try:
             t = asyncio.create_task(self._send_ble_stop())
-            t.add_done_callback(lambda _: None)  # keep reference alive
+            t.add_done_callback(lambda _: None)
         except RuntimeError:
-            pass  # event loop shutting down (e.g. Ctrl-C in finally block)
+            pass
 
     def print_stats(self):
         print(f"  Packets received: {self._packets_received}")
@@ -518,8 +371,6 @@ class VoiceBridge52Client:
             rate = self._packet_loss / (self._packets_received + self._packet_loss) * 100
             print(f"  Loss rate:        {rate:.1f}%")
         print(f"  Recording:        {'YES ({:.1f}s)'.format(self.recorder.get_duration()) if self.recorder.is_recording else 'NO'}")
-        print(f"  Gesture mode:     {'ON' if self.auto_mode else 'OFF'}")
-        print(f"  Gesture rec:      {'YES' if self._gesture_recording_active else 'NO'}")
 
 
 # ============================================================================
@@ -532,9 +383,8 @@ async def interactive_control(client: VoiceBridge52Client):
     print("VoiceBridge52 - nRF52840 Sense Recording Control")
     print("=" * 60)
     print("Commands:")
-    print("  r  - Manual: start recording")
-    print("  s  - Manual: stop recording")
-    print("  a  - Toggle gesture mode (tilt + DOUBLE_CLENCH starts, MOTION ACTIVE stops)")
+    print("  r  - Start recording")
+    print("  s  - Stop recording")
     print("  t  - Show status")
     print("  q  - Quit")
     print()
@@ -552,9 +402,6 @@ async def interactive_control(client: VoiceBridge52Client):
                 client.start_recording()
             elif cmd == 's':
                 client.stop_recording()
-            elif cmd == 'a':
-                client.auto_mode = not client.auto_mode
-                print(f"  Gesture mode: {'ON' if client.auto_mode else 'OFF'}")
             elif cmd == 't':
                 client.print_stats()
             elif cmd == '':
@@ -589,10 +436,8 @@ async def main():
 
         await client.connect(address)
 
-        # Run interactive control; it exits on 'q' or when the connection drops
         control_task = asyncio.create_task(interactive_control(client))
 
-        # Wait for either the user quitting or an unexpected disconnect
         while not control_task.done():
             if not client.is_connected:
                 print("  [RECONNECT] Waiting for device to reappear...")
@@ -602,7 +447,6 @@ async def main():
                 except asyncio.CancelledError:
                     pass
 
-                # Poll until device reappears (battery recharge / reboot)
                 reconnect_address = None
                 while reconnect_address is None:
                     await asyncio.sleep(3.0)
@@ -619,13 +463,13 @@ async def main():
 
             await asyncio.sleep(0.5)
 
-        await control_task  # propagate any exception
+        await control_task
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
     finally:
         if client.recorder.is_recording:
-            client.stop_recording(force=True)
+            client.stop_recording()
             await asyncio.sleep(0.5)
         client.print_stats()
         await client.disconnect()
