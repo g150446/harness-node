@@ -139,18 +139,42 @@ BLE 切断時   → audio_capture_stop()
               → mic_power_off()
 ```
 
-### Mac クライアントの自動録音ルール
+### ファームウェア側ジェスチャー状態機械
 
-1. `MOTION ACTIVE` 中に最初の `WAKEUP` が来ると `DOUBLE_CLENCH` とみなす。
-2. `TILT` 通知の `since_wakeup < 2000ms` なら「有効な TILT」とみなす。
-3. 直近 `2000ms` 以内に `DOUBLE_CLENCH` があり、かつ有効な `TILT` が来たら録音開始。
-4. 録音中に `TILT` が来ると即座に録音停止（グレースピリオドなし）。
+ジェスチャー判別は **ファームウェア（nRF52840）側** で完結する。Mac クライアントは BLE Audio TX 通知の到着を検知してWAV録音を開始・停止するだけ。
+
+状態遷移:
+
+```
+IDLE ──[motion active]──► RAISED
+RAISED ──[motion settled]──► HELD
+HELD ──[tilt, since_active ≤1500ms]──► pending=true（クレンチを待つ）
+HELD ──[tilt, too late]──► HELD継続（リセットしない）
+HELD ──[motion active, since_settle ≤1000ms]──► CLENCHED（pendingを引き継ぐ）
+HELD ──[timeout 3000ms or too late clench]──► RAISED
+CLENCHED ──[tilt, since_active ≤1500ms]──► pending=true（settleを待つ）
+CLENCHED ──[motion settled, duration ≤450ms, pending=true]──► IDLE + recording開始
+CLENCHED ──[motion settled, duration ≤450ms, pending=false]──► READY
+CLENCHED ──[motion settled, duration >450ms]──► IDLE
+READY ──[tilt, since_active ≤1500ms, since_ready ≤2000ms]──► IDLE + recording開始
+READY ──[tilt 条件外]──► IDLE
+```
+
+主要タイムウィンドウ定数（`src/main.c`）:
+
+| 定数 | 値 | 説明 |
+|------|----|------|
+| `GESTURE_CLENCH_INTERVAL_MS` | 1000 ms | settle→クレンチの最大間隔 |
+| `GESTURE_HOLD_TIMEOUT_MS` | 3000 ms | HELD 状態タイムアウト |
+| `GESTURE_TILT_WINDOW_MS` | 1500 ms | モーション active → tilt の最大間隔 |
+| `GESTURE_READY_TIMEOUT_MS` | 2000 ms | READY 状態タイムアウト |
 
 ### 運用上の注意
 
-- 手動録音 (`r` / `s`) は引き続き利用できる。
-- 録音停止は `TILT` ジェスチャーで即座にトリガーされる。グレースピリオドはないため、録音開始直後でも `TILT` で停止できる。
-- 切断時は最低録音時間に関係なく強制停止して WAV をクローズする。
+- 手動録音 (`r` / `s`) は引き続き利用できる。BLE write 0x01/0x00 を直接送る。
+- 録音停止は録音中の `TILT` 検出でトリガーされる（クールダウン期間あり）。
+- モーション持続が長すぎる（>450ms）クレンチは腕の動きとみなされリセットされる。
+- 切断時はファームウェアが即座に録音停止・マイク電源 OFF する。
 
 ---
 
@@ -203,70 +227,55 @@ check_tilt_src() → FUNC_SRC1 レジスタ読み出し
 
 ## ジェスチャー判別
 
-ジェスチャー判別は **Mac クライアント（Python）側** で完結する。ファームウェアは Motion TX / Wakeup TX / Tilt TX の生データを送る。
+ジェスチャー判別は **ファームウェア（nRF52840）側** の状態機械で完結する。Mac クライアントは Motion TX / Wakeup TX / Tilt TX の通知を受け取ってログ表示するが、録音トリガーの判断はしない。
 
-### 判別アルゴリズム
-
-`MOTION ACTIVE` / `WAKEUP` / `TILT` の到着順で逐次評価する：
+### 認識シーケンス
 
 ```
-MOTION ACTIVE 中に最初の WAKEUP が届いた
-  → その時点で DOUBLE_CLENCH（ダブルクレンチ）
+1. 腕を持ち上げる（motion active）        → RAISED
+2. 腕を静止する（motion settled）         → HELD
+3. 手首を傾ける / クレンチする（どちらが先でもよい）
+   3a. HELD中に tilt が来る               → pending=true のまま HELD継続
+   3b. HELD 中にクレンチ（motion active） → CLENCHED（pendingを引き継ぐ）
+4a. CLENCHED で settle + pending=true   → 直接録音開始
+4b. CLENCHED で settle + pending=false  → READY（tilt待ち）
+5. READY 状態で tilt（1500ms 以内）      → 録音開始
 
-TILT が届き、直前 WAKEUP から 2000ms 未満
-  → 有効な TILT として記録
-
-有効な TILT の時点で、直前 2000ms 以内に DOUBLE_CLENCH がある
-  → 自動録音開始
-
-録音中に TILT が届く（since_wakeup 条件なし）
-  → 自動録音停止
+録音停止: 録音中に tilt が届いた場合に停止
 ```
 
-**ログの補助情報**
-
-- `since_wakeup`: TILT 受信時点から直近 WAKEUP までの経過時間
-- `since_tilt`: DOUBLE_CLENCH 判定時点から直近の有効な TILT までの経過時間
-- `N/A`: その条件に使えるイベントが時間窓内にまだ無いことを表す
-
-**現場でよく見るログ**
+### ファームウェアログの見かた
 
 ```text
-[WAKEUP] axes=ZYX count=61
-[TILT] active=YES src=0x20 count=172 since_wakeup=136ms
-[DOUBLE_CLENCH] count=12 since_tilt=412ms
-[AUTO] Qualified tilt matched recent DOUBLE_CLENCH (since_double_clench=412ms) → start recording
-[WAV] Recording: nrf52voice_20260320_101443.wav
+>>> Gesture: HELD
+>>> Gesture: tilt in HELD pending (since_active=702ms)   ← HELD中にtiltが先着
+>>> Gesture: CLENCHED
+>>> Gesture complete (early tilt) → start recording      ← pending → 即録音開始
+Recording started
   ... (発話)
-[TILT] active=YES src=0x20 count=173 since_wakeup=842ms
-[AUTO] TILT detected during recording → stop recording (gesture_active=True)
-[WAV] Saved 4.2s (86400 bytes) → nrf52voice_20260320_101443.wav
-[VAD] Speech detected (ratio=42.3%) → keep
+>>> Tilt! func_src1=0x20 count=N
+>>> Tilt while recording → stop
+```
+
+READY 経由の場合:
+
+```text
+>>> Gesture: HELD
+>>> Gesture: CLENCHED
+>>> Gesture: READY (tilt window open)
+>>> Tilt! func_src1=0x20 count=N
+>>> Gesture complete → start recording
+Recording started
 ```
 
 ### データ収集ツール
 
-`mac_client/gesture_collector.py` で2ジェスチャーの比較データを収集できる：
+`mac_client/gesture_collector.py` で IMU イベントの生データを収集できる：
 
 ```bash
 cd mac_client
 source venv/bin/activate
 python3 gesture_collector.py
-```
-
-サマリーに `wakeups_after` 統計が表示され、閾値調整に利用できる。
-
-### 主要定数（`mac_client/nrf52_voice_client.py`）
-
-```python
-TILT_WAKEUP_MAX_MS = 2000          # TILT が有効とみなされる WAKEUP からの最大経過時間
-DOUBLE_CLENCH_TILT_MAX_MS = 2000   # TILT が録音開始と紐付けられる DOUBLE_CLENCH からの最大経過時間
-GESTURE_EVENT_RETENTION_S = 5.0    # ジェスチャーイベントを保持する時間窓
-MIN_RECORDING_DURATION_MS = 1000   # 手動停止の最小録音時間（スクリプト終了時は無視）
-
-VAD_AGGRESSIVENESS = 2             # VAD 感度 0-3（数値が大きいほど無音判定が厳格）
-VAD_FRAME_MS = 30                  # VAD フレーム長（10/20/30ms のみ）
-VAD_SPEECH_RATIO_THRESHOLD = 0.10  # 発語フレーム割合の閾値（これ未満なら破棄）
 ```
 
 ---

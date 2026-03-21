@@ -47,23 +47,30 @@ LOG_MODULE_REGISTER(nrf52_voice, LOG_LEVEL_INF);
 #define IMU_NODE                    DT_ALIAS(imu0)
 #define LED0_NODE                   DT_ALIAS(led0)
 #define ACCEL_ODR_HZ                52
-#define MOTION_SAMPLE_INTERVAL_MS   100
+#define MOTION_SAMPLE_INTERVAL_MS   25
 #define EVENT_POLL_INTERVAL_MS      25
 #define IDLE_SLEEP_TIMEOUT_MS       30000   /* 30s idle → low-power mode */
 #define SLEEP_POLL_INTERVAL_MS      1000    /* polling interval in low-power mode */
 #define CALIBRATION_SAMPLES         25
-#define ACTIVITY_WINDOW_SAMPLES     4
+#define ACTIVITY_WINDOW_SAMPLES     2
 #define MOTION_ENTRY_ACTIVITY_MS2   8.0
 #define MOTION_ENTRY_PEAK_MS2       2.4
 #define MOTION_CONTINUE_ACTIVITY_MS2 4.0
 #define MOTION_CONTINUE_PEAK_MS2    1.4
-#define MOTION_SETTLE_ACTIVITY_MS2  0.9
-#define MOTION_SETTLE_PEAK_MS2      0.35
+#define MOTION_SETTLE_ACTIVITY_MS2  2.0
+#define MOTION_SETTLE_PEAK_MS2      0.8
 #define MOTION_START_WINDOWS        2
-#define MOTION_SETTLE_WINDOWS       4
+#define MOTION_SETTLE_WINDOWS       2
 #define BASELINE_ALPHA              0.03
 #define REPORT_COOLDOWN_MS          700
+#define CLENCH_MAX_DURATION_MS      450  /* これ以下は clench とみなし録音を止めない */
 #define MOTION_DURATION_SAMPLES     2
+
+/* Gesture recognition thresholds */
+#define GESTURE_CLENCH_INTERVAL_MS  1000  /* settle→クレンチ最大間隔 */
+#define GESTURE_HOLD_TIMEOUT_MS     3000  /* HELD状態タイムアウト */
+#define GESTURE_TILT_WINDOW_MS      1500  /* クレンチactive→tilt最大間隔 */
+#define GESTURE_READY_TIMEOUT_MS    2000  /* READY状態タイムアウト */
 
 /* ============================================================================
  * BLE UUIDs
@@ -149,6 +156,23 @@ static volatile bool stop_requested;
 
 /* Motion → audio cooldown */
 static int64_t last_audio_transition_ms;
+
+static int64_t  motion_active_start_ms;             /* motion_active 開始時刻 */
+static int64_t  last_settle_ms;                     /* 最後にmotion settleした時刻 */
+
+/* Gesture recognition state */
+typedef enum {
+    GESTURE_IDLE,      /* 初期 / リセット */
+    GESTURE_RAISED,    /* 1st motion active 検出済み */
+    GESTURE_HELD,      /* 1st motion settled（腕を静止） */
+    GESTURE_CLENCHED,  /* 2nd motion active 検出済み（クレンチ中） */
+    GESTURE_READY,     /* 2nd motion settled（ティルト待ち） */
+} gesture_state_t;
+
+static gesture_state_t gesture_state = GESTURE_IDLE;
+static int64_t gesture_state_ms;   /* 現在状態に入った時刻 */
+static bool    gesture_tilt_pending;   /* CLENCHED中にtiltを受信済み */
+static int64_t gesture_tilt_ms;        /* そのtiltの受信時刻 */
 
 /* Audio thread */
 static K_THREAD_STACK_DEFINE(audio_stack, 4096);
@@ -343,12 +367,15 @@ static void notify_wakeup_event(uint8_t axes, uint8_t count)
 }
 
 /* tilt_src mirrors FUNC_SRC1, where bit5 is tilt_ia */
-static void notify_tilt_event(uint8_t tilt_src, uint8_t count)
+static void notify_tilt_event(uint8_t tilt_src, uint8_t count, uint32_t elapsed_ms)
 {
     if (!current_conn) {
         return;
     }
-    uint8_t pkt[2] = { tilt_src, count };
+    uint8_t pkt[6];
+    pkt[0] = tilt_src;
+    pkt[1] = count;
+    memcpy(&pkt[2], &elapsed_ms, 4);
     bt_gatt_notify(NULL, &motion_svc.attrs[8], pkt, sizeof(pkt));
 }
 
@@ -388,31 +415,100 @@ static void notify_motion_event(uint8_t event_type, uint8_t count,
  * Motion → Audio Control (2-second cooldown)
  * ============================================================================ */
 
+static void gesture_reset(void)
+{
+    gesture_state = GESTURE_IDLE;
+    gesture_state_ms = 0;
+    gesture_tilt_pending = false;
+    gesture_tilt_ms = 0;
+}
+
+static void gesture_advance(gesture_state_t next)
+{
+    gesture_state = next;
+    gesture_state_ms = k_uptime_get();
+}
+
 static void on_motion_started(void)
 {
     reset_idle_timer();
-    int64_t now = k_uptime_get();
+    motion_active_start_ms = k_uptime_get();
 
-    if ((now - last_audio_transition_ms) >= MOTION_AUDIO_COOLDOWN_MS) {
-        printk(">>> Motion started → requesting audio start\n");
-        recording_requested = true;
-        last_audio_transition_ms = now;
-    } else {
-        printk(">>> Motion started (cooldown active, ignoring)\n");
+    int64_t now = motion_active_start_ms;
+
+    switch (gesture_state) {
+    case GESTURE_IDLE:
+    case GESTURE_RAISED:
+        gesture_advance(GESTURE_RAISED);
+        break;
+    case GESTURE_HELD:
+        /* タイムアウトチェック */
+        if ((now - gesture_state_ms) > GESTURE_HOLD_TIMEOUT_MS) {
+            gesture_reset();
+            gesture_advance(GESTURE_RAISED);
+            break;
+        }
+        /* settle→clench 間隔チェック */
+        if (last_settle_ms && (uint32_t)(now - last_settle_ms) <= GESTURE_CLENCH_INTERVAL_MS) {
+            gesture_advance(GESTURE_CLENCHED);
+            printk(">>> Gesture: CLENCHED\n");
+        } else {
+            gesture_reset();
+            gesture_advance(GESTURE_RAISED);
+        }
+        break;
+    default:
+        /* READY/CLENCHED中に別モーション → リセット */
+        gesture_reset();
+        gesture_advance(GESTURE_RAISED);
+        break;
     }
 }
 
 static void on_motion_settled(void)
 {
     int64_t now = k_uptime_get();
+    int64_t duration_ms = now - motion_active_start_ms;
 
-    if ((now - last_audio_transition_ms) >= MOTION_AUDIO_COOLDOWN_MS) {
-        printk(">>> Motion settled → requesting audio stop\n");
+    /* 既存の録音停止ロジック（変更なし） */
+    if (is_recording &&
+        duration_ms > CLENCH_MAX_DURATION_MS &&
+        (now - last_audio_transition_ms) >= MOTION_AUDIO_COOLDOWN_MS) {
+        printk(">>> Motion duration %lldms → arm movement → stop recording\n", duration_ms);
         stop_requested = true;
         last_audio_transition_ms = now;
-    } else {
-        printk(">>> Motion settled (cooldown active, ignoring)\n");
+    } else if (is_recording) {
+        printk(">>> Motion duration %lldms → clench-like → recording continues\n", duration_ms);
     }
+
+    /* ジェスチャー遷移 */
+    switch (gesture_state) {
+    case GESTURE_RAISED:
+        gesture_advance(GESTURE_HELD);
+        printk(">>> Gesture: HELD\n");
+        break;
+    case GESTURE_CLENCHED:
+        if (duration_ms <= CLENCH_MAX_DURATION_MS) {
+            if (gesture_tilt_pending) {
+                /* tiltが先着していた → READY をスキップして直接録音開始 */
+                printk(">>> Gesture complete (early tilt) → start recording\n");
+                recording_requested = true;
+                last_audio_transition_ms = now;
+                gesture_reset();
+            } else {
+                gesture_advance(GESTURE_READY);
+                printk(">>> Gesture: READY (tilt window open)\n");
+            }
+        } else {
+            gesture_reset();
+            printk(">>> Gesture: reset (clench too long)\n");
+        }
+        break;
+    default:
+        break;
+    }
+
+    printk(">>> Motion settled (gesture=%d)\n", gesture_state);
 }
 
 /* ============================================================================
@@ -654,6 +750,7 @@ static void check_wakeup_src(void)
     uint8_t axes = wu_src & 0x07;       /* bit2=Z, bit1=Y, bit0=X */
     uint8_t count = (uint8_t)(atomic_inc(&detected_wakeup_count) + 1);
     printk(">>> Wakeup! axes=0x%02x count=%u\n", axes, count);
+
     reset_idle_timer();
     notify_wakeup_event(axes, count);
 }
@@ -672,8 +769,69 @@ static void check_tilt_src(void)
 
     uint8_t count = (uint8_t)(atomic_inc(&detected_tilt_count) + 1);
     printk(">>> Tilt! func_src1=0x%02x count=%u\n", func_src1, count);
+
+    int64_t now = k_uptime_get();
+
+    if (is_recording) {
+        /* 録音中の tilt → 停止（cooldown を尊重） */
+        if ((now - last_audio_transition_ms) >= MOTION_AUDIO_COOLDOWN_MS) {
+            printk(">>> Tilt while recording → stop\n");
+            stop_requested = true;
+            last_audio_transition_ms = now;
+        }
+    }
+
+    /* --- ジェスチャー録音開始 --- */
+    if (!is_recording) {
+        if (gesture_state == GESTURE_READY) {
+            /* 既存ロジック: READY状態でtilt */
+            uint32_t since_active = motion_active_start_ms
+                ? (uint32_t)(now - motion_active_start_ms) : UINT32_MAX;
+            uint32_t since_ready  = (uint32_t)(now - gesture_state_ms);
+
+            if (since_active <= GESTURE_TILT_WINDOW_MS &&
+                since_ready   <= GESTURE_READY_TIMEOUT_MS) {
+                printk(">>> Gesture complete → start recording\n");
+                recording_requested = true;
+                last_audio_transition_ms = now;
+            } else {
+                printk(">>> Tilt outside gesture window (active=%ums ready=%ums)\n",
+                       since_active, since_ready);
+            }
+            gesture_reset();
+
+        } else if (gesture_state == GESTURE_CLENCHED) {
+            /* 新規: settle前にtiltが来た → pending記録 */
+            uint32_t since_active = motion_active_start_ms
+                ? (uint32_t)(now - motion_active_start_ms) : UINT32_MAX;
+            if (since_active <= GESTURE_TILT_WINDOW_MS) {
+                gesture_tilt_pending = true;
+                gesture_tilt_ms = now;
+                printk(">>> Gesture: early tilt pending (since_active=%ums)\n", since_active);
+            } else {
+                printk(">>> Tilt during CLENCHED but too late (since_active=%ums) → reset\n",
+                       since_active);
+                gesture_reset();
+            }
+        } else if (gesture_state == GESTURE_HELD) {
+            /* 新規: HELD中（クレンチ前）にtiltが来た → pending記録 */
+            uint32_t since_active = motion_active_start_ms
+                ? (uint32_t)(now - motion_active_start_ms) : UINT32_MAX;
+            if (since_active <= GESTURE_TILT_WINDOW_MS) {
+                gesture_tilt_pending = true;
+                gesture_tilt_ms = now;
+                printk(">>> Gesture: tilt in HELD pending (since_active=%ums)\n", since_active);
+            } else {
+                printk(">>> Tilt during HELD but too late (since_active=%ums) → ignore\n",
+                       since_active);
+                /* HELDは継続（リセットしない）。クレンチが来れば通常フローで READY へ */
+            }
+        }
+    }
+
     reset_idle_timer();
-    notify_tilt_event(func_src1, count);
+    uint32_t elapsed = motion_active_start_ms ? (uint32_t)(now - motion_active_start_ms) : 0;
+    notify_tilt_event(func_src1, count, elapsed);
 }
 
 static int configure_motion_detection(void)
@@ -747,12 +905,13 @@ static void process_motion_sample(void)
             atomic_inc(&detected_motion_count);
             pulse_led();
 
-            uint32_t elapsed = last_motion_time_ms ? (uint32_t)(now - last_motion_time_ms) : 0;
+            uint32_t elapsed = last_settle_ms ? (uint32_t)(now - last_settle_ms) : 0;
             LOG_INF("Motion! count=%d elapsed=%u ms activity=%.3f peak=%.3f z_exc=%.3f",
                     (int)atomic_get(&detected_motion_count), elapsed, activity, peak, z_excursion_peak);
             notify_motion_event(0x01, (uint8_t)atomic_get(&detected_motion_count),
                                 activity, peak, elapsed, z_excursion_peak);
             last_motion_time_ms = now;
+            on_motion_started();
         }
         return;
     }
@@ -761,19 +920,6 @@ static void process_motion_sample(void)
     double z_dev = abs_double(z - baseline_z);
     if (z_dev > z_excursion_peak) {
         z_excursion_peak = z_dev;
-    }
-
-    if ((activity >= MOTION_CONTINUE_ACTIVITY_MS2 || peak >= MOTION_CONTINUE_PEAK_MS2) &&
-        (now - last_report_ms) >= REPORT_COOLDOWN_MS) {
-        last_report_ms = now;
-        atomic_inc(&detected_motion_count);
-        pulse_led();
-        uint32_t elapsed = last_motion_time_ms ? (uint32_t)(now - last_motion_time_ms) : 0;
-        LOG_INF("Motion! count=%d elapsed=%u ms activity=%.3f peak=%.3f z_exc=%.3f",
-                (int)atomic_get(&detected_motion_count), elapsed, activity, peak, z_excursion_peak);
-        notify_motion_event(0x01, (uint8_t)atomic_get(&detected_motion_count),
-                            activity, peak, elapsed, z_excursion_peak);
-        last_motion_time_ms = now;
     }
 
     if (activity <= MOTION_SETTLE_ACTIVITY_MS2 && peak <= MOTION_SETTLE_PEAK_MS2) {
@@ -789,9 +935,12 @@ static void process_motion_sample(void)
         reset_step_window();
         LOG_INF("Motion settled: baseline=(%.3f, %.3f, %.3f)", x, y, z);
 
-        uint32_t elapsed = last_motion_time_ms ? (uint32_t)(k_uptime_get() - last_motion_time_ms) : 0;
+        int64_t settle_now = k_uptime_get();
+        uint32_t elapsed = motion_active_start_ms ? (uint32_t)(settle_now - motion_active_start_ms) : 0;
         notify_motion_event(0x00, (uint8_t)atomic_get(&detected_motion_count),
                             activity, peak, elapsed, z_excursion_peak);
+        last_settle_ms = settle_now;
+        on_motion_settled();
     }
 }
 

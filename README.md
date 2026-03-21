@@ -125,18 +125,17 @@ python3 nrf52_voice_client.py
 
 **現在の自動録音フロー**
 
-- 自動モードはデフォルトで ON。
-- `DOUBLE_CLENCH` は `MOTION ACTIVE` の後に最初の `WAKEUP` が来た時点で即時認識。
-- `TILT` は `since_wakeup < 2000ms` のときだけ「有効な TILT」として扱う。
-- 直近 `2000ms` 以内の `DOUBLE_CLENCH` がある状態で有効な `TILT` を受けると録音開始。
-- 録音停止は `WAKEUP` ではなく `MOTION ACTIVE`。ただし開始後 `1000ms` は停止イベントを無視し、さらに `1000ms` 未満では最低録音時間のため停止しない。
+ジェスチャー判別は **ファームウェア側の状態機械** で完結する。Mac クライアントは BLE Audio 通知の開始を検知して WAV 録音を開始・停止するだけ。
 
-**ログの見かた**
+ジェスチャー認識シーケンス（いずれかのパターン）:
 
-- `[TILT] ... since_wakeup=136ms` は直前の `WAKEUP` からの経過時間。
-- `[DOUBLE_CLENCH] ... since_tilt=412ms` は直近の有効な `TILT` からの経過時間。
-- `since_wakeup=N/A` / `since_tilt=N/A` は、必要な相手イベントがまだ時間窓内に存在しないことを示す。
-- `[AUTO] ... ignored (grace .../1000ms)` は停止イベントを 1 秒猶予で無視したことを示す。
+- **tilt → clench（HELD 中 tilt 先着）**: 腕を持ち上げ静止 → tilt 検出（pending 記録）→ クレンチ → 録音開始
+- **clench → tilt**: 腕を持ち上げ静止 → クレンチ → settle (READY) → tilt → 録音開始
+- **clench + tilt 同時**: CLENCHED 中に tilt 先着 (pending) → settle → 録音開始
+
+録音停止: 録音中に tilt ジェスチャーで停止。
+
+詳細は `docs/nrf52_voice_guide.md` を参照。
 
 録音ファイルは `mac_client/output/nrf52voice_YYYYMMDD_HHMMSS.wav` に保存されます（16kHz / 16bit / モノラル）。
 
