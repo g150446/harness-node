@@ -10,6 +10,8 @@ Recording start/stop: controlled by gesture events from the device.
   0x02 recording_stop  → WAV recording ends and file is saved
   0x10 motion_active   → displayed (z-value shown)
   0x11 motion_settled  → displayed (z-value shown)
+  0x20 sleep_enter     → displayed
+  0x21 sleep_wake      → displayed
 """
 
 import asyncio
@@ -248,6 +250,10 @@ class VoiceBridge52Client:
             elif code == 0x11:
                 z = struct.unpack_from('<f', data, 3)[0] if len(data) >= 7 else float('nan')
                 print(f"  [EVT] motion_settled z={z:+.2f}")
+            elif code == 0x20:
+                print("  [EVT] sleep_enter")
+            elif code == 0x21:
+                print("  [EVT] sleep_wake")
             else:
                 print(f"  [EVT] 0x{code:02x}")
             return

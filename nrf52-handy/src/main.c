@@ -474,6 +474,7 @@ static void on_motion_started(float z)
     if (imu_sleeping) {
         imu_sleeping = false;
         printk(">>> Wake from light sleep\n");
+        send_event_packet(0x21);
         if (current_conn) {
             led_set_state(is_recording ? LED_RECORDING : LED_CONNECTED);
         } else {
@@ -969,6 +970,7 @@ int main(void)
                    (long long)(now_ms - (int64_t)last_motion_time_ms));
             imu_sleeping = true;
             led_set_state(LED_SLEEP);
+            send_event_packet(0x20);
         }
 
         led_tick();
