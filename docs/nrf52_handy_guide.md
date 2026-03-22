@@ -96,26 +96,24 @@ nrf52-handy/
 
 ## ジェスチャー検出アルゴリズム
 
-### 録音開始トリガー（3 条件の AND）
+### 録音開始トリガー（5 条件の AND）
 
-ジェスチャー判定はファームウェア内で完結します。以下の 3 条件がすべて成立したとき `recording_requested = true` となり、DMIC 録音を開始して `0x01` イベントを送信します。
+ジェスチャー判定はファームウェア内で完結します。以下の 5 条件がすべて成立したとき `recording_requested = true` となり、DMIC 録音を開始して `0x01` イベントを送信します。
 
-| 条件 | 判定内容 | しきい値（通常） | しきい値（sleep wake 直後） |
-|------|---------|----------------|--------------------------|
-| 1. `motion_active` の z 値 | 腕の姿勢チェック | `\|z\| < 5.0 m/s²` | `z > 6.0 m/s²`（腕が持ち上がっている方向のみ） |
-| 2. `motion_settled` の z 値 | 静定時に腕が上がっている | `z ≥ 8.0 m/s²` | 同左 |
-| 3. 経過時間 | active → settled の間隔 | `≤ 2000 ms` | 同左 |
+| 条件 | 変数 | 判定内容 |
+|------|------|---------|
+| 1. `active_z_ok` | `gesture_active_z < 0.0 m/s²` | motion_active 時の z 軸加速度が負（腕が重力方向に向いている） |
+| 2. `settle_z_ok` | `z ≥ 8.0 m/s²` | motion_settled 時の z 軸加速度が大きい（腕が上を向いて静定） |
+| 3. `window_ok` | `elapsed ≤ 2000 ms` | active → settled の経過時間が 2 秒以内 |
+| 4. `peak_ok` | `motion_peak_speed ≥ 2.5 m/s` | モーション中のピーク速度が十分大きい（弱い動きを除外） |
+| 5. `dist_ok` | `motion_distance ≥ 0.25 m` | モーション中の総移動距離が十分ある（小さい動きを除外） |
 
-> **sleep wake 直後の挙動**: スリープ解除後の最初の `motion_settled` のみ条件 1 を `z > 6.0` に差し替えます。
-> 腕を持ち上げる動き（z 正方向が大きい）以外は録音トリガーにならず、誤検知を抑制します。
-> 2 回目以降のモーションからは通常条件（`|z| < 5.0`）に戻ります。
+**シーケンス例（手首フリップジェスチャー）:**
 
-**シーケンス例（腕を持ち上げるジェスチャー）:**
-
-1. 腕が横方向に動き始める → `motion_active` 検出（通常: z が ±5.0 以内 / wake 直後: z > 6.0）
-2. 腕を持ち上げて静止する → `motion_settled` 検出（z ≥ 8.0）
-3. 1→2 の経過時間が 2000 ms 以内
-4. 3 条件成立 → 録音開始 + `0x01` 送信
+1. 手首を素早くフリップ → `motion_active` 検出（z < 0: 腕が重力方向）
+2. 手首を静止させる → `motion_settled` 検出（z ≥ 8.0: 腕が上向きで静定）
+3. 1→2 の経過時間 ≤ 2000 ms、peak ≥ 2.5 m/s、dist ≥ 0.25 m
+4. 5 条件成立 → 録音開始 + `0x01` 送信
 
 ### 録音停止トリガー
 
@@ -151,10 +149,12 @@ nrf52-handy/
 
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
-| `GESTURE_ACTIVE_Z_ABS_MAX_MS2` | 5.0 m/s² | motion_active 時の z 絶対値上限（通常） |
-| `GESTURE_WAKE_ACTIVE_Z_MIN_MS2` | 6.0 m/s² | motion_active 時の z 下限（sleep wake 直後のみ） |
 | `GESTURE_SETTLE_Z_MIN_MS2` | 8.0 m/s² | motion_settled 時の z 軸下限 |
+| `GESTURE_SETTLE_PEAK_SPEED_MIN` | 2.5 m/s | モーション中のピーク速度下限 |
+| `GESTURE_SETTLE_DIST_MIN` | 0.25 m | モーション中の総移動距離下限 |
 | `GESTURE_WINDOW_MS` | 2000 ms | active → settled の最大許容時間 |
+
+motion_active 時の z 軸加速度が 0 未満であること（`gesture_active_z < 0`）もハードコードされた条件として判定に含まれます。
 
 ---
 

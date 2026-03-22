@@ -249,7 +249,15 @@ class VoiceBridge52Client:
                 print(f"  [EVT] motion_active  z={z:+.2f}")
             elif code == 0x11:
                 z = struct.unpack_from('<f', data, 3)[0] if len(data) >= 7 else float('nan')
-                print(f"  [EVT] motion_settled z={z:+.2f}")
+                if len(data) >= 23:
+                    elapsed_ms = struct.unpack_from('<I', data, 7)[0]
+                    avg_speed  = struct.unpack_from('<f', data, 11)[0]
+                    peak_speed = struct.unpack_from('<f', data, 15)[0]
+                    distance   = struct.unpack_from('<f', data, 19)[0]
+                    print(f"  [EVT] motion_settled z={z:+.2f} elapsed={elapsed_ms}ms "
+                          f"avg={avg_speed:.3f}m/s peak={peak_speed:.3f}m/s dist={distance:.3f}m")
+                else:
+                    print(f"  [EVT] motion_settled z={z:+.2f}")
             elif code == 0x20:
                 print("  [EVT] sleep_enter")
             elif code == 0x21:

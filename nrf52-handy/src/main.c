@@ -39,6 +39,8 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/dfu/mcuboot.h>
 
+#include <math.h>
+
 #include "audio_capture.h"
 
 LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
@@ -70,23 +72,19 @@ LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
 #define MOTION_ENTRY_PEAK_MS2       2.4
 #define MOTION_CONTINUE_ACTIVITY_MS2 4.0
 #define MOTION_CONTINUE_PEAK_MS2    1.4
-#define MOTION_SETTLE_ACTIVITY_MS2  2.0
-#define MOTION_SETTLE_PEAK_MS2      0.8
+#define MOTION_SETTLE_ACTIVITY_MS2  4.0
+#define MOTION_SETTLE_PEAK_MS2      1.4
 #define MOTION_START_WINDOWS        2
-#define MOTION_SETTLE_WINDOWS       4
+#define MOTION_SETTLE_WINDOWS       2
 #define BASELINE_ALPHA              0.03
 #define REPORT_COOLDOWN_MS          700
 #define MOTION_DURATION_SAMPLES     2
 
 /* Gesture classifier thresholds */
-#define GESTURE_ACTIVE_Z_ABS_MAX_MS2 5.0f   /* |motion_active z| must be < this */
 #define GESTURE_SETTLE_Z_MIN_MS2     8.0f   /* motion_settled z must be >= this */
+#define GESTURE_SETTLE_PEAK_SPEED_MIN 2.5f  /* settle時のpeak速度下限 */
+#define GESTURE_SETTLE_DIST_MIN       0.25f /* 移動距離下限 */
 #define GESTURE_WINDOW_MS            2000   /* max ms between active and settle */
-#define GESTURE_WAKE_ACTIVE_Z_MIN_MS2  6.0f  /* sleep wake直後: active z must be > this */
-
-/* Light sleep */
-#define LIGHT_SLEEP_TIMEOUT_MS       10000  /* enter light sleep after 10s of no motion */
-#define LIGHT_SLEEP_POLL_MS          200    /* IMU poll interval during light sleep */
 
 /* ============================================================================
  * BLE UUIDs (Handy-compatible)
@@ -148,12 +146,11 @@ static float gesture_active_z;
 /* Motion detection state */
 static atomic_t detected_motion_count;
 static uint32_t last_motion_time_ms;
-static bool imu_sleeping;
-static bool just_woke_from_sleep;
 static bool baseline_valid;
 static double baseline_x, baseline_y, baseline_z;
 static uint8_t calibration_count, active_high_count, settle_count;
 static bool motion_active;
+static bool inhibit_next_settle;   /* 録音中断直後のsettleをスキップ */
 static int64_t last_report_ms;
 static bool previous_sample_valid;
 static double previous_accel_x, previous_accel_y, previous_accel_z;
@@ -161,6 +158,13 @@ static double step_window[ACTIVITY_WINDOW_SAMPLES];
 static uint8_t step_window_index, step_window_count;
 static double step_window_sum;
 static double z_excursion_peak;
+
+/* Extended motion metrics */
+static float motion_vel_x, motion_vel_y, motion_vel_z;
+static float motion_distance;
+static float motion_peak_speed;
+static float motion_speed_sum;
+static uint32_t motion_speed_samples;
 
 /* Watchdog */
 static const struct device *const wdt = DEVICE_DT_GET(WDT_NODE);
@@ -178,7 +182,6 @@ typedef enum {
     LED_CONNECTED,
     LED_RECORDING,
     LED_ERROR,
-    LED_SLEEP,
 } led_state_t;
 
 static led_state_t current_led_state = LED_BOOT;
@@ -243,9 +246,6 @@ static void led_set_state(led_state_t state)
         rgb_set(true, false, false); /* Red ON to start */
         blink_on = true;
         blink_next_ms = k_uptime_get() + ERROR_BLINK_MS;
-        break;
-    case LED_SLEEP:
-        rgb_set(false, false, false); /* All off */
         break;
     }
 }
@@ -349,6 +349,8 @@ static void mic_power_off(void)
 /* Forward declarations */
 static void send_event_packet(uint8_t event_code);
 static void send_event_packet_f32(uint8_t event_code, float val);
+static void send_event_packet_settle(float z, uint32_t elapsed_ms,
+                                     float avg_speed, float peak_speed, float distance);
 
 /* ============================================================================
  * Motion Detection
@@ -473,52 +475,67 @@ static int configure_motion_detection(void)
 
 static void on_motion_started(float z)
 {
-    if (imu_sleeping) {
-        imu_sleeping = false;
-        just_woke_from_sleep = true;
-        printk(">>> Wake from light sleep\n");
-        send_event_packet(0x21);
-        if (current_conn) {
-            led_set_state(is_recording ? LED_RECORDING : LED_CONNECTED);
-        } else {
-            led_set_state(LED_ADVERTISING);
-        }
-    }
-
     motion_active_start_ms = k_uptime_get();
     gesture_active_z = z;
+
+    motion_vel_x = 0.0f; motion_vel_y = 0.0f; motion_vel_z = 0.0f;
+    motion_distance   = 0.0f;
+    motion_peak_speed = 0.0f;
+    motion_speed_sum  = 0.0f;
+    motion_speed_samples = 0;
+
     send_event_packet_f32(0x10, z);
     printk(">>> Motion active z=%.2f\n", (double)z);
 
     if (is_recording) {
         printk(">>> Motion active while recording → stop\n");
         stop_requested = true;
+        inhibit_next_settle = true;
     }
 }
 
 static void on_motion_settled(float z)
 {
-    last_motion_time_ms = (uint32_t)k_uptime_get();
-    send_event_packet_f32(0x11, z);
-    printk(">>> Motion settled z=%.2f\n", (double)z);
-
     if (is_recording) {
+        last_motion_time_ms = (uint32_t)k_uptime_get();
+        int64_t elapsed = k_uptime_get() - motion_active_start_ms;
+        uint32_t elapsed_ms = (uint32_t)(elapsed < 0 ? 0 : elapsed);
+        float avg_speed = motion_speed_samples > 0
+            ? motion_speed_sum / (float)motion_speed_samples : 0.0f;
+        send_event_packet_settle(z, elapsed_ms, avg_speed, motion_peak_speed, motion_distance);
+        printk(">>> Motion settled z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
+               (double)z, elapsed_ms,
+               (double)avg_speed, (double)motion_peak_speed, (double)motion_distance);
         return;
     }
 
     int64_t elapsed = k_uptime_get() - motion_active_start_ms;
-    float active_z_abs = gesture_active_z < 0.0f ? -gesture_active_z : gesture_active_z;
-    bool active_z_ok  = just_woke_from_sleep
-        ? (gesture_active_z > GESTURE_WAKE_ACTIVE_Z_MIN_MS2)
-        : (active_z_abs < GESTURE_ACTIVE_Z_ABS_MAX_MS2);
-    just_woke_from_sleep = false;
-    bool settle_z_ok  = (z >= GESTURE_SETTLE_Z_MIN_MS2);
-    bool window_ok    = (elapsed <= GESTURE_WINDOW_MS);
+    uint32_t elapsed_ms = (uint32_t)(elapsed < 0 ? 0 : elapsed);
+    float avg_speed = motion_speed_samples > 0
+        ? motion_speed_sum / (float)motion_speed_samples : 0.0f;
+    if (inhibit_next_settle) {
+        inhibit_next_settle = false;
+        printk(">>> Motion settled (inhibited after recording stop)\n");
+        return;
+    }
 
-    printk(">>> Gesture check: active_z=%.2f(|%.2f|<5) settle_z=%.2f elapsed=%lld ms\n",
-           (double)gesture_active_z, (double)active_z_abs, (double)z, (long long)elapsed);
+    bool settle_z_ok   = (z >= GESTURE_SETTLE_Z_MIN_MS2);
+    bool window_ok     = (elapsed <= GESTURE_WINDOW_MS);
+    bool peak_ok       = (motion_peak_speed >= GESTURE_SETTLE_PEAK_SPEED_MIN);
+    bool dist_ok       = (motion_distance >= GESTURE_SETTLE_DIST_MIN);
+    bool active_z_ok   = (gesture_active_z < 0.0f);
 
-    if (active_z_ok && settle_z_ok && window_ok) {
+    last_motion_time_ms = (uint32_t)k_uptime_get();
+    send_event_packet_settle(z, elapsed_ms, avg_speed, motion_peak_speed, motion_distance);
+    printk(">>> Motion settled z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
+           (double)z, elapsed_ms,
+           (double)avg_speed, (double)motion_peak_speed, (double)motion_distance);
+
+    printk(">>> Gesture check: active_z=%.2f settle_z=%.2f elapsed=%lld ms peak=%.3f dist=%.3f\n",
+           (double)gesture_active_z, (double)z, (long long)elapsed,
+           (double)motion_peak_speed, (double)motion_distance);
+
+    if (settle_z_ok && window_ok && peak_ok && dist_ok && active_z_ok) {
         printk(">>> Gesture MATCH → recording_start\n");
         recording_requested = true;
     }
@@ -582,6 +599,19 @@ static void process_motion_sample(void)
     if (z_dev > z_excursion_peak) {
         z_excursion_peak = z_dev;
     }
+
+    /* Velocity & distance integration */
+    static const float DT = MOTION_SAMPLE_INTERVAL_MS / 1000.0f;
+    motion_vel_x += (float)(x - baseline_x) * DT;
+    motion_vel_y += (float)(y - baseline_y) * DT;
+    motion_vel_z += (float)(z - baseline_z) * DT;
+    float spd = sqrtf(motion_vel_x * motion_vel_x +
+                      motion_vel_y * motion_vel_y +
+                      motion_vel_z * motion_vel_z);
+    if (spd > motion_peak_speed) { motion_peak_speed = spd; }
+    motion_distance += spd * DT;
+    motion_speed_sum += spd;
+    motion_speed_samples++;
 
     if ((activity >= MOTION_CONTINUE_ACTIVITY_MS2 || peak >= MOTION_CONTINUE_PEAK_MS2) &&
         (now - last_report_ms) >= REPORT_COOLDOWN_MS) {
@@ -667,6 +697,22 @@ static void send_event_packet_f32(uint8_t event_code, float val)
     pkt[1] = 0x55;
     pkt[2] = event_code;
     memcpy(&pkt[3], &val, 4);
+    bt_gatt_notify(NULL, &audio_svc.attrs[2], pkt, sizeof(pkt));
+}
+
+/* motion_settled extended packet: [0x00][0x55][0x11][f32_z 4B][u32_elapsed_ms 4B]
+ *   [f32_avg_speed 4B][f32_peak_speed 4B][f32_distance 4B] = 23 bytes */
+static void send_event_packet_settle(float z, uint32_t elapsed_ms,
+                                     float avg_speed, float peak_speed, float distance)
+{
+    if (!current_conn) { return; }
+    uint8_t pkt[23];
+    pkt[0] = 0x00; pkt[1] = 0x55; pkt[2] = 0x11;
+    memcpy(&pkt[3],  &z,          4);
+    memcpy(&pkt[7],  &elapsed_ms, 4);
+    memcpy(&pkt[11], &avg_speed,  4);
+    memcpy(&pkt[15], &peak_speed, 4);
+    memcpy(&pkt[19], &distance,   4);
     bt_gatt_notify(NULL, &audio_svc.attrs[2], pkt, sizeof(pkt));
 }
 
@@ -815,13 +861,6 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     LOG_INF("BLE connected");
     printk(">>> Connected!\n");
     current_conn = conn;
-
-    if (imu_sleeping) {
-        imu_sleeping = false;
-        printk(">>> Wake from light sleep (BLE connect)\n");
-        last_motion_time_ms = (uint32_t)k_uptime_get();
-    }
-
     led_set_state(LED_CONNECTED);
 
     int ret = bt_gatt_exchange_mtu(conn, &exchange_params);
@@ -961,22 +1000,12 @@ int main(void)
 
         int64_t now_ms = k_uptime_get();
 
-        /* IMU motion detection (reduced rate during light sleep) */
-        int64_t imu_poll_ms = imu_sleeping ? LIGHT_SLEEP_POLL_MS : MOTION_SAMPLE_INTERVAL_MS;
+        /* IMU motion detection */
+        int64_t imu_poll_ms = MOTION_SAMPLE_INTERVAL_MS;
         if (device_is_ready(imu) &&
             (now_ms - last_motion_sample_ms) >= imu_poll_ms) {
             last_motion_sample_ms = now_ms;
             process_motion_sample();
-        }
-
-        /* Enter light sleep after LIGHT_SLEEP_TIMEOUT_MS of no motion */
-        if (!imu_sleeping && !is_recording &&
-            (now_ms - (int64_t)last_motion_time_ms) >= LIGHT_SLEEP_TIMEOUT_MS) {
-            printk(">>> Light sleep: no motion for %lld ms\n",
-                   (long long)(now_ms - (int64_t)last_motion_time_ms));
-            imu_sleeping = true;
-            led_set_state(LED_SLEEP);
-            send_event_packet(0x20);
         }
 
         led_tick();
