@@ -13,8 +13,7 @@
  *
  * LED states (active-low, Zephyr GPIO_ACTIVE_LOW flag handles inversion):
  *   Boot        White  1s then off
- *   Advertising Blue   500ms ON / 1500ms OFF blink
- *   Connected   Green  solid
+ *   Idle        Off    advertising / connected idle
  *   Recording   Red    solid
  *   Error       Red    200ms fast blink
  */
@@ -54,8 +53,6 @@ LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
 #define WDT_NODE                DT_NODELABEL(wdt0)
 #define WDT_TIMEOUT_MS          5000
 #define MAIN_LOOP_INTERVAL_MS   100
-#define ADV_BLINK_ON_MS         500
-#define ADV_BLINK_OFF_MS        1500
 #define ERROR_BLINK_MS          200
 
 #define LED_RED_NODE    DT_ALIAS(led0)
@@ -178,8 +175,7 @@ static const struct gpio_dt_spec led_blue  = GPIO_DT_SPEC_GET(LED_BLUE_NODE,  gp
 /* LED state machine */
 typedef enum {
     LED_BOOT,
-    LED_ADVERTISING,
-    LED_CONNECTED,
+    LED_IDLE,
     LED_RECORDING,
     LED_ERROR,
 } led_state_t;
@@ -231,13 +227,8 @@ static void led_set_state(led_state_t state)
     case LED_BOOT:
         rgb_set(true, true, true);   /* White */
         break;
-    case LED_ADVERTISING:
-        rgb_set(false, false, true); /* Blue ON to start */
-        blink_on = true;
-        blink_next_ms = k_uptime_get() + ADV_BLINK_ON_MS;
-        break;
-    case LED_CONNECTED:
-        rgb_set(false, true, false); /* Green solid */
+    case LED_IDLE:
+        rgb_set(false, false, false); /* Off */
         break;
     case LED_RECORDING:
         rgb_set(true, false, false); /* Red solid */
@@ -250,18 +241,29 @@ static void led_set_state(led_state_t state)
     }
 }
 
+static void led_sync_runtime_state(void)
+{
+    led_state_t desired = LED_IDLE;
+
+    if (current_led_state == LED_BOOT || current_led_state == LED_ERROR) {
+        return;
+    }
+
+    if (is_recording) {
+        desired = LED_RECORDING;
+    }
+
+    if (current_led_state != desired) {
+        led_set_state(desired);
+    }
+}
+
 /* Called from main loop every MAIN_LOOP_INTERVAL_MS to handle blink patterns. */
 static void led_tick(void)
 {
     int64_t now = k_uptime_get();
 
-    if (current_led_state == LED_ADVERTISING) {
-        if (now >= blink_next_ms) {
-            blink_on = !blink_on;
-            rgb_set(false, false, blink_on);
-            blink_next_ms = now + (blink_on ? ADV_BLINK_ON_MS : ADV_BLINK_OFF_MS);
-        }
-    } else if (current_led_state == LED_ERROR) {
+    if (current_led_state == LED_ERROR) {
         if (now >= blink_next_ms) {
             blink_on = !blink_on;
             rgb_set(blink_on, false, false);
@@ -349,7 +351,8 @@ static void mic_power_off(void)
 /* Forward declarations */
 static void send_event_packet(uint8_t event_code);
 static void send_event_packet_f32(uint8_t event_code, float val);
-static void send_event_packet_settle(float z, uint32_t elapsed_ms,
+static void send_event_packet_xyz(uint8_t event_code, float x, float y, float z);
+static void send_event_packet_settle(float x, float y, float z, uint32_t elapsed_ms,
                                      float avg_speed, float peak_speed, float distance);
 
 /* ============================================================================
@@ -473,7 +476,7 @@ static int configure_motion_detection(void)
  * Gesture Detection
  * ============================================================================ */
 
-static void on_motion_started(float z)
+static void on_motion_started(float x, float y, float z)
 {
     motion_active_start_ms = k_uptime_get();
     gesture_active_z = z;
@@ -484,8 +487,8 @@ static void on_motion_started(float z)
     motion_speed_sum  = 0.0f;
     motion_speed_samples = 0;
 
-    send_event_packet_f32(0x10, z);
-    printk(">>> Motion active z=%.2f\n", (double)z);
+    send_event_packet_xyz(0x10, x, y, z);
+    printk(">>> Motion active x=%.2f y=%.2f z=%.2f\n", (double)x, (double)y, (double)z);
 
     if (is_recording) {
         printk(">>> Motion active while recording → stop\n");
@@ -494,7 +497,7 @@ static void on_motion_started(float z)
     }
 }
 
-static void on_motion_settled(float z)
+static void on_motion_settled(float x, float y, float z)
 {
     if (is_recording) {
         last_motion_time_ms = (uint32_t)k_uptime_get();
@@ -502,9 +505,9 @@ static void on_motion_settled(float z)
         uint32_t elapsed_ms = (uint32_t)(elapsed < 0 ? 0 : elapsed);
         float avg_speed = motion_speed_samples > 0
             ? motion_speed_sum / (float)motion_speed_samples : 0.0f;
-        send_event_packet_settle(z, elapsed_ms, avg_speed, motion_peak_speed, motion_distance);
-        printk(">>> Motion settled z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
-               (double)z, elapsed_ms,
+        send_event_packet_settle(x, y, z, elapsed_ms, avg_speed, motion_peak_speed, motion_distance);
+        printk(">>> Motion settled x=%.2f y=%.2f z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
+               (double)x, (double)y, (double)z, elapsed_ms,
                (double)avg_speed, (double)motion_peak_speed, (double)motion_distance);
         return;
     }
@@ -526,9 +529,9 @@ static void on_motion_settled(float z)
     bool active_z_ok   = (gesture_active_z < 0.0f);
 
     last_motion_time_ms = (uint32_t)k_uptime_get();
-    send_event_packet_settle(z, elapsed_ms, avg_speed, motion_peak_speed, motion_distance);
-    printk(">>> Motion settled z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
-           (double)z, elapsed_ms,
+    send_event_packet_settle(x, y, z, elapsed_ms, avg_speed, motion_peak_speed, motion_distance);
+    printk(">>> Motion settled x=%.2f y=%.2f z=%.2f elapsed=%u ms avg=%.3f peak=%.3f dist=%.3f\n",
+           (double)x, (double)y, (double)z, elapsed_ms,
            (double)avg_speed, (double)motion_peak_speed, (double)motion_distance);
 
     printk(">>> Gesture check: active_z=%.2f settle_z=%.2f elapsed=%lld ms peak=%.3f dist=%.3f\n",
@@ -589,7 +592,7 @@ static void process_motion_sample(void)
             LOG_INF("Motion! count=%d activity=%.3f peak=%.3f",
                     (int)atomic_get(&detected_motion_count), activity, peak);
             last_motion_time_ms = now;
-            on_motion_started((float)z);
+            on_motion_started((float)x, (float)y, (float)z);
         }
         return;
     }
@@ -631,7 +634,7 @@ static void process_motion_sample(void)
         set_baseline(x, y, z);
         reset_step_window();
         LOG_INF("Motion settled: baseline=(%.3f, %.3f, %.3f)", x, y, z);
-        on_motion_settled((float)z);
+        on_motion_settled((float)x, (float)y, (float)z);
     }
 }
 
@@ -700,19 +703,33 @@ static void send_event_packet_f32(uint8_t event_code, float val)
     bt_gatt_notify(NULL, &audio_svc.attrs[2], pkt, sizeof(pkt));
 }
 
-/* motion_settled extended packet: [0x00][0x55][0x11][f32_z 4B][u32_elapsed_ms 4B]
- *   [f32_avg_speed 4B][f32_peak_speed 4B][f32_distance 4B] = 23 bytes */
-static void send_event_packet_settle(float z, uint32_t elapsed_ms,
+/* motion_active/xyz packet: [0x00][0x55][code][f32_x][f32_y][f32_z] = 15 bytes */
+static void send_event_packet_xyz(uint8_t event_code, float x, float y, float z)
+{
+    if (!current_conn) { return; }
+    uint8_t pkt[15];
+    pkt[0] = 0x00; pkt[1] = 0x55; pkt[2] = event_code;
+    memcpy(&pkt[3],  &x, 4);
+    memcpy(&pkt[7],  &y, 4);
+    memcpy(&pkt[11], &z, 4);
+    bt_gatt_notify(NULL, &audio_svc.attrs[2], pkt, sizeof(pkt));
+}
+
+/* motion_settled extended packet: [0x00][0x55][0x11][f32_x][f32_y][f32_z][u32_elapsed_ms]
+ *   [f32_avg_speed][f32_peak_speed][f32_distance] = 31 bytes */
+static void send_event_packet_settle(float x, float y, float z, uint32_t elapsed_ms,
                                      float avg_speed, float peak_speed, float distance)
 {
     if (!current_conn) { return; }
-    uint8_t pkt[23];
+    uint8_t pkt[31];
     pkt[0] = 0x00; pkt[1] = 0x55; pkt[2] = 0x11;
-    memcpy(&pkt[3],  &z,          4);
-    memcpy(&pkt[7],  &elapsed_ms, 4);
-    memcpy(&pkt[11], &avg_speed,  4);
-    memcpy(&pkt[15], &peak_speed, 4);
-    memcpy(&pkt[19], &distance,   4);
+    memcpy(&pkt[3],  &x,          4);
+    memcpy(&pkt[7],  &y,          4);
+    memcpy(&pkt[11], &z,          4);
+    memcpy(&pkt[15], &elapsed_ms, 4);
+    memcpy(&pkt[19], &avg_speed,  4);
+    memcpy(&pkt[23], &peak_speed, 4);
+    memcpy(&pkt[27], &distance,   4);
     bt_gatt_notify(NULL, &audio_svc.attrs[2], pkt, sizeof(pkt));
 }
 
@@ -861,7 +878,7 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     LOG_INF("BLE connected");
     printk(">>> Connected!\n");
     current_conn = conn;
-    led_set_state(LED_CONNECTED);
+    led_sync_runtime_state();
 
     int ret = bt_gatt_exchange_mtu(conn, &exchange_params);
     if (ret) {
@@ -887,7 +904,7 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
     current_conn = NULL;
     is_recording = false;
     stop_requested = true;
-    led_set_state(LED_ADVERTISING);
+    led_sync_runtime_state();
 
     int ret = bt_le_adv_start(BT_LE_ADV_CONN, adv_data, ARRAY_SIZE(adv_data),
                               scan_rsp, ARRAY_SIZE(scan_rsp));
@@ -960,9 +977,9 @@ int main(void)
 
     LOG_INF("nrf52-handy ready");
 
-    /* Boot LED: white for ~1 second, then switch to advertising blink */
+    /* Boot LED: white for ~1 second, then switch to idle/off */
     k_msleep(1000);
-    led_set_state(LED_ADVERTISING);
+    led_set_state(LED_IDLE);
 
     /* Auto-confirm OTA image after 3s total — basic sanity that we didn't crash */
     k_msleep(2000);
@@ -989,14 +1006,7 @@ int main(void)
             wdt_feed(wdt, wdt_channel_id);
         }
 
-        /* Sync LED to recording state when connected */
-        if (current_conn) {
-            if (is_recording && current_led_state != LED_RECORDING) {
-                led_set_state(LED_RECORDING);
-            } else if (!is_recording && current_led_state == LED_RECORDING) {
-                led_set_state(LED_CONNECTED);
-            }
-        }
+        led_sync_runtime_state();
 
         int64_t now_ms = k_uptime_get();
 
