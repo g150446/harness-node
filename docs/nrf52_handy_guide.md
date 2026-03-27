@@ -52,6 +52,18 @@ nrf52-handy/
 
 ## BLE サービス仕様
 
+### Battery Service（標準 UUID）
+
+**サービス UUID**: `0000180f-0000-1000-8000-00805f9b34fb`（Bluetooth SIG 標準 Battery Service）
+
+| キャラクタリスティック | UUID | プロパティ | 説明 |
+|----------------------|------|-----------|------|
+| Battery Level | `00002a19-0000-1000-8000-00805f9b34fb` | Read, Notify | バッテリー残量（0〜100%） |
+
+- nRF Connect や iOS/Android の標準 API で直接読み取り可能
+- 30 秒ごとに更新。変化があると Notify が発火する
+- 詳細な実装・回路知見は `docs/nrf52_battery_guide.md` を参照
+
 ### Audio Service
 
 **サービス UUID**: `00000001-0000-1000-8000-00805f9b34fb`

@@ -28,6 +28,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/drivers/sensor.h>
@@ -36,6 +37,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/usb/usb_device.h>
+#include <zephyr/bluetooth/services/bas.h>
 #include <zephyr/dfu/mcuboot.h>
 
 #include <math.h>
@@ -54,6 +56,7 @@ LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
 #define WDT_TIMEOUT_MS          5000
 #define MAIN_LOOP_INTERVAL_MS   100
 #define ERROR_BLINK_MS          200
+#define BATTERY_POLL_INTERVAL_MS 30000  /* 30 seconds */
 
 #define LED_RED_NODE    DT_ALIAS(led0)
 #define LED_GREEN_NODE  DT_ALIAS(led1)
@@ -162,6 +165,18 @@ static float motion_distance;
 static float motion_peak_speed;
 static float motion_speed_sum;
 static uint32_t motion_speed_samples;
+
+/* Battery ADC (P0.31 = AIN7) + Enable GPIO (P0.14) */
+static const struct adc_dt_spec adc_bat =
+    ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 0);
+static const struct gpio_dt_spec bat_en =
+    GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), bat_read_enable_gpios);
+static int16_t bat_sample_buf;
+static struct adc_sequence bat_sequence = {
+    .buffer      = &bat_sample_buf,
+    .buffer_size = sizeof(bat_sample_buf),
+};
+static bool bat_adc_ready;
 
 /* Watchdog */
 static const struct device *const wdt = DEVICE_DT_GET(WDT_NODE);
@@ -320,6 +335,90 @@ static void configure_watchdog(void)
     }
     LOG_INF("WDT armed: %d ms timeout", WDT_TIMEOUT_MS);
     printk("Watchdog armed (%d ms)\n", WDT_TIMEOUT_MS);
+}
+
+/* ============================================================================
+ * Battery Monitor
+ * ============================================================================ */
+
+static int battery_init(void)
+{
+    if (!adc_is_ready_dt(&adc_bat)) {
+        LOG_WRN("Battery ADC not ready");
+        return -ENODEV;
+    }
+    int err = adc_channel_setup_dt(&adc_bat);
+    if (err < 0) {
+        LOG_ERR("Battery ADC channel setup failed: %d", err);
+        return err;
+    }
+    /* Configure P0.14 as output (battery measurement enable) */
+    if (gpio_is_ready_dt(&bat_en)) {
+        gpio_pin_configure_dt(&bat_en, GPIO_OUTPUT_INACTIVE);
+    } else {
+        LOG_WRN("Battery enable GPIO not ready");
+    }
+    bat_adc_ready = true;
+    LOG_INF("Battery ADC ready (AIN7/P0.31, enable P0.14)");
+    return 0;
+}
+
+static int battery_get_millivolt(void)
+{
+    int err;
+    int32_t val_mv;
+
+    /* P0.14 must remain LOW — HIGH injects 3.3V into P0.31 and saturates ADC */
+
+    err = adc_sequence_init_dt(&adc_bat, &bat_sequence);
+    if (err < 0) { return err; }
+
+    err = adc_read(adc_bat.dev, &bat_sequence);
+    if (err < 0) { return err; }
+
+    val_mv = bat_sample_buf;
+    err = adc_raw_to_millivolts_dt(&adc_bat, &val_mv);
+    if (err < 0) { return err; }
+
+    /*
+     * Correction factor ×3: XIAO nRF52840 divider is 2MΩ:1MΩ (not 1:1).
+     * Verified empirically: pin_mv=1398mV × 3 = 4194mV ≈ 4200mV (USB charge).
+     */
+    return (int)(val_mv * 3);
+}
+
+static uint8_t battery_millivolt_to_percent(int mv)
+{
+    static const struct { int mv; int pct; } lut[] = {
+        { 4200, 100 }, { 4100, 90 }, { 4000, 80 },
+        { 3900,  70 }, { 3800, 60 }, { 3700, 50 },
+        { 3600,  40 }, { 3500, 30 }, { 3400, 20 },
+        { 3300,  10 }, { 3000,  0 },
+    };
+    if (mv >= lut[0].mv) { return 100; }
+    for (int i = 0; i < (int)ARRAY_SIZE(lut) - 1; i++) {
+        if (mv >= lut[i + 1].mv) {
+            int mv_range  = lut[i].mv  - lut[i + 1].mv;
+            int pct_range = lut[i].pct - lut[i + 1].pct;
+            return (uint8_t)(lut[i + 1].pct +
+                   (mv - lut[i + 1].mv) * pct_range / mv_range);
+        }
+    }
+    return 0;
+}
+
+static void battery_update(void)
+{
+    if (!bat_adc_ready) { return; }
+    int mv = battery_get_millivolt();
+    if (mv <= 0) {
+        LOG_WRN("Battery read failed: %d", mv);
+        return;
+    }
+    uint8_t pct = battery_millivolt_to_percent(mv);
+    LOG_INF("Battery: %d mV (%d%%)", mv, pct);
+    printk("Battery: %d mV (%d%%)\n", mv, pct);
+    bt_bas_set_battery_level(pct);
 }
 
 /* ============================================================================
@@ -950,6 +1049,9 @@ int main(void)
     ret = configure_mic_power();
     if (ret < 0) LOG_WRN("Mic power GPIO setup failed: %d", ret);
 
+    ret = battery_init();
+    if (ret < 0) LOG_WRN("Battery monitor init failed: %d", ret);
+
     if (!device_is_ready(imu)) {
         LOG_WRN("IMU not ready — gesture detection disabled");
     } else {
@@ -997,8 +1099,12 @@ int main(void)
     /* Arm watchdog after image confirmation */
     configure_watchdog();
 
+    /* Initial battery reading after BLE is ready */
+    battery_update();
+
     /* Main loop: watchdog feed + LED state management + blink tick + IMU motion */
     int64_t last_motion_sample_ms = k_uptime_get();
+    int64_t last_battery_ms = k_uptime_get();
     while (1) {
         k_msleep(MAIN_LOOP_INTERVAL_MS);
 
@@ -1019,6 +1125,12 @@ int main(void)
         }
 
         led_tick();
+
+        /* Battery polling */
+        if ((now_ms - last_battery_ms) >= BATTERY_POLL_INTERVAL_MS) {
+            last_battery_ms = now_ms;
+            battery_update();
+        }
     }
 
     return 0;
