@@ -56,7 +56,9 @@ LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
 #define WDT_TIMEOUT_MS          5000
 #define MAIN_LOOP_INTERVAL_MS   100
 #define ERROR_BLINK_MS          200
-#define BATTERY_POLL_INTERVAL_MS 30000  /* 30 seconds */
+#define BATTERY_POLL_INTERVAL_MS 60000  /* 1 minute */
+#define SLEEP_IDLE_TIMEOUT_MS   10000  /* idle this long with no motion → light sleep */
+#define SLEEP_POLL_INTERVAL_MS  500    /* IMU poll interval while in light sleep */
 
 #define LED_RED_NODE    DT_ALIAS(led0)
 #define LED_GREEN_NODE  DT_ALIAS(led1)
@@ -151,6 +153,9 @@ static double baseline_x, baseline_y, baseline_z;
 static uint8_t calibration_count, active_high_count, settle_count;
 static bool motion_active;
 static bool inhibit_next_settle;   /* 録音中断直後のsettleをスキップ */
+static bool light_sleep_active;    /* true = IMUポーリングを低速化して省電力 */
+static bool just_woke_from_sleep;  /* スリープ復帰直後の1ジェスチャーだけ閾値を緩和 */
+static int64_t last_activity_ms;   /* motion_active/settled/recording_stop の最終時刻 */
 static int64_t last_report_ms;
 static bool previous_sample_valid;
 static double previous_accel_x, previous_accel_y, previous_accel_z;
@@ -578,6 +583,7 @@ static int configure_motion_detection(void)
 static void on_motion_started(float x, float y, float z)
 {
     motion_active_start_ms = k_uptime_get();
+    last_activity_ms = motion_active_start_ms;
     gesture_active_z = z;
 
     motion_vel_x = 0.0f; motion_vel_y = 0.0f; motion_vel_z = 0.0f;
@@ -598,6 +604,8 @@ static void on_motion_started(float x, float y, float z)
 
 static void on_motion_settled(float x, float y, float z)
 {
+    last_activity_ms = k_uptime_get();
+
     if (is_recording) {
         last_motion_time_ms = (uint32_t)k_uptime_get();
         int64_t elapsed = k_uptime_get() - motion_active_start_ms;
@@ -623,9 +631,15 @@ static void on_motion_settled(float x, float y, float z)
 
     bool settle_z_ok   = (z >= GESTURE_SETTLE_Z_MIN_MS2);
     bool window_ok     = (elapsed <= GESTURE_WINDOW_MS);
-    bool peak_ok       = (motion_peak_speed >= GESTURE_SETTLE_PEAK_SPEED_MIN);
-    bool dist_ok       = (motion_distance >= GESTURE_SETTLE_DIST_MIN);
-    bool active_z_ok   = (gesture_active_z < 0.0f);
+    float peak_thr = just_woke_from_sleep
+                     ? (GESTURE_SETTLE_PEAK_SPEED_MIN / 2.0f)
+                     : GESTURE_SETTLE_PEAK_SPEED_MIN;
+    float dist_thr = just_woke_from_sleep
+                     ? (GESTURE_SETTLE_DIST_MIN / 2.0f)
+                     : GESTURE_SETTLE_DIST_MIN;
+    bool peak_ok = (motion_peak_speed >= peak_thr);
+    bool dist_ok = (motion_distance   >= dist_thr);
+    just_woke_from_sleep = false;
 
     last_motion_time_ms = (uint32_t)k_uptime_get();
     send_event_packet_settle(x, y, z, elapsed_ms, avg_speed, motion_peak_speed, motion_distance);
@@ -633,11 +647,12 @@ static void on_motion_settled(float x, float y, float z)
            (double)x, (double)y, (double)z, elapsed_ms,
            (double)avg_speed, (double)motion_peak_speed, (double)motion_distance);
 
-    printk(">>> Gesture check: active_z=%.2f settle_z=%.2f elapsed=%lld ms peak=%.3f dist=%.3f\n",
-           (double)gesture_active_z, (double)z, (long long)elapsed,
-           (double)motion_peak_speed, (double)motion_distance);
+    printk(">>> Gesture check: settle_z=%.2f elapsed=%lld ms peak=%.3f(thr=%.2f) dist=%.3f(thr=%.2f)\n",
+           (double)z, (long long)elapsed,
+           (double)motion_peak_speed, (double)peak_thr,
+           (double)motion_distance, (double)dist_thr);
 
-    if (settle_z_ok && window_ok && peak_ok && dist_ok && active_z_ok) {
+    if (settle_z_ok && window_ok && peak_ok && dist_ok) {
         printk(">>> Gesture MATCH → recording_start\n");
         recording_requested = true;
     }
@@ -926,6 +941,8 @@ static void audio_thread(void *p1, void *p2, void *p3)
 
             printk("Recording stopped\n");
             send_event_packet(0x02);
+            battery_update();
+            last_activity_ms = k_uptime_get();   /* reset idle timer after recording */
         }
 
         if (is_recording && current_conn) {
@@ -1105,6 +1122,7 @@ int main(void)
     /* Main loop: watchdog feed + LED state management + blink tick + IMU motion */
     int64_t last_motion_sample_ms = k_uptime_get();
     int64_t last_battery_ms = k_uptime_get();
+    last_activity_ms = k_uptime_get();
     while (1) {
         k_msleep(MAIN_LOOP_INTERVAL_MS);
 
@@ -1116,8 +1134,10 @@ int main(void)
 
         int64_t now_ms = k_uptime_get();
 
-        /* IMU motion detection */
-        int64_t imu_poll_ms = MOTION_SAMPLE_INTERVAL_MS;
+        /* IMU motion detection — poll faster when active, slower when sleeping */
+        int64_t imu_poll_ms = light_sleep_active
+                              ? SLEEP_POLL_INTERVAL_MS
+                              : MOTION_SAMPLE_INTERVAL_MS;
         if (device_is_ready(imu) &&
             (now_ms - last_motion_sample_ms) >= imu_poll_ms) {
             last_motion_sample_ms = now_ms;
@@ -1125,6 +1145,24 @@ int main(void)
         }
 
         led_tick();
+
+        /* Light sleep management */
+        if (!motion_active && !is_recording) {
+            if (!light_sleep_active &&
+                (now_ms - last_activity_ms) >= SLEEP_IDLE_TIMEOUT_MS) {
+                light_sleep_active = true;
+                send_event_packet(0x20);
+                printk(">>> Light sleep enter\n");
+            }
+        } else {
+            if (light_sleep_active) {
+                light_sleep_active = false;
+                just_woke_from_sleep = true;
+                send_event_packet(0x21);
+                printk(">>> Light sleep wake\n");
+            }
+            last_activity_ms = now_ms;
+        }
 
         /* Battery polling */
         if ((now_ms - last_battery_ms) >= BATTERY_POLL_INTERVAL_MS) {

@@ -61,7 +61,7 @@ nrf52-handy/
 | Battery Level | `00002a19-0000-1000-8000-00805f9b34fb` | Read, Notify | バッテリー残量（0〜100%） |
 
 - nRF Connect や iOS/Android の標準 API で直接読み取り可能
-- 30 秒ごとに更新。変化があると Notify が発火する
+- 1 分ごとに更新。録音停止直後にも即時更新。変化があると Notify が発火する
 - 詳細な実装・回路知見は `docs/nrf52_battery_guide.md` を参照
 
 ### Audio Service
@@ -102,35 +102,51 @@ nrf52-handy/
 |--------|-----------|----------------|------|
 | `0x01` | `recording_start` | なし | 録音開始（ジェスチャートリガー後） |
 | `0x02` | `recording_stop` | なし | 録音停止 |
-| `0x10` | `motion_active` | z-axis 加速度（f32 LE） | モーション検出開始、z 軸加速度値 |
-| `0x11` | `motion_settled` | z-axis 加速度（f32 LE） | モーション静定、z 軸加速度値 |
+| `0x10` | `motion_active` | x, y, z f32 LE（各 4 byte） | モーション検出開始、xyz 加速度値 |
+| `0x11` | `motion_settled` | x, y, z f32 LE + elapsed_ms u32 + avg/peak_speed/distance f32 LE（計 28 bytes） | モーション静定、詳細メトリクス |
+| `0x20` | `sleep_enter` | なし | ライトスリープ移行（10 秒無動作） |
+| `0x21` | `sleep_wake` | なし | ライトスリープ復帰（モーション検出） |
 
 ---
 
 ## ジェスチャー検出アルゴリズム
 
-### 録音開始トリガー（5 条件の AND）
+### 録音開始トリガー（4 条件の AND）
 
-ジェスチャー判定はファームウェア内で完結します。以下の 5 条件がすべて成立したとき `recording_requested = true` となり、DMIC 録音を開始して `0x01` イベントを送信します。
+ジェスチャー判定はファームウェア内で完結します。以下の 4 条件がすべて成立したとき `recording_requested = true` となり、DMIC 録音を開始して `0x01` イベントを送信します。
 
-| 条件 | 変数 | 判定内容 |
-|------|------|---------|
-| 1. `active_z_ok` | `gesture_active_z < 0.0 m/s²` | motion_active 時の z 軸加速度が負（腕が重力方向に向いている） |
-| 2. `settle_z_ok` | `z ≥ 8.0 m/s²` | motion_settled 時の z 軸加速度が大きい（腕が上を向いて静定） |
-| 3. `window_ok` | `elapsed ≤ 2000 ms` | active → settled の経過時間が 2 秒以内 |
-| 4. `peak_ok` | `motion_peak_speed ≥ 2.5 m/s` | モーション中のピーク速度が十分大きい（弱い動きを除外） |
-| 5. `dist_ok` | `motion_distance ≥ 0.25 m` | モーション中の総移動距離が十分ある（小さい動きを除外） |
+| 条件 | 通常閾値 | スリープ復帰直後 | 判定内容 |
+|------|---------|---------------|---------|
+| `settle_z_ok` | `z ≥ 8.0 m/s²` | 同じ | motion_settled 時の z 軸加速度が大きい（腕が上を向いて静定） |
+| `window_ok` | `elapsed ≤ 2000 ms` | 同じ | active → settled の経過時間が 2 秒以内 |
+| `peak_ok` | `peak_speed ≥ 2.5 m/s` | `≥ 1.25 m/s` | モーション中のピーク速度が十分大きい |
+| `dist_ok` | `distance ≥ 0.25 m` | `≥ 0.125 m` | モーション中の総移動距離が十分ある |
+
+スリープ復帰直後（`just_woke_from_sleep = true`）は、最初の 1 ジェスチャーのみ `peak_ok` と `dist_ok` の閾値を半分に緩和します。これはスリープ中に蓄積される静的オフセットの影響でピーク速度・移動距離が過小評価される問題への対処です。
 
 **シーケンス例（手首フリップジェスチャー）:**
 
-1. 手首を素早くフリップ → `motion_active` 検出（z < 0: 腕が重力方向）
+1. 手首を素早くフリップ → `motion_active` 検出
 2. 手首を静止させる → `motion_settled` 検出（z ≥ 8.0: 腕が上向きで静定）
-3. 1→2 の経過時間 ≤ 2000 ms、peak ≥ 2.5 m/s、dist ≥ 0.25 m
-4. 5 条件成立 → 録音開始 + `0x01` 送信
+3. 経過時間 ≤ 2000 ms、peak ≥ 2.5 m/s、dist ≥ 0.25 m
+4. 4 条件成立 → 録音開始 + `0x01` 送信
 
 ### 録音停止トリガー
 
 録音中に次の `motion_active` イベントが発生すると `stop_requested = true` となり、DMIC を停止して `0x02` を送信します。
+
+### ライトスリープ
+
+10 秒間 `motion_active` でなく録音中でもない場合、ライトスリープに移行します。
+
+| 状態 | IMU ポーリング | BLE 送信 |
+|------|-------------|---------|
+| 通常（アクティブ） | 25 ms | — |
+| ライトスリープ移行時 | → 500 ms | `0x20 sleep_enter` |
+| ライトスリープ中 | 500 ms | — |
+| ライトスリープ復帰時 | → 25 ms | `0x21 sleep_wake` |
+
+BLE 接続はスリープ中も維持されます。録音停止後もタイマーはリセットされ、即座にスリープに入ることはありません。
 
 ---
 
@@ -163,11 +179,11 @@ nrf52-handy/
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
 | `GESTURE_SETTLE_Z_MIN_MS2` | 8.0 m/s² | motion_settled 時の z 軸下限 |
-| `GESTURE_SETTLE_PEAK_SPEED_MIN` | 2.5 m/s | モーション中のピーク速度下限 |
-| `GESTURE_SETTLE_DIST_MIN` | 0.25 m | モーション中の総移動距離下限 |
+| `GESTURE_SETTLE_PEAK_SPEED_MIN` | 2.5 m/s | ピーク速度下限（スリープ復帰直後は 1.25 m/s） |
+| `GESTURE_SETTLE_DIST_MIN` | 0.25 m | 総移動距離下限（スリープ復帰直後は 0.125 m） |
 | `GESTURE_WINDOW_MS` | 2000 ms | active → settled の最大許容時間 |
-
-motion_active 時の z 軸加速度が 0 未満であること（`gesture_active_z < 0`）もハードコードされた条件として判定に含まれます。
+| `SLEEP_IDLE_TIMEOUT_MS` | 10000 ms | ライトスリープ移行までの無動作時間 |
+| `SLEEP_POLL_INTERVAL_MS` | 500 ms | スリープ中の IMU ポーリング間隔 |
 
 ---
 
@@ -218,17 +234,17 @@ Device reset. MCUboot will swap slots on next boot.
 
 ## Mac クライアント
 
-### nrf52_voice_client.py — BLE 録音クライアント
+### xiao_voice_client.py — BLE 録音クライアント
 
-XIAOVoice に接続し、`0x01` 受信で WAV 録音を自動開始、`0x02` 受信で自動停止します。motion_active / motion_settled イベントと z 値も画面表示します。
+XIAOVoice に接続し、`0x01` 受信で WAV 録音を自動開始、`0x02` 受信で自動停止します。motion_active / motion_settled / sleep_enter / sleep_wake イベントも画面表示します。
 
 ```bash
 cd mac_client
 source venv/bin/activate
-python3 nrf52_voice_client.py
+python3 xiao_voice_client.py
 ```
 
-録音ファイルは `mac_client/output/nrf52voice_YYYYMMDD_HHMMSS.wav` に保存されます（16 kHz / 16-bit / モノラル）。
+録音ファイルは `mac_client/output/xiavoice_YYYYMMDD_HHMMSS.wav` に保存されます（16 kHz / 16-bit / モノラル）。
 
 ### gesture_monitor.py — ジェスチャーモニター
 
@@ -239,6 +255,8 @@ cd mac_client
 source venv/bin/activate
 python3 gesture_monitor.py
 ```
+
+表示イベント: `motion_active`（x/y/z）、`motion_settled`（x/y/z + elapsed/peak/dist）、`recording_start`、`recording_stop`、`sleep_enter`、`sleep_wake`
 
 ### gesture_classifier.py — オフライン分類器（検証用）
 
