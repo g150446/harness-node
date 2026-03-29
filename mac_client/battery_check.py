@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Battery diagnostic for XIAOVoice (nrf52-handy).
+Battery diagnostic for HarnessNode (nordic-main).
 Connects via BLE and reads Battery Service (0x180F) + dumps all services.
 """
 
@@ -8,7 +8,7 @@ import asyncio
 import sys
 from bleak import BleakClient, BleakScanner
 
-DEVICE_NAME = "XIAOVoice"
+DEVICE_NAME = "HarnessNode"
 BATTERY_SERVICE_UUID  = "0000180f-0000-1000-8000-00805f9b34fb"
 BATTERY_LEVEL_UUID    = "00002a19-0000-1000-8000-00805f9b34fb"
 

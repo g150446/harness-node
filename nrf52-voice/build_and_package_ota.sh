@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$SCRIPT_DIR"
-PROJECT_DIR="/Users/g150446/projects/voice-harness/voice-bridge-ble"
+PROJECT_DIR="/Users/g150446/projects/voice-harness/harness-node"
 BUILD_DIR="${BUILD_DIR:-$HOME/nrf52-voice-build}"
 BOARD="xiao_ble/nrf52840/sense"
 NCS_BASE="/opt/nordic/ncs/v2.9.2"

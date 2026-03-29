@@ -1,6 +1,6 @@
 /*
  * Device Tree Overlay for Seeed Studio XIAO nRF52840 Sense
- * nrf52-handy: PDM microphone + flash partitions (no IMU)
+ * nordic-main: PDM microphone + flash partitions (no IMU)
  *
  * Partition DTS ID assignment (sorted by address):
  *   0x00000 sd_partition        → 0  (board DTS)

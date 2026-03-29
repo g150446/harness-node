@@ -19,7 +19,7 @@ import sys
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
 
-DEVICE_NAME   = "XIAOVoice"
+DEVICE_NAME   = "HarnessNode"
 AUDIO_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"
 
 

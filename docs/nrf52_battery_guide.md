@@ -1,6 +1,6 @@
-# XIAO nRF52840 Sense — バッテリー残量実装ガイド
+# HarnessNode (`nordic-main`) バッテリー残量実装ガイド
 
-nrf52-handy ファームウェアのバッテリー残量 BLE 通知機能の実装詳細と、実機診断で判明した回路知見をまとめます。
+XIAO nRF52840 Sense 向け `nordic-main` ファームウェア（BLE デバイス名: `HarnessNode`）のバッテリー残量 BLE 通知機能の実装詳細と、実機診断で判明した回路知見をまとめます。
 
 ---
 
@@ -174,7 +174,7 @@ python3 battery_check.py
 出力例:
 
 ```
-Scanning for 'XIAOVoice'...
+Scanning for 'HarnessNode'...
 Found: C57DBDCF-8ACD-BBA7-5675-A3843B609520
 Connected. MTU=244
 
@@ -196,7 +196,7 @@ Connected. MTU=244
 
 | ファイル | 役割 |
 |---------|------|
-| `nrf52-handy/src/main.c` | バッテリー読み取り実装（`battery_init`, `battery_get_millivolt`, `battery_millivolt_to_percent`, `battery_update`） |
-| `nrf52-handy/boards/xiao_ble_nrf52840_sense.overlay` | ADC チャンネル（AIN7/P0.31）と P0.14 GPIO 定義 |
-| `nrf52-handy/prj.conf` | `CONFIG_ADC=y`, `CONFIG_BT_BAS=y` |
+| `nordic-main/src/main.c` | バッテリー読み取り実装（`battery_init`, `battery_get_millivolt`, `battery_millivolt_to_percent`, `battery_update`） |
+| `nordic-main/boards/xiao_ble_nrf52840_sense.overlay` | ADC チャンネル（AIN7/P0.31）と P0.14 GPIO 定義 |
+| `nordic-main/prj.conf` | `CONFIG_ADC=y`, `CONFIG_BT_BAS=y` |
 | `mac_client/battery_check.py` | BLE 経由の診断スクリプト |

@@ -1,5 +1,5 @@
 /*
- * nrf52-handy: XIAO nRF52840 Sense → Handy BLE firmware
+ * nordic-main: XIAO nRF52840 Sense → Handy BLE firmware
  *
  * Audio streaming via BLE with Handy-compatible protocol.
  * IMU gesture detection triggers BLE event packets to control Handy recording.
@@ -40,23 +40,27 @@
 #include <zephyr/bluetooth/services/bas.h>
 #include <zephyr/dfu/mcuboot.h>
 
+#include <hal/nrf_power.h>
 #include <math.h>
 
 #include "audio_capture.h"
 
-LOG_MODULE_REGISTER(nrf52_handy, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 
 /* ============================================================================
  * Configuration
  * ============================================================================ */
 
-#define BLE_DEVICE_NAME         "XIAOVoice"
+#define BLE_DEVICE_NAME         "HarnessNode"
 #define PCM_PACKET_SIZE         200
 #define WDT_NODE                DT_NODELABEL(wdt0)
 #define WDT_TIMEOUT_MS          5000
 #define MAIN_LOOP_INTERVAL_MS   100
 #define ERROR_BLINK_MS          200
 #define BATTERY_POLL_INTERVAL_MS 60000  /* 1 minute */
+#define BATTERY_CAPACITY_MAH        40   /* LiPo capacity in mAh */
+#define BATTERY_CHARGE_CURRENT_MA  100   /* BQ25120 charge current on XIAO nRF52840 */
+#define BATTERY_CHARGE_MAX_EST_PCT 100   /* linear to 100% (slightly early, CV phase ignored) */
 #define SLEEP_IDLE_TIMEOUT_MS   10000  /* idle this long with no motion → light sleep */
 #define SLEEP_POLL_INTERVAL_MS  500    /* IMU poll interval while in light sleep */
 
@@ -181,7 +185,11 @@ static struct adc_sequence bat_sequence = {
     .buffer      = &bat_sample_buf,
     .buffer_size = sizeof(bat_sample_buf),
 };
-static bool bat_adc_ready;
+static bool    bat_adc_ready;
+static uint8_t bat_last_pct      = 50;  /* last ADC-measured % (initial: 50% fallback) */
+static uint32_t bat_charge_start_ms;    /* k_uptime when USB was connected */
+static uint8_t  bat_charge_start_pct;   /* battery % when USB was connected */
+static bool     bat_vbus_prev;          /* previous VBUS state for edge detection */
 
 /* Watchdog */
 static const struct device *const wdt = DEVICE_DT_GET(WDT_NODE);
@@ -415,12 +423,39 @@ static uint8_t battery_millivolt_to_percent(int mv)
 static void battery_update(void)
 {
     if (!bat_adc_ready) { return; }
+
+    bool vbus = nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
+
+    /* USBが新たに接続された → 充電開始を記録 */
+    if (vbus && !bat_vbus_prev) {
+        bat_charge_start_ms  = k_uptime_get_32();
+        bat_charge_start_pct = bat_last_pct;
+        LOG_INF("Battery: USB connected, charging from %d%%", bat_charge_start_pct);
+    }
+    bat_vbus_prev = vbus;
+
+    if (vbus) {
+        /* 充電中：経過時間から残量を線形推定 */
+        uint32_t elapsed_min = (k_uptime_get_32() - bat_charge_start_ms) / 60000U;
+        /* 充電レート [%/min] = charge_current_mA * 100 / (capacity_mAh * 60) */
+        uint32_t added_pct = (elapsed_min * BATTERY_CHARGE_CURRENT_MA * 100U)
+                             / (BATTERY_CAPACITY_MAH * 60U);
+        uint8_t est_pct = (uint8_t)MIN(bat_charge_start_pct + added_pct,
+                                       BATTERY_CHARGE_MAX_EST_PCT);
+        LOG_INF("Battery: charging ~%d%% (est, %u min)", est_pct, elapsed_min);
+        printk("Battery: charging ~%d%% (est, %u min)\n", est_pct, elapsed_min);
+        bt_bas_set_battery_level(est_pct);
+        return;
+    }
+
+    /* USB切断中：ADCで実測 */
     int mv = battery_get_millivolt();
     if (mv <= 0) {
         LOG_WRN("Battery read failed: %d", mv);
         return;
     }
     uint8_t pct = battery_millivolt_to_percent(mv);
+    bat_last_pct = pct;
     LOG_INF("Battery: %d mV (%d%%)", mv, pct);
     printk("Battery: %d mV (%d%%)\n", mv, pct);
     bt_bas_set_battery_level(pct);
@@ -1050,13 +1085,13 @@ int main(void)
 
     printk("\n");
     printk("============================================\n");
-    printk("nrf52-handy: XIAO nRF52840 Sense\n");
+    printk("nordic-main: XIAO nRF52840 Sense\n");
     printk("Build: %s %s\n", __DATE__, __TIME__);
     printk("============================================\n\n");
 
     log_reset_cause();
 
-    LOG_INF("Starting nrf52-handy");
+    LOG_INF("Starting nordic-main");
 
     ret = configure_leds();
     if (ret < 0) LOG_WRN("LED setup failed: %d", ret);
@@ -1094,7 +1129,7 @@ int main(void)
     k_thread_create(&audio_thread_data, audio_stack, K_THREAD_STACK_SIZEOF(audio_stack),
                     audio_thread, NULL, NULL, NULL, 14, 0, K_NO_WAIT);
 
-    LOG_INF("nrf52-handy ready");
+    LOG_INF("nordic-main ready");
 
     /* Boot LED: white for ~1 second, then switch to idle/off */
     k_msleep(1000);
@@ -1164,7 +1199,15 @@ int main(void)
             last_activity_ms = now_ms;
         }
 
-        /* Battery polling */
+        /* Battery polling — force immediate re-read on USB disconnect */
+        {
+            static bool vbus_prev_main;
+            bool vbus_now = nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
+            if (!vbus_now && vbus_prev_main) {
+                last_battery_ms = 0; /* trigger immediate ADC read */
+            }
+            vbus_prev_main = vbus_now;
+        }
         if ((now_ms - last_battery_ms) >= BATTERY_POLL_INTERVAL_MS) {
             last_battery_ms = now_ms;
             battery_update();

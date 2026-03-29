@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Voice Bridge BLE - Mac Client for nRF52840 Sense (XIAOVoice)
+Voice Bridge BLE - Mac Client for nRF52840 Sense (HarnessNode)
 
-Connects to XIAO nRF52840 Sense running nrf52-handy firmware.
+Connects to XIAO nRF52840 Sense running nordic-main firmware.
 Receives audio and IMU event notifications via BLE.
 
 Recording start/stop: controlled by gesture events from the device.
@@ -35,7 +35,7 @@ except ImportError:
 # Configuration
 # ============================================================================
 
-DEVICE_NAME = "XIAOVoice"
+DEVICE_NAME = "HarnessNode"
 
 # Audio Service UUIDs
 AUDIO_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"  # Notify

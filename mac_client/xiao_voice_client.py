@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Voice Bridge BLE - Mac Client for XIAO nRF52840 / nRF54L15 Sense (XIAOVoice)
+Harness Node - Mac Client for XIAO nRF52840 / nRF54L15 Sense
 
 Connects to XIAO nRF52840 Sense or XIAO nRF54L15 Sense running
-nrf52-handy / nrf54-handy firmware.
+nordic-main / nrf54-handy firmware.
 Receives audio and IMU event notifications via BLE.
 
 Recording start/stop: controlled by gesture events from the device.
@@ -36,7 +36,9 @@ except ImportError:
 # Configuration
 # ============================================================================
 
-DEVICE_NAME = "XIAOVoice"
+PRIMARY_DEVICE_NAME = "HarnessNode"
+LEGACY_DEVICE_NAMES = ("XIAOVoice",)
+DEVICE_NAMES = (PRIMARY_DEVICE_NAME, *LEGACY_DEVICE_NAMES)
 
 # Audio Service UUIDs
 AUDIO_TX_UUID = "00000002-0000-1000-8000-00805f9b34fb"  # Notify
@@ -98,7 +100,7 @@ class WAVRecorder:
 
         if filename is None:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = os.path.join(output_dir, f"xiavoice_{ts}.wav")
+            filename = os.path.join(output_dir, f"xiao_recording_{ts}.wav")
         elif not os.path.isabs(filename):
             filename = os.path.join(output_dir, filename)
 
@@ -147,7 +149,7 @@ class WAVRecorder:
 # BLE Client
 # ============================================================================
 
-class XIAOVoiceClient:
+class XiaoBleClient:
     def __init__(self):
         self.client: Optional[BleakClient] = None
         self.recorder = WAVRecorder()
@@ -166,7 +168,8 @@ class XIAOVoiceClient:
         self._audio_silence_task = None
 
     async def find_device(self) -> Optional[str]:
-        print(f"Scanning for '{DEVICE_NAME}' (8s)...")
+        accepted_names = ", ".join(repr(name) for name in DEVICE_NAMES)
+        print(f"Scanning for {accepted_names} (8s)...")
         audio_svc_uuid = "00000001-0000-1000-8000-00805f9b34fb"
         candidates: list[tuple[str, str]] = []  # (address, label)
         seen: set[str] = set()
@@ -176,7 +179,7 @@ class XIAOVoiceClient:
                 return
             local_name = adv.local_name or device.name or ""
             uuids = [str(u).lower() for u in adv.service_uuids]
-            if local_name == DEVICE_NAME or audio_svc_uuid in uuids:
+            if local_name in DEVICE_NAMES or audio_svc_uuid in uuids:
                 seen.add(device.address)
                 label = f"{device.address}  (name={local_name!r})"
                 candidates.append((device.address, label))
@@ -194,7 +197,7 @@ class XIAOVoiceClient:
             return addr
 
         # Multiple devices — ask the user to choose
-        print(f"\n  Found {len(candidates)} devices named '{DEVICE_NAME}':")
+        print(f"\n  Found {len(candidates)} compatible devices:")
         for i, (addr, label) in enumerate(candidates):
             print(f"    [{i + 1}] {label}")
         loop = asyncio.get_event_loop()
@@ -425,10 +428,10 @@ class XIAOVoiceClient:
 # Interactive Control
 # ============================================================================
 
-async def interactive_control(client: XIAOVoiceClient):
+async def interactive_control(client: XiaoBleClient):
     print()
     print("=" * 60)
-    print("XIAOVoice - XIAO nRF52840 / nRF54L15 Recording Control")
+    print("HarnessNode / XIAOVoice - XIAO Recording Control")
     print("=" * 60)
     print("Commands:")
     print("  r  - Start recording")
@@ -470,16 +473,19 @@ async def interactive_control(client: XIAOVoiceClient):
 
 async def main():
     print("=" * 60)
-    print("XIAOVoice - Mac Client")
+    print("Harness Node - Mac Client")
     print("=" * 60)
     print()
 
-    client = XIAOVoiceClient()
+    client = XiaoBleClient()
 
     try:
         address = await client.find_device()
         if not address:
-            print(f"Device not found. Make sure XIAO Sense is advertising '{DEVICE_NAME}'.")
+            print(
+                "Device not found. Make sure XIAO Sense is advertising "
+                f"'{PRIMARY_DEVICE_NAME}' (legacy '{LEGACY_DEVICE_NAMES[0]}' also supported)."
+            )
             return
 
         await client.connect(address)
@@ -498,7 +504,7 @@ async def main():
                 reconnect_address = None
                 while reconnect_address is None:
                     await asyncio.sleep(3.0)
-                    print(f"  [RECONNECT] Scanning for '{DEVICE_NAME}'...")
+                    print(f"  [RECONNECT] Scanning for '{PRIMARY_DEVICE_NAME}'...")
                     try:
                         reconnect_address = await client.find_device()
                     except Exception:

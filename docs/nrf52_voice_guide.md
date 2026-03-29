@@ -2,6 +2,10 @@
 
 XIAO nRF52840 Sense 向け音声+モーション検出+OTA 統合ファームウェア `nrf52-voice`（BLE デバイス名: `VoiceBridge52`）の保守・運用に必要な情報をまとめます。
 
+> [!NOTE]
+> この文書はレガシーな `nrf52-voice/` 向けです。`harness-node` リポジトリで現在の
+> nRF52840 Sense 向けメインファームウェアは `nordic-main/`（BLE 名: `HarnessNode`）です。
+
 ---
 
 ## 概要
@@ -287,22 +291,22 @@ python3 gesture_collector.py
 ```bash
 cd /opt/nordic/ncs/v2.9.2
 /opt/nordic/ncs/toolchains/b8efef2ad5/bin/python3 -m west build -p always --sysbuild \
-  -b xiao_ble/nrf52840/sense /Users/g150446/projects/voice-harness/voice-bridge-ble/nrf52-voice \
+  -b xiao_ble/nrf52840/sense /Users/g150446/projects/voice-harness/harness-node/nrf52-voice \
   --build-dir $HOME/nrf52-voice-build \
-  -- -DBOARD_ROOT=/Users/g150446/projects/voice-harness/voice-bridge-ble
+  -- -DBOARD_ROOT=/Users/g150446/projects/voice-harness/harness-node
 ```
 
 ### OTA 配布
 
 ```bash
-cd /Users/g150446/projects/voice-harness/voice-bridge-ble/mac_client
+cd /Users/g150446/projects/voice-harness/harness-node/mac_client
 ../venv/bin/python3 ota_updater.py $HOME/nrf52-voice-build/nrf52-voice/zephyr/zephyr.signed.bin
 ```
 
 ### クライアントの最低限確認
 
 ```bash
-cd /Users/g150446/projects/voice-harness/voice-bridge-ble
+cd /Users/g150446/projects/voice-harness/harness-node
 venv/bin/python3 -m py_compile mac_client/nrf52_voice_client.py
 ```
 
