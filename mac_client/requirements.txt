@@ -1,4 +1,5 @@
 bleak>=0.20.0
+matplotlib>=3.7.0
 numpy>=1.24.0
 pyaudio>=0.2.13
 pyserial>=3.5

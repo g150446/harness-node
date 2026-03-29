@@ -1,0 +1,42 @@
+/*
+ * Device Tree Overlay for Seeed Studio XIAO nRF54L15 Sense
+ * nrf54-handy: PDM microphone + IMU
+ *
+ * Board DTS already enables uart20, i2c30, lsm6ds3tr_c, pdm20, and imu0 alias.
+ * This overlay adds the dmic20 alias used by audio_capture.c.
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	chosen {
+		zephyr,console = &uart20;
+		zephyr,shell-uart = &uart20;
+	};
+
+	aliases {
+		dmic20 = &pdm20;
+	};
+};
+
+&uart20 {
+	status = "okay";
+};
+
+&i2c30 {
+	status = "okay";
+};
+
+&pdm20 {
+	status = "okay";
+};
+
+&wdt31 {
+	status = "okay";
+};
+
+/* Remove regulator-boot-on so pdm_imu_pwr starts OFF.
+ * Firmware enables it explicitly on BLE connect via regulator_enable(). */
+&pdm_imu_pwr {
+	/delete-property/ regulator-boot-on;
+};
