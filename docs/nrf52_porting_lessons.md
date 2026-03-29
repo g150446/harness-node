@@ -108,7 +108,7 @@ DTS slot1 の ID 3 が PM_MCUBOOT_PRIMARY (0x33000) を指してしまう。
 ビルド後に生成された `devicetree_generated.h` で ID を確認：
 
 ```bash
-grep "PARTITION_ID" build/nrf52-motion/zephyr/include/generated/zephyr/devicetree_generated.h \
+grep "PARTITION_ID" build/nordic-main/zephyr/include/generated/zephyr/devicetree_generated.h \
   | grep "flash_0.*partition"
 ```
 
