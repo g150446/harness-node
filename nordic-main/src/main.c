@@ -402,11 +402,18 @@ static int battery_get_millivolt(void)
 
 static uint8_t battery_millivolt_to_percent(int mv)
 {
+    /*
+     * OCV (Open Circuit Voltage) based LUT for BQ25101 on XIAO nRF52840 Sense.
+     * The charger terminates at 4.2V CV / 5mA (ITERM=10% of 50mA default).
+     * After termination and USB removal, the battery OCV settles at ~4.08-4.15V
+     * (not 4.2V, which is only the charger-applied terminal voltage).
+     * This LUT uses resting OCV values so that a fully charged battery reads ~100%.
+     */
     static const struct { int mv; int pct; } lut[] = {
-        { 4200, 100 }, { 4100, 90 }, { 4000, 80 },
-        { 3900,  70 }, { 3800, 60 }, { 3700, 50 },
-        { 3600,  40 }, { 3500, 30 }, { 3400, 20 },
-        { 3300,  10 }, { 3000,  0 },
+        { 4150, 100 }, { 4050, 90 }, { 3950, 80 },
+        { 3850,  70 }, { 3750, 60 }, { 3650, 50 },
+        { 3550,  40 }, { 3450, 30 }, { 3350, 20 },
+        { 3250,  10 }, { 3000,  0 },
     };
     if (mv >= lut[0].mv) { return 100; }
     for (int i = 0; i < (int)ARRAY_SIZE(lut) - 1; i++) {
