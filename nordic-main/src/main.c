@@ -36,6 +36,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/bluetooth/services/bas.h>
 #include <zephyr/dfu/mcuboot.h>
@@ -129,7 +130,31 @@ static const struct bt_data scan_rsp[] = {
     BT_DATA(BT_DATA_NAME_COMPLETE, BLE_DEVICE_NAME, sizeof(BLE_DEVICE_NAME) - 1),
 };
 
-static struct bt_conn *current_conn;
+#define MAX_CONNS 2
+static struct bt_conn *connections[MAX_CONNS];
+static int primary_idx = -1;
+
+static struct bt_conn *get_primary_conn(void) {
+    return (primary_idx >= 0) ? connections[primary_idx] : NULL;
+}
+
+static int conn_index(struct bt_conn *conn) {
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (connections[i] == conn) return i;
+    return -1;
+}
+
+static int free_slot(void) {
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (connections[i] == NULL) return i;
+    return -1;
+}
+
+static int active_count(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_CONNS; i++) if (connections[i]) n++;
+    return n;
+}
 
 /* Audio state */
 static uint8_t tx_packet[512];
@@ -141,6 +166,51 @@ static volatile bool stop_requested;
 /* Audio thread */
 static K_THREAD_STACK_DEFINE(audio_stack, 4096);
 static struct k_thread audio_thread_data;
+
+/* Serial command thread */
+static K_THREAD_STACK_DEFINE(serial_stack, 1024);
+static struct k_thread serial_thread_data;
+
+/* Deferred advertising restart — calling bt_le_adv_start() directly from
+ * within a BT callback can fail silently on Nordic NCS because the BT stack
+ * lock may already be held.  Schedule via a work item instead. */
+static struct k_work_delayable adv_work;
+
+/* Deferred BLE connection parameter update.
+ * After primary/secondary role changes we schedule this work item so that
+ * bt_conn_le_param_update() is called from the system workqueue (not from
+ * inside a BT/GATT callback where the BT lock is already held). */
+static struct k_work_delayable conn_param_work;
+
+static void conn_param_work_handler(struct k_work *work)
+{
+    /* Fast params for primary: 7.5–15 ms interval → max audio throughput */
+    static const struct bt_le_conn_param fast_param = {
+        .interval_min = 6,    /* 6 × 1.25 ms = 7.5 ms */
+        .interval_max = 12,   /* 12 × 1.25 ms = 15 ms  */
+        .latency      = 0,
+        .timeout      = 400,
+    };
+    /* Slow params for secondary: 200–500 ms → frees radio for primary */
+    static const struct bt_le_conn_param slow_param = {
+        .interval_min = 160,  /* 200 ms */
+        .interval_max = 400,  /* 500 ms */
+        .latency      = 0,
+        .timeout      = 400,
+    };
+
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (!connections[i]) continue;
+        const struct bt_le_conn_param *p = (i == primary_idx) ? &fast_param : &slow_param;
+        int ret = bt_conn_le_param_update(connections[i], p);
+        if (ret && ret != -EALREADY) {
+            printk(">>> conn_param_update[%d] failed: %d\n", i, ret);
+        } else {
+            printk(">>> conn_param_update[%d]: %s\n", i,
+                   (i == primary_idx) ? "fast(7.5ms)" : "slow(200ms)");
+        }
+    }
+}
 
 /* IMU device */
 static const struct device *const imu     = DEVICE_DT_GET(IMU_NODE);
@@ -818,6 +888,33 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
         } else if (data[0] == 0x00) {
             printk(">>> STOP command\n");
             stop_requested = true;
+        } else if (data[0] == 0x02) {
+            /* Claim primary role */
+            int idx = conn_index(conn);
+            if (idx >= 0) {
+                primary_idx = idx;
+                inhibit_next_settle = false;
+                printk(">>> conn[%d] claimed primary\n", idx);
+                /* Update connection params: fast for primary, slow for secondary */
+                k_work_schedule(&conn_param_work, K_MSEC(200));
+            }
+        } else if (data[0] == 0x03) {
+            /* Yield primary role to the other connection */
+            bool found = false;
+            for (int i = 0; i < MAX_CONNS; i++) {
+                if (connections[i] && connections[i] != conn) {
+                    primary_idx = i;
+                    printk(">>> Primary yielded to conn[%d]\n", i);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                primary_idx = -1;
+                printk(">>> Primary yielded but no peer present; primary cleared\n");
+            }
+            /* Update connection params after yield */
+            k_work_schedule(&conn_param_work, K_MSEC(200));
         }
     }
 
@@ -838,17 +935,19 @@ BT_GATT_SERVICE_DEFINE(audio_svc,
 /* Send event packet via TX characteristic: [0x00][0x55][event_code] */
 static void send_event_packet(uint8_t event_code)
 {
-    if (!current_conn) {
+    if (!get_primary_conn()) {
+        printk(">>> send_event 0x%02x: no primary conn\n", event_code);
         return;
     }
+    printk(">>> send_event 0x%02x -> primary[%d]\n", event_code, primary_idx);
     uint8_t pkt[3] = { 0x00, 0x55, event_code };
-    bt_gatt_notify(NULL, &audio_svc.attrs[2], pkt, sizeof(pkt));
+    bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
 }
 
 /* Event packet with float payload: [0x00][0x55][code][val f32] = 7 bytes */
 static void send_event_packet_f32(uint8_t event_code, float val)
 {
-    if (!current_conn) {
+    if (!get_primary_conn()) {
         return;
     }
     uint8_t pkt[7];
@@ -856,19 +955,19 @@ static void send_event_packet_f32(uint8_t event_code, float val)
     pkt[1] = 0x55;
     pkt[2] = event_code;
     memcpy(&pkt[3], &val, 4);
-    bt_gatt_notify(NULL, &audio_svc.attrs[2], pkt, sizeof(pkt));
+    bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
 }
 
 /* motion_active/xyz packet: [0x00][0x55][code][f32_x][f32_y][f32_z] = 15 bytes */
 static void send_event_packet_xyz(uint8_t event_code, float x, float y, float z)
 {
-    if (!current_conn) { return; }
+    if (!get_primary_conn()) { return; }
     uint8_t pkt[15];
     pkt[0] = 0x00; pkt[1] = 0x55; pkt[2] = event_code;
     memcpy(&pkt[3],  &x, 4);
     memcpy(&pkt[7],  &y, 4);
     memcpy(&pkt[11], &z, 4);
-    bt_gatt_notify(NULL, &audio_svc.attrs[2], pkt, sizeof(pkt));
+    bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
 }
 
 /* motion_settled extended packet: [0x00][0x55][0x11][f32_x][f32_y][f32_z][u32_elapsed_ms]
@@ -876,7 +975,7 @@ static void send_event_packet_xyz(uint8_t event_code, float x, float y, float z)
 static void send_event_packet_settle(float x, float y, float z, uint32_t elapsed_ms,
                                      float avg_speed, float peak_speed, float distance)
 {
-    if (!current_conn) { return; }
+    if (!get_primary_conn()) { return; }
     uint8_t pkt[31];
     pkt[0] = 0x00; pkt[1] = 0x55; pkt[2] = 0x11;
     memcpy(&pkt[3],  &x,          4);
@@ -886,7 +985,7 @@ static void send_event_packet_settle(float x, float y, float z, uint32_t elapsed
     memcpy(&pkt[19], &avg_speed,  4);
     memcpy(&pkt[23], &peak_speed, 4);
     memcpy(&pkt[27], &distance,   4);
-    bt_gatt_notify(NULL, &audio_svc.attrs[2], pkt, sizeof(pkt));
+    bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
 }
 
 /* ============================================================================
@@ -909,11 +1008,11 @@ static void stream_audio_frame(const int16_t *audio_buffer, size_t audio_size)
         memcpy(&tx_packet[2], &audio_buffer[offset],
                samples_to_send * sizeof(int16_t));
 
-        int ret = bt_gatt_notify(NULL, &audio_svc.attrs[2],
+        int ret = bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2],
                                  tx_packet, 2 + (samples_to_send * sizeof(int16_t)));
         if (ret == -ENOMEM) {
             k_msleep(1);
-            ret = bt_gatt_notify(NULL, &audio_svc.attrs[2],
+            ret = bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2],
                                  tx_packet, 2 + (samples_to_send * sizeof(int16_t)));
         }
 
@@ -987,7 +1086,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
             last_activity_ms = k_uptime_get();   /* reset idle timer after recording */
         }
 
-        if (is_recording && current_conn) {
+        if (is_recording && get_primary_conn()) {
             if (dmic_session_active) {
                 ret = audio_capture_get_data(&audio_buffer, &audio_size);
                 if (ret < 0) {
@@ -1001,7 +1100,7 @@ static void audio_thread(void *p1, void *p2, void *p3)
             continue;
         }
 
-        if (!current_conn && dmic_session_active) {
+        if (!get_primary_conn() && dmic_session_active) {
             (void)audio_capture_stop();
             mic_power_off();
             dmic_session_active = false;
@@ -1025,9 +1124,62 @@ static void exchange_func(struct bt_conn *conn, uint8_t att_err,
     }
 }
 
-static struct bt_gatt_exchange_params exchange_params = {
-    .func = exchange_func,
-};
+static struct bt_gatt_exchange_params exchange_params[MAX_CONNS];
+
+/* ============================================================================
+ * Deferred advertising restart
+ * ============================================================================ */
+
+static void adv_work_handler(struct k_work *work)
+{
+    if (active_count() >= MAX_CONNS) {
+        return;
+    }
+    int ret = bt_le_adv_start(BT_LE_ADV_CONN, adv_data, ARRAY_SIZE(adv_data),
+                              scan_rsp, ARRAY_SIZE(scan_rsp));
+    if (ret && ret != -EALREADY) {
+        LOG_WRN("Advertising restart failed: %d", ret);
+        printk(">>> Adv restart failed: %d\n", ret);
+    } else {
+        printk(">>> Advertising restarted\n");
+    }
+}
+
+/* ============================================================================
+ * Serial command thread — reads from USB CDC ACM UART
+ *   'r' → recording start
+ *   's' → recording stop
+ * ============================================================================ */
+
+static void serial_cmd_thread(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    if (!device_is_ready(uart_dev)) {
+        printk(">>> Serial: console UART not ready\n");
+        return;
+    }
+
+    printk(">>> Serial command thread ready ('r'=start 's'=stop)\n");
+
+    while (true) {
+        unsigned char ch;
+        int ret = uart_poll_in(uart_dev, &ch);
+        if (ret == 0) {
+            if (ch == 'r' || ch == 'R') {
+                printk(">>> SERIAL: recording start\n");
+                stop_requested = false;
+                recording_requested = true;
+            } else if (ch == 's' || ch == 'S') {
+                printk(">>> SERIAL: recording stop\n");
+                stop_requested = true;
+            }
+        } else {
+            k_msleep(20);
+        }
+    }
+}
 
 static void ble_connected(struct bt_conn *conn, uint8_t err)
 {
@@ -1035,10 +1187,29 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
 
     LOG_INF("BLE connected");
     printk(">>> Connected!\n");
-    current_conn = conn;
+
+    int slot = free_slot();
+    if (slot < 0) {
+        LOG_WRN("No free connection slot, rejecting");
+        bt_conn_disconnect(conn, BT_HCI_ERR_CONN_LIMIT_EXCEEDED);
+        return;
+    }
+
+    connections[slot] = bt_conn_ref(conn);
+
+    if (primary_idx < 0) {
+        primary_idx = slot;
+        printk(">>> conn[%d] is primary\n", slot);
+    } else {
+        printk(">>> conn[%d] is secondary, notifying primary\n", slot);
+        uint8_t pkt[3] = { 0x00, 0x55, 0x31 };
+        bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
+    }
+
     led_sync_runtime_state();
 
-    int ret = bt_gatt_exchange_mtu(conn, &exchange_params);
+    exchange_params[slot].func = exchange_func;
+    int ret = bt_gatt_exchange_mtu(conn, &exchange_params[slot]);
     if (ret) {
         printk(">>> MTU exchange request failed: %d\n", ret);
     }
@@ -1053,25 +1224,52 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     if (ret) {
         LOG_WRN("Conn param update failed: %d", ret);
     }
+
+    if (active_count() < MAX_CONNS) {
+        /* Schedule advertising restart via work queue — calling bt_le_adv_start()
+         * directly from within a BT callback can fail on Nordic NCS. */
+        k_work_schedule(&adv_work, K_MSEC(100));
+        printk(">>> Advertising restart scheduled\n");
+    }
 }
 
 static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
 {
     LOG_INF("BLE disconnected: %d", reason);
     printk(">>> Disconnected: %d\n", reason);
-    current_conn = NULL;
-    is_recording = false;
-    stop_requested = true;
+
+    int idx = conn_index(conn);
+    if (idx < 0) {
+        return;
+    }
+
+    bt_conn_unref(connections[idx]);
+    connections[idx] = NULL;
+
+    if (primary_idx == idx) {
+        primary_idx = -1;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (connections[i]) {
+                primary_idx = i;
+                printk(">>> conn[%d] promoted to primary\n", i);
+                break;
+            }
+        }
+        if (primary_idx < 0) {
+            is_recording = false;
+            stop_requested = true;
+        }
+    } else if (primary_idx >= 0) {
+        printk(">>> Secondary disconnected, notifying primary\n");
+        uint8_t pkt[3] = { 0x00, 0x55, 0x32 };
+        bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
+    }
+
     led_sync_runtime_state();
 
-    int ret = bt_le_adv_start(BT_LE_ADV_CONN, adv_data, ARRAY_SIZE(adv_data),
-                              scan_rsp, ARRAY_SIZE(scan_rsp));
-    if (ret && ret != -EALREADY) {
-        LOG_WRN("Advertising restart failed: %d", ret);
-        printk(">>> Adv restart failed: %d\n", ret);
-    } else {
-        printk(">>> Advertising restarted\n");
-    }
+    /* Schedule advertising restart via work queue */
+    k_work_schedule(&adv_work, K_MSEC(100));
+    printk(">>> Advertising restart scheduled\n");
 }
 
 static struct bt_conn_cb conn_callbacks = {
@@ -1132,9 +1330,17 @@ int main(void)
 
     LOG_INF("BLE advertising: %s", BLE_DEVICE_NAME);
 
+    /* Initialize deferred advertising work */
+    k_work_init_delayable(&adv_work, adv_work_handler);
+    k_work_init_delayable(&conn_param_work, conn_param_work_handler);
+
     /* Start audio thread (priority 14, below BLE stack) */
     k_thread_create(&audio_thread_data, audio_stack, K_THREAD_STACK_SIZEOF(audio_stack),
                     audio_thread, NULL, NULL, NULL, 14, 0, K_NO_WAIT);
+
+    /* Start serial command thread (priority 10) */
+    k_thread_create(&serial_thread_data, serial_stack, K_THREAD_STACK_SIZEOF(serial_stack),
+                    serial_cmd_thread, NULL, NULL, NULL, 10, 0, K_NO_WAIT);
 
     LOG_INF("nordic-main ready");
 
