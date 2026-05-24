@@ -203,6 +203,14 @@ The working nRF54L15 path now uses a custom XIAO board definition imported from 
   - Connects over BLE, sends start/stop commands, and stores the received PCM stream as a 16 kHz WAV file.
   - This was updated to match the firmware sample rate, so saved files now have the correct timing.
 
+### Known Hardware Limitation on nRF54L15: Shared PDM / IMU Power Regulator
+
+The Seeed XIAO nRF54L15 Sense board shares a single fixed regulator (`pdm_imu_pwr`, GPIO0.1) between the onboard PDM microphone and the LSM6DS3TR-C IMU. Because of this design, **the microphone cannot be powered on or off independently**—whenever the IMU is needed for gesture detection, the microphone is also powered.
+
+This is why the `nrf54-handy/` firmware keeps `pdm_imu_pwr` ON for the entire BLE session (enabling both IMU gesture detection and PDM recording) and turns it OFF only when BLE is disconnected. By contrast, the `nordic-main/` firmware for nRF52840 Sense can toggle microphone power individually via the dedicated `msm261d3526hicpm-c-en` regulator (P1.10), achieving better battery life for gesture-triggered recording use cases.
+
+For details, see `docs/nrf54_power_management.md`.
+
 ### nRF52840 Sense の現行サポート
 
 このリポジトリでサポートしている nRF52840 Sense 向けファームウェアは現在
