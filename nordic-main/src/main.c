@@ -586,9 +586,16 @@ static void set_baseline(double x, double y, double z)
 static void update_baseline(double x, double y, double z)
 {
     if (!baseline_valid) { set_baseline(x, y, z); return; }
-    baseline_x += (x - baseline_x) * BASELINE_ALPHA;
-    baseline_y += (y - baseline_y) * BASELINE_ALPHA;
-    baseline_z += (z - baseline_z) * BASELINE_ALPHA;
+    /* Suppress baseline drift when the board is vibrating (e.g., in a car).
+     * Only update when the total acceleration change is very small,
+     * indicating the device is truly still. */
+    double step = abs_double(x - baseline_x) + abs_double(y - baseline_y) +
+                  abs_double(z - baseline_z);
+    if (step < 0.5) {
+        baseline_x += (x - baseline_x) * BASELINE_ALPHA;
+        baseline_y += (y - baseline_y) * BASELINE_ALPHA;
+        baseline_z += (z - baseline_z) * BASELINE_ALPHA;
+    }
 }
 
 static double motion_delta(double x, double y, double z)
@@ -604,8 +611,10 @@ static double sample_delta(double x, double y, double z)
         previous_sample_valid = true;
         return 0.0;
     }
-    double d = abs_double(x - previous_accel_x) + abs_double(y - previous_accel_y) +
-               abs_double(z - previous_accel_z);
+    /* Use z-axis only for step calculation.  The arm-lift gesture is
+     * predominantly a change in the gravity (z) direction, while
+     * horizontal vibrations (e.g., from a car) are ignored. */
+    double d = abs_double(z - previous_accel_z);
     previous_accel_x = x; previous_accel_y = y; previous_accel_z = z;
     return d;
 }
