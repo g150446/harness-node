@@ -88,7 +88,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define MOTION_DURATION_SAMPLES     2
 
 /* Gesture classifier thresholds */
-#define GESTURE_SETTLE_Z_MIN_MS2     8.0f   /* motion_settled z must be >= this */
+#define GESTURE_SETTLE_Z_ABS_MIN_MS2 8.0f   /* reverse-side-up settle: z must be <= -this */
 #define GESTURE_SETTLE_PEAK_SPEED_MIN 2.5f  /* settle時のpeak速度下限 */
 #define GESTURE_SETTLE_DIST_MIN       0.25f /* 移動距離下限 */
 #define GESTURE_WINDOW_MS            2000   /* max ms between active and settle */
@@ -750,7 +750,7 @@ static void on_motion_settled(float x, float y, float z)
         return;
     }
 
-    bool settle_z_ok   = (z >= GESTURE_SETTLE_Z_MIN_MS2);
+    bool settle_z_ok   = (z <= -GESTURE_SETTLE_Z_ABS_MIN_MS2);
     bool window_ok     = (elapsed <= GESTURE_WINDOW_MS);
     float peak_thr = just_woke_from_sleep
                      ? (GESTURE_SETTLE_PEAK_SPEED_MIN / 2.0f)

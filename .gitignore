@@ -3,6 +3,7 @@ build/
 **/build/
 
 # Zephyr/NCS
+.west/
 zephyr/
 modules/
 **/zephyr/

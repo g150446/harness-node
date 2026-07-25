@@ -94,7 +94,7 @@ LED は省電力・省発光寄りの挙動にしてあり、起動直後の白�
 
 録音開始は以下の **4 条件**がすべて成立したとき:
 
-1. 静定時の z 軸加速度が ≥ 8.0 m/s²（腕が上がった状態で静定）
+1. 静定時の z 軸加速度が ≤ -8.0 m/s²（基板の裏面を上にした状態で静定）
 2. モーション開始 → 静定の経過時間が ≤ 2000 ms
 3. モーション中のピーク速度 ≥ 2.5 m/s（通常）/ ≥ 1.25 m/s（ライトスリープ復帰直後）
 4. モーション中の総移動距離 ≥ 0.25 m（通常）/ ≥ 0.125 m（ライトスリープ復帰直後）
@@ -112,7 +112,11 @@ cd nordic-main
 ./build_and_flash.sh
 ```
 
-XIAO のリセットボタンをダブルタップして UF2 ブートローダに入ると（XIAO-SENSE ドライブが出現）、スクリプトが自動でフラッシュします。
+NCS v2.9.2 を使用します。標準インストール先以外にある場合は
+`NCS_BASE=/path/to/ncs/v2.9.2` を指定してください。XIAO のリセットボタンを
+ダブルタップして UF2 ブートローダに入ると（XIAO-SENSE ドライブが出現）、
+スクリプトが MCUboot と署名済みアプリを含む merged UF2 を書き込み、USB の
+再列挙まで確認します。
 
 #### BLE OTA アップデート（2 回目以降）
 
@@ -121,9 +125,13 @@ cd nordic-main
 ./build_and_package_ota.sh           # OTA バイナリをビルド → ota_update.bin
 
 cd mac_client
-source venv/bin/activate
-python3 ota_updater.py --device HarnessNode ../nordic-main/ota_update.bin
+python3 -m venv venv
+venv/bin/pip install bleak cbor2 pyserial
+venv/bin/python ota_updater.py --device HarnessNode ../nordic-main/ota_update.bin
 ```
+
+アップデータは再起動後に自動で再接続し、転送したイメージが slot 0 で
+`active` かつ `confirmed` になったことまで検証します。
 
 #### Mac クライアントで接続・録音
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""BLE OTA firmware updater for MotionBridge (nrf54-motion) using SMP over BLE.
+"""BLE OTA firmware updater using MCUmgr SMP over BLE.
 
 Usage:
-    venv/bin/pip install cbor2
-    venv/bin/python3 ota_updater.py ../nrf54-motion/ota_update.bin
+    venv/bin/pip install bleak cbor2
+    venv/bin/python3 ota_updater.py --device HarnessNode ../nordic-main/ota_update.bin
 """
 
 import asyncio
@@ -15,7 +15,7 @@ import time
 import cbor2
 from bleak import BleakClient, BleakScanner
 
-DEVICE_NAME = "MotionBridge"   # default; override with --device flag
+DEVICE_NAME = "HarnessNode"   # default; override with --device flag
 
 # SMP BLE service / characteristic UUIDs
 SMP_SERVICE_UUID   = "8D53DC1D-1DB7-4CD3-868B-8A527460AA84"
@@ -94,7 +94,69 @@ async def find_device(name: str, timeout: float = 15.0):
     return device
 
 
-async def ota_update(bin_path: str) -> None:
+async def query_image_state(smp: SMPClient) -> dict:
+    state = await smp.send(OP_READ, GRP_IMG, IMG_STATE, {})
+    images = state.get("images", [])
+    printable = [
+        {key: value.hex() if isinstance(value, bytes) else value
+         for key, value in image.items()}
+        for image in images
+    ]
+    print(f"Images: {printable}", flush=True)
+    return state
+
+
+async def verify_update(expected_hash: bytes, timeout: float) -> None:
+    """Reconnect after reset and require the uploaded image to be active and confirmed."""
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+
+    print("Waiting for the updated device to return...", flush=True)
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            device = await find_device(DEVICE_NAME, timeout=min(8.0, remaining))
+            async with BleakClient(device) as client:
+                smp = SMPClient(client)
+                await smp.start()
+                await asyncio.sleep(0.5)
+
+                while time.monotonic() < deadline:
+                    state = await query_image_state(smp)
+                    matching = [
+                        image for image in state.get("images", [])
+                        if bytes(image.get("hash", b"")) == expected_hash
+                    ]
+                    if matching:
+                        image = matching[0]
+                        if (image.get("slot") == 0
+                                and image.get("active") is True
+                                and image.get("confirmed") is True):
+                            print(
+                                "OTA verified: uploaded image is active and confirmed "
+                                f"in slot 0 (version={image.get('version', 'unknown')}).",
+                                flush=True,
+                            )
+                            return
+                        print(
+                            "Updated image is present but not confirmed yet; retrying...",
+                            flush=True,
+                        )
+                    else:
+                        print("Updated image hash is not visible yet; retrying...", flush=True)
+                    await asyncio.sleep(1.0)
+        except Exception as exc:
+            last_error = exc
+            await asyncio.sleep(1.0)
+
+    detail = f": {last_error}" if last_error else ""
+    raise RuntimeError(
+        f"OTA verification timed out after {timeout:.0f}s; "
+        f"the uploaded image did not become active and confirmed{detail}"
+    )
+
+
+async def ota_update(bin_path: str, verify_timeout: float = 60.0) -> None:
     # Load firmware image
     with open(bin_path, "rb") as f:
         image_data = f.read()
@@ -158,9 +220,8 @@ async def ota_update(bin_path: str) -> None:
 
         # Query image list to get the hash MCUboot recorded for the uploaded image
         print("Querying image state...", flush=True)
-        state_resp = await smp.send(OP_READ, GRP_IMG, IMG_STATE, {})
+        state_resp = await query_image_state(smp)
         images = state_resp.get("images", [])
-        print(f"Images: {[{k: v.hex() if isinstance(v, bytes) else v for k, v in img.items()} for img in images]}", flush=True)
         # Find slot 1 (secondary) image hash
         slot1_hash = None
         for img in images:
@@ -187,7 +248,8 @@ async def ota_update(bin_path: str) -> None:
             pass  # device reboots immediately, disconnect is expected
 
         print("Device reset. MCUboot will swap slots on next boot.", flush=True)
-        print("Reconnect with motion_receiver.py to verify the new firmware.", flush=True)
+
+    await verify_update(slot1_hash, verify_timeout)
 
 
 def main() -> None:
@@ -197,9 +259,15 @@ def main() -> None:
     parser.add_argument("bin", help="Path to ota_update.bin")
     parser.add_argument("--device", default=DEVICE_NAME,
                         help=f"BLE device name to target (default: {DEVICE_NAME})")
+    parser.add_argument(
+        "--verify-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for the new image to become active and confirmed (default: 60)",
+    )
     args = parser.parse_args()
     DEVICE_NAME = args.device
-    asyncio.run(ota_update(args.bin))
+    asyncio.run(ota_update(args.bin, args.verify_timeout))
 
 
 if __name__ == "__main__":

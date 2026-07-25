@@ -117,7 +117,7 @@ nordic-main/
 
 | 条件 | 通常閾値 | スリープ復帰直後 | 判定内容 |
 |------|---------|---------------|---------|
-| `settle_z_ok` | `z ≥ 8.0 m/s²` | 同じ | motion_settled 時の z 軸加速度が大きい（腕が上を向いて静定） |
+| `settle_z_ok` | `z ≤ -8.0 m/s²` | 同じ | motion_settled 時の z 軸加速度が負方向に大きい（基板の裏面を上にして静定） |
 | `window_ok` | `elapsed ≤ 2000 ms` | 同じ | active → settled の経過時間が 2 秒以内 |
 | `peak_ok` | `peak_speed ≥ 2.5 m/s` | `≥ 1.25 m/s` | モーション中のピーク速度が十分大きい |
 | `dist_ok` | `distance ≥ 0.25 m` | `≥ 0.125 m` | モーション中の総移動距離が十分ある |
@@ -127,7 +127,7 @@ nordic-main/
 **シーケンス例（手首フリップジェスチャー）:**
 
 1. 手首を素早くフリップ → `motion_active` 検出
-2. 手首を静止させる → `motion_settled` 検出（z ≥ 8.0: 腕が上向きで静定）
+2. 手首を静止させる → `motion_settled` 検出（z ≤ -8.0: 基板の裏面を上にして静定）
 3. 経過時間 ≤ 2000 ms、peak ≥ 2.5 m/s、dist ≥ 0.25 m
 4. 4 条件成立 → 録音開始 + `0x01` 送信
 
@@ -178,7 +178,7 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
-| `GESTURE_SETTLE_Z_MIN_MS2` | 8.0 m/s² | motion_settled 時の z 軸下限 |
+| `GESTURE_SETTLE_Z_ABS_MIN_MS2` | 8.0 m/s² | 裏向き静定時に要求する負方向z軸加速度の絶対値 |
 | `GESTURE_SETTLE_PEAK_SPEED_MIN` | 2.5 m/s | ピーク速度下限（スリープ復帰直後は 1.25 m/s） |
 | `GESTURE_SETTLE_DIST_MIN` | 0.25 m | 総移動距離下限（スリープ復帰直後は 0.125 m） |
 | `GESTURE_WINDOW_MS` | 2000 ms | active → settled の最大許容時間 |
@@ -189,6 +189,11 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 
 ## ビルドと OTA
 
+NCS v2.9.2 を使用します。SDK が標準の `/opt/nordic/ncs/v2.9.2` または
+`/opt/nordic/ncs/2.9.2` 以外にある場合は、SDK workspace を `NCS_BASE` で
+指定してください。`west` が PATH にない場合は、実行可能な nRF Util を
+`NRFUTIL` で指定すると SDK Manager のツールチェーン環境を使用できます。
+
 ### 初回フラッシュ（MCUboot + アプリを UF2 で書き込み）
 
 ```bash
@@ -196,7 +201,9 @@ cd nordic-main
 ./build_and_flash.sh
 ```
 
-XIAO のリセットボタンをダブルタップして UF2 ブートローダに入ると（XIAO-SENSE ドライブが出現）、スクリプトが自動でフラッシュします。
+XIAO のリセットボタンをダブルタップして UF2 ブートローダに入ると
+（XIAO-SENSE ドライブが出現）、スクリプトが merged UF2 を書き込み、
+アプリのUSBシリアル再列挙まで確認します。
 
 ### OTA バイナリのビルド
 
@@ -212,8 +219,9 @@ OTA バイナリのバージョンは稼働中ファームウェアより新し�
 
 ```bash
 cd mac_client
-source venv/bin/activate
-python3 ota_updater.py --device HarnessNode ../nordic-main/ota_update.bin
+python3 -m venv venv
+venv/bin/pip install bleak cbor2 pyserial
+venv/bin/python ota_updater.py --device HarnessNode ../nordic-main/ota_update.bin
 ```
 
 正常終了時の出力例:
@@ -228,6 +236,8 @@ Setting image test flag...
 Image test flag set.
 Sending reset command...
 Device reset. MCUboot will swap slots on next boot.
+Waiting for the updated device to return...
+OTA verified: uploaded image is active and confirmed in slot 0 (version=...).
 ```
 
 ---
