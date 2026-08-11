@@ -106,30 +106,45 @@ nordic-main/
 | `0x11` | `motion_settled` | x, y, z f32 LE + elapsed_ms u32 + avg/peak_speed/distance f32 LE（計 28 bytes） | モーション静定、詳細メトリクス |
 | `0x20` | `sleep_enter` | なし | ライトスリープ移行（10 秒無動作） |
 | `0x21` | `sleep_wake` | なし | ライトスリープ復帰（モーション検出） |
+| `0x30` | `gesture_diag` | stage/reason u8 + value1/2/3 f32 LE | USBなしのジェスチャー内部診断 |
 
 ---
 
 ## ジェスチャー検出アルゴリズム
 
-### 録音開始トリガー（4 条件の AND）
+この章は運用時の概要です。軸調査の根拠、判定式、状態遷移、全閾値、既知の
+制約、実機テスト項目は [屈曲→回内ジェスチャー仕様](flex_pronation_gesture.md)
+を参照してください。
 
-ジェスチャー判定はファームウェア内で完結します。以下の 4 条件がすべて成立したとき `recording_requested = true` となり、DMIC 録音を開始して `0x01` イベントを送信します。
+### IMU 軸と取り付け方向
 
-| 条件 | 通常閾値 | スリープ復帰直後 | 判定内容 |
-|------|---------|---------------|---------|
-| `settle_z_ok` | `z ≤ -8.0 m/s²` | 同じ | motion_settled 時の z 軸加速度が負方向に大きい（基板の裏面を上にして静定） |
-| `window_ok` | `elapsed ≤ 2000 ms` | 同じ | active → settled の経過時間が 2 秒以内 |
-| `peak_ok` | `peak_speed ≥ 2.5 m/s` | `≥ 1.25 m/s` | モーション中のピーク速度が十分大きい |
-| `dist_ok` | `distance ≥ 0.25 m` | `≥ 0.125 m` | モーション中の総移動距離が十分ある |
+Seeed Studio 公式の XIAO nRF52840 Sense KiCad 基板データと ST の LSM6DS3TR-C 軸図を照合すると、基板上のセンサー軸は次の向きになります。
 
-スリープ復帰直後（`just_woke_from_sleep = true`）は、最初の 1 ジェスチャーのみ `peak_ok` と `dist_ok` の閾値を半分に緩和します。これはスリープ中に蓄積される静的オフセットの影響でピーク速度・移動距離が過小評価される問題への対処です。
+| 軸 | XIAO 基板上の向き | リストバンド装着時の用途 |
+|----|------------------|------------------------|
+| `+X` | 基板長手方向、USB 端子から離れる向き | 前腕長手軸。回内・回外の回転軸 |
+| `+Y` | 基板横方向、5V/GND/3V 側 | 肘屈曲の主な横軸 |
+| `+Z` | 部品面から外向き | 部品面を内側に装着するため手首方向 |
 
-**シーケンス例（手首フリップジェスチャー）:**
+資料: [Seeed Studio XIAO nRF52840 Series](https://wiki.seeedstudio.com/XIAO_BLE/)、[LSM6DS3TR-C datasheet](https://www.st.com/resource/en/datasheet/lsm6ds3tr-c.pdf)
 
-1. 手首を素早くフリップ → `motion_active` 検出
-2. 手首を静止させる → `motion_settled` 検出（z ≤ -8.0: 基板の裏面を上にして静定）
-3. 経過時間 ≤ 2000 ms、peak ≥ 2.5 m/s、dist ≥ 0.25 m
-4. 4 条件成立 → 録音開始 + `0x01` 送信
+### 録音開始トリガー（屈曲 → 回内）
+
+絶対姿勢や重力の向きを使わず、加速度センサーとジャイロの短時間の相対変化を使います。これにより立位、寝た姿勢、走行中の車内で同じ条件を適用できます。
+
+1. 角速度が 200 ms 以上安定している状態を開始姿勢とし、その後1000 msを屈曲開始受付期間とする。この間のX軸先行成分も保持する。
+2. **肘屈曲フェーズ**: X 軸に直交する角速度 `sqrt(gyro_y² + gyro_z²)` が35°/s以上になると回転を積分する。
+3. 180〜1600 ms の間に、屈曲角 ≥ 35°、ピーク角速度 ≥ 50°/s、加速度エビデンス ≥ 0.5 m/s²を満たす。
+4. **回内待ちフェーズ**へ移り、1500 ms 以内の20°/s以上の X 軸角速度を、正負方向別に積算する。
+5. X 軸の方向別積分角 ≥ 30°、ピーク角速度 ≥ 55°/s、3 サンプル以上を満たすと `recording_requested = true` とし、録音開始 + `0x01` を送信する。
+
+加速度エビデンスには `abs(|accel| - 1g)` と開始姿勢からの3軸加速度ベクトル差の大きい方を使います。固定の x/y/z 値を要求しないため姿勢依存がなく、ジャイロだけのノイズでも成立しません。
+
+屈曲は Y-Z の合成角、回内は X の正負方向別積分角で評価するため、右手・左手でジャイロの符号が反転しても同じ条件で発動します。自然な連続動作を許容するため、開始受付中のX軸成分と、屈曲開始50 ms後かつ屈曲角8°以上のX軸回転を屈曲成立後へ引き継ぎます。全シーケンスの上限は3000 msです。成立後に腕を戻す動作は、6000 ms以内に現れる逆向きX回転として1回だけ除外します。1200 msのガードは同一動作内の重複防止用であり、腕戻し対策として長時間の全面禁止は行いません。
+
+単一の手首 IMU だけでは、立位・臥位を問わず肘の絶対伸展角を直接観測できません。そのため「伸展状態」は開始前 200 ms の角速度安定で代用し、その後に十分な Y-Z 回転が生じたことを屈曲として判定します。
+
+同様に、左右どちらの手かという設定を持たずに両手対応するため、X 軸回転は正負の両方向を許容します。この構成では回内と同程度の逆方向回転（回外）も区別できません。回内だけに限定するには、装着する手を設定として追加し、手ごとに X 軸角度の符号を選ぶ必要があります。
 
 ### 録音停止トリガー
 
@@ -142,8 +157,8 @@ nordic-main/
 | 状態 | IMU ポーリング | BLE 送信 |
 |------|-------------|---------|
 | 通常（アクティブ） | 25 ms | — |
-| ライトスリープ移行時 | → 500 ms | `0x20 sleep_enter` |
-| ライトスリープ中 | 500 ms | — |
+| ライトスリープ移行時 | → 50 ms | `0x20 sleep_enter` |
+| ライトスリープ中 | 50 ms | — |
 | ライトスリープ復帰時 | → 25 ms | `0x21 sleep_wake` |
 
 BLE 接続はスリープ中も維持されます。録音停止後もタイマーはリセットされ、即座にスリープに入ることはありません。
@@ -156,7 +171,9 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
-| `ACCEL_ODR_HZ` | 52 | 加速度センサ ODR（Hz） |
+| `ACCEL_ODR_HZ` | 416 | 加速度センサ ODR（Hz） |
+| `GYRO_ODR_HZ` | 104 | ジャイロ ODR（Hz） |
+| `GYRO_FULL_SCALE_DPS` | ±500°/s | ジャイロ測定レンジ |
 | `MOTION_SAMPLE_INTERVAL_MS` | 25 | ソフトウェアポーリング間隔（ms） |
 | `CALIBRATION_SAMPLES` | 25 | 起動時ベースライン計測サンプル数 |
 | `ACTIVITY_WINDOW_SAMPLES` | 4 | アクティビティ判定ウィンドウ（サンプル数） |
@@ -167,10 +184,10 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 |-----------|----------|------|
 | `MOTION_ENTRY_ACTIVITY_MS2` | 8.0 | モーション開始判定：ウィンドウ内の活動量 |
 | `MOTION_ENTRY_PEAK_MS2` | 2.4 | モーション開始判定：ピーク加速度 |
-| `MOTION_SETTLE_ACTIVITY_MS2` | 2.0 | 静定判定：ウィンドウ内の活動量 |
-| `MOTION_SETTLE_PEAK_MS2` | 0.8 | 静定判定：ピーク加速度 |
+| `MOTION_SETTLE_ACTIVITY_MS2` | 4.0 | 静定判定：ウィンドウ内の活動量 |
+| `MOTION_SETTLE_PEAK_MS2` | 1.4 | 静定判定：ピーク加速度 |
 | `MOTION_START_WINDOWS` | 2 | モーション開始に必要な連続ウィンドウ数 |
-| `MOTION_SETTLE_WINDOWS` | 4 | 静定判定に必要な連続ウィンドウ数 |
+| `MOTION_SETTLE_WINDOWS` | 2 | 静定判定に必要な連続ウィンドウ数 |
 | `BASELINE_ALPHA` | 0.03 | ベースライン更新の指数移動平均係数 |
 | `REPORT_COOLDOWN_MS` | 700 | 連続レポートのクールダウン（ms） |
 
@@ -178,12 +195,24 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
-| `GESTURE_SETTLE_Z_ABS_MIN_MS2` | 8.0 m/s² | 裏向き静定時に要求する負方向z軸加速度の絶対値 |
-| `GESTURE_SETTLE_PEAK_SPEED_MIN` | 2.5 m/s | ピーク速度下限（スリープ復帰直後は 1.25 m/s） |
-| `GESTURE_SETTLE_DIST_MIN` | 0.25 m | 総移動距離下限（スリープ復帰直後は 0.125 m） |
-| `GESTURE_WINDOW_MS` | 2000 ms | active → settled の最大許容時間 |
+| `GESTURE_QUIET_HOLD_MS` | 200 ms | 開始前に必要な角速度安定時間 |
+| `GESTURE_START_ARM_MS` | 1000 ms | 静止成立後に保持する屈曲開始受付時間とX軸先行成分 |
+| `GESTURE_FLEX_START_RATE_DPS` | 35°/s | 屈曲フェーズ開始角速度 |
+| `GESTURE_FLEX_ANGLE_MIN_DEG` | 35° | Y-Z 合成屈曲角の下限 |
+| `GESTURE_FLEX_PEAK_RATE_MIN_DPS` | 50°/s | 屈曲ピーク角速度の下限 |
+| `GESTURE_FLEX_ACCEL_EVIDENCE_MIN_MS2` | 0.5 m/s² | 加速度による実動作確認の下限 |
+| `GESTURE_FLEX_MIN_DURATION_MS` | 180 ms | 屈曲の最短時間 |
+| `GESTURE_FLEX_MAX_DURATION_MS` | 1600 ms | 屈曲の最長時間 |
+| `GESTURE_PRONATION_INTEGRATE_RATE_DPS` | 20°/s | X 軸積分対象の最小角速度 |
+| `GESTURE_PRONATION_ANGLE_MIN_DEG` | 30° | X 軸回内角の下限 |
+| `GESTURE_PRONATION_EARLY_MIN_FLEX_DEG` | 8° | 屈曲中の回内先行積分を許可する最小屈曲角 |
+| `GESTURE_PRONATION_EARLY_MIN_MS` | 50 ms | 屈曲中の回内先行積分を許可する最短時間 |
+| `GESTURE_PRONATION_PEAK_MIN_DPS` | 55°/s | 回内ピーク角速度の下限 |
+| `GESTURE_PRONATION_WINDOW_MS` | 1500 ms | 屈曲成立後の回内待ち時間 |
+| `GESTURE_RETURN_SIGNATURE_WINDOW_MS` | 6000 ms | 逆向きXの腕戻しを除外する履歴期間 |
+| `GESTURE_SEQUENCE_TIMEOUT_MS` | 3000 ms | 全シーケンスの最大時間 |
 | `SLEEP_IDLE_TIMEOUT_MS` | 10000 ms | ライトスリープ移行までの無動作時間 |
-| `SLEEP_POLL_INTERVAL_MS` | 500 ms | スリープ中の IMU ポーリング間隔 |
+| `SLEEP_POLL_INTERVAL_MS` | 50 ms | スリープ中の IMU ポーリング間隔 |
 
 ---
 
