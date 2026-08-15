@@ -54,6 +54,9 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 
 #define BLE_DEVICE_NAME         "HarnessNode"
 #define PCM_PACKET_SIZE         200
+#define AUDIO_NOTIFY_IN_FLIGHT  6
+#define AUDIO_NOTIFY_RETRY_MS   2
+#define AUDIO_NOTIFY_DRAIN_TIMEOUT_MS 1000
 #define WDT_NODE                DT_NODELABEL(wdt0)
 #define WDT_TIMEOUT_MS          5000
 #define MAIN_LOOP_INTERVAL_MS   25
@@ -221,6 +224,7 @@ static uint8_t seq_num;
 static volatile bool is_recording;
 static volatile bool recording_requested;
 static volatile bool stop_requested;
+K_SEM_DEFINE(audio_notify_slots, AUDIO_NOTIFY_IN_FLIGHT, AUDIO_NOTIFY_IN_FLIGHT);
 
 /* Audio thread */
 static K_THREAD_STACK_DEFINE(audio_stack, 4096);
@@ -1686,7 +1690,75 @@ static void send_event_packet_settle(float x, float y, float z, uint32_t elapsed
  * Audio Streaming
  * ============================================================================ */
 
-static void stream_audio_frame(const int16_t *audio_buffer, size_t audio_size)
+static void audio_notify_complete(struct bt_conn *conn, void *user_data)
+{
+    ARG_UNUSED(conn);
+    ARG_UNUSED(user_data);
+    k_sem_give(&audio_notify_slots);
+}
+
+static int send_audio_notification(const uint8_t *data, uint16_t len)
+{
+    while (is_recording && !stop_requested) {
+        if (k_sem_take(&audio_notify_slots, K_MSEC(100)) != 0) {
+            continue;
+        }
+
+        struct bt_conn *conn = get_primary_conn();
+        if (!conn) {
+            k_sem_give(&audio_notify_slots);
+            return -ENOTCONN;
+        }
+
+        struct bt_gatt_notify_params params = {
+            .attr = &audio_svc.attrs[2],
+            .data = data,
+            .len = len,
+            .func = audio_notify_complete,
+            .user_data = NULL,
+        };
+        int ret = bt_gatt_notify_cb(conn, &params);
+        if (ret == 0) {
+            return 0;
+        }
+
+        k_sem_give(&audio_notify_slots);
+        if (ret != -ENOMEM && ret != -EAGAIN) {
+            return ret;
+        }
+        k_msleep(AUDIO_NOTIFY_RETRY_MS);
+    }
+
+    return -ECANCELED;
+}
+
+static bool drain_audio_notifications(void)
+{
+    int acquired = 0;
+    int64_t deadline = k_uptime_get() + AUDIO_NOTIFY_DRAIN_TIMEOUT_MS;
+
+    while (acquired < AUDIO_NOTIFY_IN_FLIGHT) {
+        int64_t remaining_ms = deadline - k_uptime_get();
+        if (remaining_ms <= 0 ||
+            k_sem_take(&audio_notify_slots, K_MSEC(remaining_ms)) != 0) {
+            break;
+        }
+        acquired++;
+    }
+
+    for (int i = 0; i < acquired; i++) {
+        k_sem_give(&audio_notify_slots);
+    }
+
+    if (acquired != AUDIO_NOTIFY_IN_FLIGHT) {
+        printk("Audio notify drain timed out: %d/%d slots returned\n",
+               acquired, AUDIO_NOTIFY_IN_FLIGHT);
+        return false;
+    }
+    return true;
+}
+
+static int stream_audio_frame(const int16_t *audio_buffer, size_t audio_size)
 {
     size_t total_samples = audio_size / sizeof(int16_t);
     size_t offset = 0;
@@ -1697,22 +1769,22 @@ static void stream_audio_frame(const int16_t *audio_buffer, size_t audio_size)
             samples_to_send = PCM_PACKET_SIZE / sizeof(int16_t);
         }
 
-        tx_packet[0] = seq_num++;
+        tx_packet[0] = seq_num;
         tx_packet[1] = 0xAA;
         memcpy(&tx_packet[2], &audio_buffer[offset],
                samples_to_send * sizeof(int16_t));
 
-        int ret = bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2],
-                                 tx_packet, 2 + (samples_to_send * sizeof(int16_t)));
-        if (ret == -ENOMEM) {
-            k_msleep(1);
-            ret = bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2],
-                                 tx_packet, 2 + (samples_to_send * sizeof(int16_t)));
+        int ret = send_audio_notification(
+            tx_packet, 2 + (samples_to_send * sizeof(int16_t)));
+        if (ret != 0) {
+            return ret;
         }
 
+        seq_num++;
         offset += samples_to_send;
-        k_msleep(1);
     }
+
+    return 0;
 }
 
 static void audio_thread(void *p1, void *p2, void *p3)
@@ -1774,6 +1846,8 @@ static void audio_thread(void *p1, void *p2, void *p3)
                 dmic_session_active = false;
             }
 
+            /* Preserve ordering: all accepted PCM notifications must complete before stop. */
+            (void)drain_audio_notifications();
             printk("Recording stopped\n");
             send_event_packet(0x02);
             battery_update();
@@ -1789,7 +1863,11 @@ static void audio_thread(void *p1, void *p2, void *p3)
                     dmic_session_active = false;
                     continue;
                 }
-                stream_audio_frame(audio_buffer, audio_size);
+                ret = stream_audio_frame(audio_buffer, audio_size);
+                if (ret < 0 && ret != -ECANCELED && ret != -ENOTCONN) {
+                    printk("Audio notify failed: %d\n", ret);
+                    k_msleep(AUDIO_NOTIFY_RETRY_MS);
+                }
             }
             continue;
         }
