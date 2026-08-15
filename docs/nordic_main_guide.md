@@ -113,7 +113,7 @@ nordic-main/
 ## ジェスチャー検出アルゴリズム
 
 この章は運用時の概要です。軸調査の根拠、判定式、状態遷移、全閾値、既知の
-制約、実機テスト項目は [屈曲→回内ジェスチャー仕様](flex_pronation_gesture.md)
+制約、実機テスト項目は [水平開始→肘屈曲→垂直静止仕様](flex_pronation_gesture.md)
 を参照してください。
 
 ### IMU 軸と取り付け方向
@@ -122,29 +122,26 @@ Seeed Studio 公式の XIAO nRF52840 Sense KiCad 基板データと ST の LSM6D
 
 | 軸 | XIAO 基板上の向き | リストバンド装着時の用途 |
 |----|------------------|------------------------|
-| `+X` | 基板長手方向、USB 端子から離れる向き | 前腕長手軸。回内・回外の回転軸 |
-| `+Y` | 基板横方向、5V/GND/3V 側 | 肘屈曲の主な横軸 |
-| `+Z` | 部品面から外向き | 部品面を内側に装着するため手首方向 |
+| `+X` | 基板長手方向、USB 端子から離れる向き | 掌面内。屈曲と終了姿勢の合成判定 |
+| `+Y` | 基板横方向、5V/GND/3V 側 | 掌面内。屈曲と終了姿勢の合成判定 |
+| `+Z` | 部品面から外向き | 掌面の法線。開始時の水平判定 |
 
 資料: [Seeed Studio XIAO nRF52840 Series](https://wiki.seeedstudio.com/XIAO_BLE/)、[LSM6DS3TR-C datasheet](https://www.st.com/resource/en/datasheet/lsm6ds3tr-c.pdf)
 
-### 録音開始トリガー（屈曲 → 回内）
+### 録音開始トリガー（水平開始 → 肘屈曲 → 垂直静止）
 
-絶対姿勢や重力の向きを使わず、加速度センサーとジャイロの短時間の相対変化を使います。これにより立位、寝た姿勢、走行中の車内で同じ条件を適用できます。
+XIAOをリストバンドの掌側に置く。静止加速度の絶対投影比とX-Y面合成値を
+使うため、右手・左手、掌の上向き・下向き、基板の面内回転に対応する。
 
-1. 角速度が 200 ms 以上安定している状態を開始姿勢とし、その後1000 msを屈曲開始受付期間とする。この間のX軸先行成分も保持する。
-2. **肘屈曲フェーズ**: X 軸に直交する角速度 `sqrt(gyro_y² + gyro_z²)` が35°/s以上になると回転を積分する。
-3. 180〜1600 ms の間に、屈曲角 ≥ 35°、ピーク角速度 ≥ 50°/s、加速度エビデンス ≥ 0.5 m/s²を満たす。
-4. **回内待ちフェーズ**へ移り、1500 ms 以内の20°/s以上の X 軸角速度を、正負方向別に積算する。
-5. X 軸の方向別積分角 ≥ 30°、ピーク角速度 ≥ 55°/s、3 サンプル以上を満たすと `recording_requested = true` とし、録音開始 + `0x01` を送信する。
+1. `abs(accel_z) / |accel| >= 0.80`、角速度19°/s以下を200 ms連続して満たすと、水平開始姿勢として1秒間armする。
+2. 掌面内の角速度 `sqrt(gyro_x² + gyro_y²)` が35°/s以上になると屈曲を開始する。
+3. 180〜2000 msの間に、屈曲角60°以上、ピーク角速度50°/s以上、加速度エビデンス0.5 m/s²以上を満たす。
+4. 加速度変位と有効腕長15 cmの円弧距離を融合し、推定移動距離5 cm以上を要求する。
+5. 屈曲終了後、`sqrt(accel_x² + accel_y²) / |accel| >= 0.80`、`abs(accel_z) / |accel| <= 0.45`、角速度19°/s以下、線形加速度1.2 m/s²以下を250 ms連続して満たすと `recording_requested = true` とし、録音開始 + `0x01` を送信する。
 
-加速度エビデンスには `abs(|accel| - 1g)` と開始姿勢からの3軸加速度ベクトル差の大きい方を使います。固定の x/y/z 値を要求しないため姿勢依存がなく、ジャイロだけのノイズでも成立しません。
-
-屈曲は Y-Z の合成角、回内は X の正負方向別積分角で評価するため、右手・左手でジャイロの符号が反転しても同じ条件で発動します。自然な連続動作を許容するため、開始受付中のX軸成分と、屈曲開始50 ms後かつ屈曲角8°以上のX軸回転を屈曲成立後へ引き継ぎます。全シーケンスの上限は3000 msです。成立後に腕を戻す動作は、6000 ms以内に現れる逆向きX回転として1回だけ除外します。1200 msのガードは同一動作内の重複防止用であり、腕戻し対策として長時間の全面禁止は行いません。
-
-単一の手首 IMU だけでは、立位・臥位を問わず肘の絶対伸展角を直接観測できません。そのため「伸展状態」は開始前 200 ms の角速度安定で代用し、その後に十分な Y-Z 回転が生じたことを屈曲として判定します。
-
-同様に、左右どちらの手かという設定を持たずに両手対応するため、X 軸回転は正負の両方向を許容します。この構成では回内と同程度の逆方向回転（回外）も区別できません。回内だけに限定するには、装着する手を設定として追加し、手ごとに X 軸角度の符号を選ぶ必要があります。
+垂直保持は屈曲終了から1.5秒以内に成立する必要がある。回内・回外の角度、方向、
+速度は判定しない。距離推定とBLE診断を含む詳細は
+`docs/flex_pronation_gesture.md`を参照する。
 
 ### 録音停止トリガー
 
@@ -196,21 +193,23 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
 | `GESTURE_QUIET_HOLD_MS` | 200 ms | 開始前に必要な角速度安定時間 |
-| `GESTURE_START_ARM_MS` | 1000 ms | 静止成立後に保持する屈曲開始受付時間とX軸先行成分 |
+| `GESTURE_START_ARM_MS` | 1000 ms | 静止成立後に保持する屈曲開始受付時間 |
+| `GESTURE_START_HORIZONTAL_Z_MIN_RATIO` | 0.80 | 水平開始時のZ重力投影比下限 |
 | `GESTURE_FLEX_START_RATE_DPS` | 35°/s | 屈曲フェーズ開始角速度 |
-| `GESTURE_FLEX_ANGLE_MIN_DEG` | 35° | Y-Z 合成屈曲角の下限 |
+| `GESTURE_FLEX_ANGLE_MIN_DEG` | 60° | X-Y 合成屈曲角の下限 |
 | `GESTURE_FLEX_PEAK_RATE_MIN_DPS` | 50°/s | 屈曲ピーク角速度の下限 |
 | `GESTURE_FLEX_ACCEL_EVIDENCE_MIN_MS2` | 0.5 m/s² | 加速度による実動作確認の下限 |
 | `GESTURE_FLEX_MIN_DURATION_MS` | 180 ms | 屈曲の最短時間 |
-| `GESTURE_FLEX_MAX_DURATION_MS` | 1600 ms | 屈曲の最長時間 |
-| `GESTURE_PRONATION_INTEGRATE_RATE_DPS` | 20°/s | X 軸積分対象の最小角速度 |
-| `GESTURE_PRONATION_ANGLE_MIN_DEG` | 30° | X 軸回内角の下限 |
-| `GESTURE_PRONATION_EARLY_MIN_FLEX_DEG` | 8° | 屈曲中の回内先行積分を許可する最小屈曲角 |
-| `GESTURE_PRONATION_EARLY_MIN_MS` | 50 ms | 屈曲中の回内先行積分を許可する最短時間 |
-| `GESTURE_PRONATION_PEAK_MIN_DPS` | 55°/s | 回内ピーク角速度の下限 |
-| `GESTURE_PRONATION_WINDOW_MS` | 1500 ms | 屈曲成立後の回内待ち時間 |
-| `GESTURE_RETURN_SIGNATURE_WINDOW_MS` | 6000 ms | 逆向きXの腕戻しを除外する履歴期間 |
-| `GESTURE_SEQUENCE_TIMEOUT_MS` | 3000 ms | 全シーケンスの最大時間 |
+| `GESTURE_FLEX_MAX_DURATION_MS` | 2000 ms | 屈曲の最長時間 |
+| `GESTURE_DISTANCE_MIN_M` | 0.05 m | 加速度・ジャイロ融合距離の下限 |
+| `GESTURE_EFFECTIVE_ARM_LENGTH_M` | 0.15 m | 円弧距離推定に使う有効腕長 |
+| `GESTURE_DISTANCE_LP_TAU_S` | 0.55 s | 車両加速度を追従除去する時定数 |
+| `GESTURE_VERTICAL_PLANE_MIN_RATIO` | 0.80 | 垂直終了時のX-Y面重力投影比下限 |
+| `GESTURE_VERTICAL_Z_MAX_RATIO` | 0.45 | 垂直終了時のZ重力投影比上限 |
+| `GESTURE_VERTICAL_QUIET_RATE_DPS` | 19°/s | 垂直保持中の角速度上限 |
+| `GESTURE_VERTICAL_LINEAR_ACCEL_MAX_MS2` | 1.2 m/s² | 垂直保持中の線形加速度上限 |
+| `GESTURE_VERTICAL_HOLD_MS` | 250 ms | 垂直姿勢の連続保持時間 |
+| `GESTURE_VERTICAL_HOLD_TIMEOUT_MS` | 1500 ms | 屈曲終了後の垂直保持成立期限 |
 | `SLEEP_IDLE_TIMEOUT_MS` | 10000 ms | ライトスリープ移行までの無動作時間 |
 | `SLEEP_POLL_INTERVAL_MS` | 50 ms | スリープ中の IMU ポーリング間隔 |
 

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""HarnessNode の屈曲→回内ジェスチャーを BLE で対話検証する。
+"""HarnessNode の水平開始→屈曲→垂直静止ジェスチャーをBLEで対話検証する。
 
 人が画面のカウントダウンに合わせて動作し、ファームウェアから届く
 ``recording_start`` イベント (0x01) の有無を試行ごとに判定する。
 
-Codex から macOS Terminal に起動して進捗を読み取れるよう、重要な状態は
-``CODEX_*`` で始まる一行にも出力する。標準入力は使わない。
+画面には試行ごとの判定条件だけを読みやすく表示し、生の診断イベントはJSON
+レポートだけに保存する。標準入力は使わない。
 
 Examples:
     venv/bin/python gesture_validator.py --trials 3
     venv/bin/python gesture_validator.py --expect no-match --trials 3 \
-        --instruction "回内だけを行ってください"
+        --instruction "水平姿勢のまま手を動かしてください"
     venv/bin/python gesture_validator.py --self-test
 """
 
@@ -59,8 +59,11 @@ EVENT_NAMES = {
 DIAG_STAGE_NAMES = {
     0x01: "flex_start",
     0x02: "flex_complete",
-    0x03: "pronation_start",
+    0x03: "vertical_hold_start",
     0x04: "match",
+    0x05: "distance_ready",
+    0x06: "vertical_ready",
+    0x07: "gyro_bias_ready",
     0x10: "wait_reject",
     0x80: "reset",
 }
@@ -68,14 +71,31 @@ DIAG_STAGE_NAMES = {
 DIAG_REASON_NAMES = {
     0x00: "none",
     0x01: "quiet_not_ready",
-    0x02: "axis_not_transverse",
+    0x02: "start_not_horizontal",
     0x03: "flex_rate_low",
     0x11: "flex_timeout",
-    0x12: "wrong_order",
     0x13: "incomplete_flex",
-    0x14: "pronation_timeout",
-    0x15: "return_motion",
+    0x14: "endpoint_not_vertical",
+    0x16: "distance_too_short",
+    0x17: "vertical_hold_interrupted",
+    0x18: "vertical_hold_timeout",
 }
+
+START_HORIZONTAL_Z_MIN_RATIO = 0.80
+START_QUIET_HOLD_MS = 200
+START_QUIET_RATE_MAX_DPS = 19.0
+FLEX_START_RATE_MIN_DPS = 35.0
+FLEX_ANGLE_MIN_DEG = 60.0
+FLEX_PEAK_RATE_MIN_DPS = 50.0
+FLEX_ACCEL_MIN_MS2 = 0.50
+FLEX_DURATION_MIN_MS = 180
+FLEX_DURATION_MAX_MS = 2000
+DISTANCE_MIN_CM = 5.0
+VERTICAL_PLANE_MIN_RATIO = 0.80
+VERTICAL_Z_MAX_RATIO = 0.45
+VERTICAL_RATE_MAX_DPS = 19.0
+VERTICAL_LINEAR_ACCEL_MAX_MS2 = 1.20
+VERTICAL_HOLD_MIN_MS = 250
 
 
 @dataclass(frozen=True)
@@ -95,6 +115,13 @@ class GestureEvent:
     value3: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class ConditionResult:
+    label: str
+    status: str
+    detail: str
+
+
 @dataclass
 class TrialResult:
     trial: int
@@ -104,8 +131,291 @@ class TrialResult:
     latency_ms: Optional[int]
     motion_active_seen: bool
     motion_settled_seen: bool
+    sequence_reset_seen: bool
     reason: str
     diagnostics: list[dict[str, Any]]
+    conditions: list[ConditionResult]
+
+
+def gesture_gate_eligible(
+    fused_distance_cm: float,
+    start_z_ratio: float,
+    end_plane_ratio: float,
+    end_z_ratio: float,
+    vertical_hold_ms: int,
+) -> bool:
+    """Mirror the firmware's public posture, distance, and hold boundaries."""
+    return (
+        fused_distance_cm >= DISTANCE_MIN_CM
+        and start_z_ratio >= START_HORIZONTAL_Z_MIN_RATIO
+        and end_plane_ratio >= VERTICAL_PLANE_MIN_RATIO
+        and end_z_ratio <= VERTICAL_Z_MAX_RATIO
+        and vertical_hold_ms >= VERTICAL_HOLD_MIN_MS
+    )
+
+
+def sequence_reset_seen(diagnostics: list[dict[str, Any]]) -> bool:
+    """Return whether the one-action trial reset before its eventual match."""
+    return any(record.get("stage") == "reset" for record in diagnostics)
+
+
+def _latest_diagnostic(
+    diagnostics: list[dict[str, Any]],
+    *,
+    stage: Optional[str] = None,
+    reasons: tuple[str, ...] = (),
+) -> Optional[dict[str, Any]]:
+    for record in reversed(diagnostics):
+        if stage is not None and record.get("stage") != stage:
+            continue
+        if reasons and record.get("reason") not in reasons:
+            continue
+        return record
+    return None
+
+
+def build_condition_results(
+    diagnostics: list[dict[str, Any]], matched: bool
+) -> list[ConditionResult]:
+    """Turn raw diagnostics into the firmware gate checklist shown per trial."""
+    flex_start = _latest_diagnostic(diagnostics, stage="flex_start")
+    flex_complete = _latest_diagnostic(diagnostics, stage="flex_complete")
+    distance = _latest_diagnostic(diagnostics, stage="distance_ready")
+    vertical_start = _latest_diagnostic(
+        diagnostics, stage="vertical_hold_start"
+    )
+    vertical_ready = _latest_diagnostic(diagnostics, stage="vertical_ready")
+    wait_quiet = _latest_diagnostic(
+        diagnostics,
+        stage="wait_reject",
+        reasons=("quiet_not_ready",),
+    )
+    wait_horizontal = _latest_diagnostic(
+        diagnostics,
+        stage="wait_reject",
+        reasons=("start_not_horizontal",),
+    )
+    wait_flex_rate = _latest_diagnostic(
+        diagnostics,
+        stage="wait_reject",
+        reasons=("flex_rate_low",),
+    )
+    flex_reset = _latest_diagnostic(
+        diagnostics,
+        stage="reset",
+        reasons=("flex_timeout", "incomplete_flex"),
+    )
+    endpoint_reset = _latest_diagnostic(
+        diagnostics,
+        stage="reset",
+        reasons=("endpoint_not_vertical", "vertical_hold_timeout"),
+    )
+
+    conditions: list[ConditionResult] = []
+
+    if flex_start is not None:
+        z_ratio = float(flex_start["value2"])
+        conditions.append(
+            ConditionResult(
+                "水平な開始姿勢",
+                "PASS",
+                f"Z比 {z_ratio:.2f} ≥ {START_HORIZONTAL_Z_MIN_RATIO:.2f}",
+            )
+        )
+        conditions.append(
+            ConditionResult(
+                "開始前の静止",
+                "PASS",
+                f"{START_QUIET_HOLD_MS} ms以上・角速度 "
+                f"≤ {START_QUIET_RATE_MAX_DPS:.0f}°/s が成立",
+            )
+        )
+    elif wait_flex_rate is not None or wait_quiet is not None:
+        wait_horizontal_proof = wait_flex_rate or wait_quiet
+        assert wait_horizontal_proof is not None
+        z_ratio = float(wait_horizontal_proof["value1"])
+        conditions.append(
+            ConditionResult(
+                "水平な開始姿勢",
+                "PASS",
+                f"Z比 {z_ratio:.2f} ≥ {START_HORIZONTAL_Z_MIN_RATIO:.2f}",
+            )
+        )
+        quiet_passed = wait_flex_rate is not None
+        conditions.append(
+            ConditionResult(
+                "開始前の静止",
+                "PASS" if quiet_passed else "FAIL",
+                (
+                    f"{START_QUIET_HOLD_MS} ms以上・角速度 "
+                    f"≤ {START_QUIET_RATE_MAX_DPS:.0f}°/s が成立"
+                    if quiet_passed
+                    else f"{START_QUIET_HOLD_MS} msの静止を確認できず"
+                ),
+            )
+        )
+    elif wait_horizontal is not None:
+        z_ratio = float(wait_horizontal["value1"])
+        conditions.append(
+            ConditionResult(
+                "水平な開始姿勢",
+                "FAIL",
+                f"Z比 {z_ratio:.2f} < {START_HORIZONTAL_Z_MIN_RATIO:.2f}",
+            )
+        )
+        conditions.append(
+            ConditionResult("開始前の静止", "NOT_REACHED", "開始姿勢が未成立")
+        )
+    else:
+        conditions.append(
+            ConditionResult("水平な開始姿勢", "NOT_REACHED", "判定データなし")
+        )
+        conditions.append(
+            ConditionResult("開始前の静止", "NOT_REACHED", "判定データなし")
+        )
+
+    if flex_complete is not None and flex_start is not None:
+        start_rate = float(flex_start["value1"])
+        angle = float(flex_complete["value1"])
+        peak = float(flex_complete["value2"])
+        accel = float(flex_complete["value3"])
+        conditions.append(
+            ConditionResult(
+                "肘の屈曲動作",
+                "PASS",
+                f"開始 {start_rate:.1f} ≥ {FLEX_START_RATE_MIN_DPS:.0f}°/s、"
+                f"角度 {angle:.1f} ≥ {FLEX_ANGLE_MIN_DEG:.0f}°、"
+                f"peak {peak:.1f} ≥ {FLEX_PEAK_RATE_MIN_DPS:.0f}°/s、"
+                f"加速度 {accel:.2f} ≥ {FLEX_ACCEL_MIN_MS2:.2f} m/s²、"
+                f"時間 {FLEX_DURATION_MIN_MS}–{FLEX_DURATION_MAX_MS} ms内",
+            )
+        )
+    elif flex_reset is not None:
+        conditions.append(
+            ConditionResult(
+                "肘の屈曲動作",
+                "FAIL",
+                f"角度 {float(flex_reset['value1']):.1f}°、"
+                f"peak {float(flex_reset['value2']):.1f}°/s、"
+                f"加速度 {float(flex_reset['value3']):.2f} m/s² "
+                f"({flex_reset['reason']})",
+            )
+        )
+    elif flex_start is not None:
+        conditions.append(
+            ConditionResult("肘の屈曲動作", "FAIL", "屈曲完了条件まで到達せず")
+        )
+    else:
+        conditions.append(
+            ConditionResult("肘の屈曲動作", "NOT_REACHED", "屈曲開始を検出せず")
+        )
+
+    if distance is not None:
+        fused_cm = float(distance["value1"])
+        conditions.append(
+            ConditionResult(
+                "5 cm以上の移動",
+                "PASS" if fused_cm >= DISTANCE_MIN_CM else "FAIL",
+                f"融合推定 {fused_cm:.1f} cm "
+                f"{'≥' if fused_cm >= DISTANCE_MIN_CM else '<'} {DISTANCE_MIN_CM:.1f} cm",
+            )
+        )
+    else:
+        conditions.append(
+            ConditionResult("5 cm以上の移動", "NOT_REACHED", "距離判定まで到達せず")
+        )
+
+    vertical_evidence = vertical_ready or vertical_start
+    if vertical_evidence is not None:
+        plane_ratio = float(vertical_evidence["value1"])
+        z_ratio = float(vertical_evidence["value2"])
+        conditions.append(
+            ConditionResult(
+                "垂直な終了姿勢",
+                "PASS",
+                f"XY面比 {plane_ratio:.2f} ≥ {VERTICAL_PLANE_MIN_RATIO:.2f}、"
+                f"Z比 {z_ratio:.2f} ≤ {VERTICAL_Z_MAX_RATIO:.2f}",
+            )
+        )
+    elif endpoint_reset is not None:
+        plane_ratio = float(endpoint_reset["value1"])
+        z_ratio = float(endpoint_reset["value2"])
+        posture_passed = (
+            plane_ratio >= VERTICAL_PLANE_MIN_RATIO
+            and z_ratio <= VERTICAL_Z_MAX_RATIO
+        )
+        conditions.append(
+            ConditionResult(
+                "垂直な終了姿勢",
+                "PASS" if posture_passed else "FAIL",
+                f"XY面比 {plane_ratio:.2f} "
+                f"{'≥' if plane_ratio >= VERTICAL_PLANE_MIN_RATIO else '<'} "
+                f"{VERTICAL_PLANE_MIN_RATIO:.2f}、Z比 {z_ratio:.2f} "
+                f"{'≤' if z_ratio <= VERTICAL_Z_MAX_RATIO else '>'} "
+                f"{VERTICAL_Z_MAX_RATIO:.2f}",
+            )
+        )
+    else:
+        conditions.append(
+            ConditionResult("垂直な終了姿勢", "NOT_REACHED", "姿勢判定まで到達せず")
+        )
+
+    if vertical_ready is not None:
+        hold_ms = float(vertical_ready["value3"])
+        conditions.append(
+            ConditionResult(
+                "垂直位置での静止保持",
+                "PASS",
+                f"{hold_ms:.0f} ms ≥ {VERTICAL_HOLD_MIN_MS} ms "
+                f"（角速度 ≤ {VERTICAL_RATE_MAX_DPS:.0f}°/s・"
+                f"線形加速度 ≤ {VERTICAL_LINEAR_ACCEL_MAX_MS2:.2f} m/s²も成立）",
+            )
+        )
+    elif vertical_start is not None or (
+        endpoint_reset is not None
+        and endpoint_reset["reason"] == "vertical_hold_timeout"
+    ):
+        conditions.append(
+            ConditionResult(
+                "垂直位置での静止保持",
+                "FAIL",
+                f"{VERTICAL_HOLD_MIN_MS} msの連続静止を確認できず",
+            )
+        )
+    else:
+        conditions.append(
+            ConditionResult("垂直位置での静止保持", "NOT_REACHED", "垂直姿勢が未成立")
+        )
+
+    conditions.append(
+        ConditionResult(
+            "1回の動作で完結",
+            "FAIL" if sequence_reset_seen(diagnostics) else "PASS",
+            (
+                "途中で判定がリセットされた"
+                if sequence_reset_seen(diagnostics)
+                else "途中の判定リセットなし"
+            ),
+        )
+    )
+    conditions.append(
+        ConditionResult(
+            "ジェスチャー発動",
+            "PASS" if matched else "FAIL",
+            "recording_startを受信" if matched else "recording_startなし",
+        )
+    )
+    return conditions
+
+
+def print_condition_results(conditions: list[ConditionResult]) -> None:
+    markers = {"PASS": "[OK]", "FAIL": "[NG]", "NOT_REACHED": "[--]"}
+    print("  判定条件:", flush=True)
+    for condition in conditions:
+        print(
+            f"    {markers[condition.status]} {condition.label}: {condition.detail}",
+            flush=True,
+        )
 
 
 def parse_event_packet(data: bytes, now: Optional[float] = None) -> Optional[GestureEvent]:
@@ -168,7 +478,7 @@ def format_event(event: GestureEvent) -> str:
         v3 = event.value3 or 0.0
         if stage == "flex_start":
             suffix = (
-                f" transverse={v1:.1f}dps longitudinal={v2:.1f}dps "
+                f" plane_rate={v1:.1f}dps start_z_ratio={v2:.2f} "
                 f"accel={v3:.2f}m/s^2"
             )
         elif stage == "flex_complete":
@@ -176,37 +486,48 @@ def format_event(event: GestureEvent) -> str:
                 f" angle={v1:.1f}deg peak={v2:.1f}dps "
                 f"accel={v3:.2f}m/s^2"
             )
-        elif stage == "pronation_start":
+        elif stage == "vertical_hold_start":
             suffix = (
-                f" x_rate={v1:.1f}dps transverse={v2:.1f}dps "
-                f"angle={v3:.1f}deg"
+                f" plane_ratio={v1:.2f} z_ratio={v2:.2f} "
+                f"linear_accel={v3:.2f}m/s^2"
             )
         elif stage == "match":
-            suffix = f" angle={v1:.1f}deg peak={v2:.1f}dps samples={v3:.0f}"
+            suffix = (
+                f" distance={v1:.1f}cm plane_ratio={v2:.2f} "
+                f"hold={v3:.0f}ms"
+            )
+        elif stage == "distance_ready":
+            suffix = (
+                f" fused={v1:.1f}cm accel={v2:.1f}cm arc={v3:.1f}cm"
+            )
+        elif stage == "vertical_ready":
+            suffix = (
+                f" plane_ratio={v1:.2f} z_ratio={v2:.2f} hold={v3:.0f}ms"
+            )
+        elif stage == "gyro_bias_ready":
+            suffix = (
+                f" correction={v1:.1f}dps plane_bias={v2:.1f}dps "
+                f"z_bias={v3:.1f}dps"
+            )
         elif stage == "wait_reject":
             suffix = (
-                f" reason={reason} transverse={v1:.1f}dps "
-                f"longitudinal={v2:.1f}dps norm={v3:.1f}dps"
+                f" reason={reason} z_ratio={v1:.2f} "
+                f"plane_ratio={v2:.2f} gyro={v3:.1f}dps"
             )
         elif reason in ("flex_timeout", "incomplete_flex"):
             suffix = (
                 f" reason={reason} angle={v1:.1f}deg peak={v2:.1f}dps "
                 f"accel={v3:.2f}m/s^2"
             )
-        elif reason == "wrong_order":
+        elif reason == "distance_too_short":
             suffix = (
-                f" reason={reason} flex_angle={v1:.1f}deg "
-                f"x_rate={v2:.1f}dps transverse={v3:.1f}dps"
+                f" reason={reason} fused={v1:.1f}cm "
+                f"accel={v2:.1f}cm arc={v3:.1f}cm"
             )
-        elif reason == "pronation_timeout":
+        elif reason in ("endpoint_not_vertical", "vertical_hold_timeout"):
             suffix = (
-                f" reason={reason} angle={v1:.1f}deg peak={v2:.1f}dps "
-                f"samples={v3:.0f}"
-            )
-        elif reason == "return_motion":
-            suffix = (
-                f" reason={reason} x_direction_relation={v1:.0f} "
-                f"x_angle={v2:.1f}deg elapsed={v3:.0f}ms"
+                f" reason={reason} plane_ratio={v1:.2f} "
+                f"z_ratio={v2:.2f} distance={v3:.1f}cm"
             )
         else:
             suffix = f" reason={reason} values={v1:.2f},{v2:.2f},{v3:.2f}"
@@ -222,7 +543,7 @@ def format_event(event: GestureEvent) -> str:
 
 
 def diagnostic_record(event: GestureEvent) -> dict[str, Any]:
-    return {
+    record: dict[str, Any] = {
         "time": event.wall_time,
         "stage": DIAG_STAGE_NAMES.get(event.diag_stage or 0, "unknown"),
         "reason": DIAG_REASON_NAMES.get(event.diag_reason or 0, "unknown"),
@@ -230,6 +551,45 @@ def diagnostic_record(event: GestureEvent) -> dict[str, Any]:
         "value2": event.value2,
         "value3": event.value3,
     }
+    stage = record["stage"]
+    reason = record["reason"]
+    if stage == "distance_ready" or reason == "distance_too_short":
+        record["metrics"] = {
+            "fused_distance_cm": event.value1,
+            "accel_distance_cm": event.value2,
+            "arc_distance_cm": event.value3,
+        }
+    elif stage == "vertical_hold_start":
+        record["metrics"] = {
+            "plane_gravity_ratio": event.value1,
+            "z_gravity_ratio": event.value2,
+            "linear_accel_ms2": event.value3,
+        }
+    elif stage == "vertical_ready":
+        record["metrics"] = {
+            "plane_gravity_ratio": event.value1,
+            "z_gravity_ratio": event.value2,
+            "vertical_hold_ms": event.value3,
+        }
+    elif stage == "match":
+        record["metrics"] = {
+            "fused_distance_cm": event.value1,
+            "plane_gravity_ratio": event.value2,
+            "vertical_hold_ms": event.value3,
+        }
+    elif stage == "gyro_bias_ready":
+        record["metrics"] = {
+            "correction_dps": event.value1,
+            "plane_bias_dps": event.value2,
+            "z_bias_dps": event.value3,
+        }
+    elif reason in ("endpoint_not_vertical", "vertical_hold_timeout"):
+        record["metrics"] = {
+            "plane_gravity_ratio": event.value1,
+            "z_gravity_ratio": event.value2,
+            "fused_distance_cm": event.value3,
+        }
+    return record
 
 
 class GestureValidator:
@@ -251,16 +611,9 @@ class GestureValidator:
         raw = bytes(data)
         event = parse_event_packet(raw)
         if event is not None:
-            print(f"  {format_event(event)}", flush=True)
             if event.code == EVT_GESTURE_DIAG:
                 record = diagnostic_record(event)
                 self.all_diagnostics.append(record)
-                print(
-                    f"CODEX_DIAG stage={record['stage']} reason={record['reason']} "
-                    f"v1={record['value1']:.3f} v2={record['value2']:.3f} "
-                    f"v3={record['value3']:.3f}",
-                    flush=True,
-                )
             if self.loop is not None:
                 self.loop.call_soon_threadsafe(self._enqueue, event)
             return
@@ -326,13 +679,8 @@ class GestureValidator:
         if self.args.address:
             target: Any = self.args.address
             self.address = self.args.address
-            print(f"指定アドレスへ接続: {self.address}", flush=True)
         else:
-            print(
-                f"'{self.args.device}' をスキャン中 "
-                f"({self.args.scan_timeout:.0f}秒)...",
-                flush=True,
-            )
+            print(f"BLE接続準備中: {self.args.device}", flush=True)
             target = await BleakScanner.find_device_by_name(
                 self.args.device, timeout=self.args.scan_timeout
             )
@@ -342,7 +690,6 @@ class GestureValidator:
                 )
             self.address = target.address
 
-        print(f"検出: {self.address}。接続中...", flush=True)
         self.client = BleakClient(
             target,
             timeout=self.args.connect_timeout,
@@ -353,13 +700,11 @@ class GestureValidator:
 
         # イベントはprimary接続だけへ送られるため、検証中だけprimaryを引き受ける。
         await self._write_command(0x02)
-        print(f"接続完了 (MTU={self.client.mtu_size})。通知を購読しました。", flush=True)
-        print(f"CODEX_CONNECTED address={self.address} mtu={self.client.mtu_size}", flush=True)
+        print("BLE接続: OK", flush=True)
 
         # 接続前から録音中なら音声パケットが届く。その場合だけ停止して初期化する。
         await asyncio.sleep(0.8)
         if self.audio_seen.is_set():
-            print("既存の録音を検出したため停止します。", flush=True)
             await self._write_command(0x00)
             await self._wait_for_event(EVT_RECORDING_STOP, timeout=3.0)
         self._drain_events()
@@ -369,23 +714,19 @@ class GestureValidator:
 
     async def preflight(self) -> None:
         """BLE writeとevent notifyの往復を実動作の前に検証する。"""
-        print("BLEイベント経路をpreflight確認中...", flush=True)
         self._drain_events()
         await self._write_command(0x01)
         started = await self._wait_for_event(EVT_RECORDING_START, timeout=3.0)
         if not started:
-            print("CODEX_PREFLIGHT result=FAIL reason=no_recording_start", flush=True)
             raise RuntimeError("preflightでrecording_startを受信できません")
 
         await self._write_command(0x00)
         stopped = await self._wait_for_event(EVT_RECORDING_STOP, timeout=3.0)
         if not stopped:
-            print("CODEX_PREFLIGHT result=FAIL reason=no_recording_stop", flush=True)
             raise RuntimeError("preflightでrecording_stopを受信できません")
 
         self._drain_events()
-        print("preflight成功: BLE start/stopイベントを往復確認しました。", flush=True)
-        print("CODEX_PREFLIGHT result=PASS", flush=True)
+        print("BLEイベント通信: OK", flush=True)
         await asyncio.sleep(0.5)
 
     async def disconnect(self) -> None:
@@ -429,11 +770,6 @@ class GestureValidator:
     async def _announce_go(self, trial: int) -> None:
         await self._play_start_cue()
         print("  >>> GO <<<", flush=True)
-        print(
-            f"CODEX_TRIAL trial={trial} state=GO expected={self.args.expect} "
-            f"window_s={self.args.window:g}",
-            flush=True,
-        )
 
     async def run_trial(self, trial: int) -> TrialResult:
         self._drain_events()
@@ -453,6 +789,13 @@ class GestureValidator:
         if early_match:
             await self._write_command(0x00)
             await self._wait_for_event(EVT_RECORDING_STOP, timeout=3.0)
+            early_conditions = build_condition_results([], matched=False)
+            early_conditions[-2] = ConditionResult(
+                "1回の動作で完結", "FAIL", "GO表示前に発動したため試行無効"
+            )
+            early_conditions[-1] = ConditionResult(
+                "ジェスチャー発動", "FAIL", "GO表示前の発動は判定対象外"
+            )
             result = TrialResult(
                 trial=trial,
                 expected=self.args.expect,
@@ -461,16 +804,13 @@ class GestureValidator:
                 latency_ms=0,
                 motion_active_seen=False,
                 motion_settled_seen=False,
+                sequence_reset_seen=False,
                 reason="GO表示前にrecording_startを受信",
                 diagnostics=[],
+                conditions=early_conditions,
             )
+            print_condition_results(result.conditions)
             print(f"  結果: FAIL — {result.reason}", flush=True)
-            print(
-                f"CODEX_TRIAL trial={trial} result=FAIL expected={self.args.expect} "
-                "matched=true latency_ms=0 early=true motion_active=false "
-                "motion_settled=false",
-                flush=True,
-            )
             return result
 
         start = self.loop.time()
@@ -513,16 +853,25 @@ class GestureValidator:
             except ConnectionError:
                 disconnected = True
 
+        reset_seen = sequence_reset_seen(diagnostics)
+
         if disconnected:
             result = "ERROR"
             reason = "BLE接続が切断されました"
         elif self.args.expect == "match":
-            result = "PASS" if matched else "FAIL"
-            reason = (
-                f"recording_startを{latency_ms} msで受信"
-                if matched
-                else f"{self.args.window:g}秒以内にrecording_startなし"
-            )
+            if matched and reset_seen:
+                result = "FAIL"
+                reason = (
+                    "recording_start前にgesture resetを検出"
+                    "（単一動作試行として無効）"
+                )
+            else:
+                result = "PASS" if matched else "FAIL"
+                reason = (
+                    f"recording_startを{latency_ms} msで受信"
+                    if matched
+                    else f"{self.args.window:g}秒以内にrecording_startなし"
+                )
         else:
             result = "FAIL" if matched else "PASS"
             reason = (
@@ -539,17 +888,13 @@ class GestureValidator:
             latency_ms=latency_ms,
             motion_active_seen=motion_active_seen,
             motion_settled_seen=motion_settled_seen,
+            sequence_reset_seen=reset_seen,
             reason=reason,
             diagnostics=diagnostics,
+            conditions=build_condition_results(diagnostics, matched),
         )
+        print_condition_results(trial_result.conditions)
         print(f"  結果: {result} — {reason}", flush=True)
-        print(
-            f"CODEX_TRIAL trial={trial} result={result} expected={self.args.expect} "
-            f"matched={str(matched).lower()} latency_ms={latency_ms} "
-            f"motion_active={str(motion_active_seen).lower()} "
-            f"motion_settled={str(motion_settled_seen).lower()}",
-            flush=True,
-        )
         return trial_result
 
     async def run(self) -> int:
@@ -557,7 +902,7 @@ class GestureValidator:
         await self.connect()
         print("", flush=True)
         print("=" * 64, flush=True)
-        print("HarnessNode 屈曲→回内ジェスチャー BLE検証", flush=True)
+        print("HarnessNode 水平開始→屈曲→垂直静止 BLE検証", flush=True)
         print(f"期待結果: {self.args.expect}", flush=True)
         print(f"試行回数: {self.args.trials} / 判定時間: {self.args.window:g}秒", flush=True)
         print("=" * 64, flush=True)
@@ -583,11 +928,6 @@ class GestureValidator:
         print("=" * 64, flush=True)
         print(f"総合結果: {overall}  PASS={passed} FAIL={failed} ERROR={errors}", flush=True)
         print("=" * 64, flush=True)
-        print(
-            f"CODEX_SUMMARY result={overall} passed={passed} failed={failed} "
-            f"errors={errors} trials={self.args.trials}",
-            flush=True,
-        )
 
         if self.args.json_output:
             report = {
@@ -637,13 +977,117 @@ def run_self_test() -> int:
     assert diag is not None
     assert diag.diag_stage == 0x02
     assert diag.value1 is not None and math.isclose(diag.value1, 42.0)
+
+    distance_packet = bytearray(
+        [0x00, 0x55, EVT_GESTURE_DIAG, 0x05, 0x00]
+    )
+    distance_packet.extend(struct.pack("<fff", 5.25, 4.75, 9.0))
+    distance = parse_event_packet(bytes(distance_packet), now=15.0)
+    assert distance is not None
+    assert distance.diag_stage == 0x05
+    assert "fused=5.2cm" in format_event(distance)
+    distance_record = diagnostic_record(distance)
+    assert math.isclose(
+        distance_record["metrics"]["fused_distance_cm"], 5.25
+    )
+
+    vertical_packet = bytearray(
+        [0x00, 0x55, EVT_GESTURE_DIAG, 0x06, 0x00]
+    )
+    vertical_packet.extend(struct.pack("<fff", 0.91, 0.12, 275.0))
+    vertical = parse_event_packet(bytes(vertical_packet), now=16.0)
+    assert vertical is not None
+    assert vertical.diag_stage == 0x06
+    assert "hold=275ms" in format_event(vertical)
+
+    bias_packet = bytearray(
+        [0x00, 0x55, EVT_GESTURE_DIAG, 0x07, 0x00]
+    )
+    bias_packet.extend(struct.pack("<fff", 22.0, 21.5, 4.5))
+    bias = parse_event_packet(bytes(bias_packet), now=17.0)
+    assert bias is not None
+    assert bias.diag_stage == 0x07
+    assert "correction=22.0dps" in format_event(bias)
+    bias_record = diagnostic_record(bias)
+    assert math.isclose(bias_record["metrics"]["correction_dps"], 22.0)
+
+    # Firmware boundary semantics for horizontal start and vertical endpoint.
+    assert not gesture_gate_eligible(4.9, 0.80, 0.80, 0.45, 250)
+    assert gesture_gate_eligible(5.0, 0.80, 0.80, 0.45, 250)
+    assert gesture_gate_eligible(5.1, 0.81, 0.81, 0.44, 251)
+    assert not gesture_gate_eligible(5.0, 0.79, 0.80, 0.45, 250)
+    assert not gesture_gate_eligible(5.0, 0.80, 0.79, 0.45, 250)
+    assert not gesture_gate_eligible(5.0, 0.80, 0.80, 0.46, 250)
+    assert not gesture_gate_eligible(5.0, 0.80, 0.80, 0.45, 249)
+    assert not sequence_reset_seen([])
+    assert not sequence_reset_seen([{"stage": "flex_complete"}])
+    assert sequence_reset_seen(
+        [{"stage": "flex_complete"}, {"stage": "reset"}]
+    )
+
+    passing_conditions = build_condition_results(
+        [
+            {
+                "stage": "flex_start",
+                "reason": "none",
+                "value1": 40.0,
+                "value2": 0.90,
+                "value3": 2.0,
+            },
+            {
+                "stage": "flex_complete",
+                "reason": "none",
+                "value1": 90.0,
+                "value2": 180.0,
+                "value3": 4.0,
+            },
+            {
+                "stage": "distance_ready",
+                "reason": "none",
+                "value1": 12.0,
+                "value2": 10.0,
+                "value3": 14.0,
+            },
+            {
+                "stage": "vertical_hold_start",
+                "reason": "none",
+                "value1": 0.95,
+                "value2": 0.10,
+                "value3": 0.50,
+            },
+            {
+                "stage": "vertical_ready",
+                "reason": "none",
+                "value1": 0.96,
+                "value2": 0.08,
+                "value3": 260.0,
+            },
+        ],
+        matched=True,
+    )
+    assert all(condition.status == "PASS" for condition in passing_conditions)
+
+    rejected_conditions = build_condition_results(
+        [
+            {
+                "stage": "wait_reject",
+                "reason": "start_not_horizontal",
+                "value1": 0.40,
+                "value2": 0.92,
+                "value3": 5.0,
+            }
+        ],
+        matched=False,
+    )
+    assert rejected_conditions[0].status == "FAIL"
+    assert rejected_conditions[-1].status == "FAIL"
     print("SELF_TEST: PASS", flush=True)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="HarnessNodeの屈曲→回内ジェスチャーをBLEイベントで検証"
+        description="HarnessNodeの水平開始→屈曲→垂直静止をBLEイベントで検証"
     )
     parser.add_argument("--device", default=DEVICE_NAME, help="BLEデバイス名")
     parser.add_argument("--address", help="スキャンせず接続するBLEアドレス/UUID")
@@ -708,7 +1152,7 @@ def main() -> int:
         parser.error("--window は正、--interval は0以上にしてください")
     if args.instruction is None:
         args.instruction = (
-            "肘を伸ばして静止し、肘を屈曲してから前腕を回内してください"
+            "手のひらを水平にして静止し、肘を屈曲して手を垂直位置に留めてください"
             if args.expect == "match"
             else "指定された非対象動作を行ってください"
         )
@@ -720,7 +1164,6 @@ def main() -> int:
         return 130
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr, flush=True)
-        print(f"CODEX_SUMMARY result=ERROR reason={type(exc).__name__}", flush=True)
         return 2
 
 
