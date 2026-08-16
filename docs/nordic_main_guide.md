@@ -135,8 +135,8 @@ XIAOをリストバンドの掌側に置き、部品面を皮膚側、基板X軸
 
 1. 手のひら上向き水平で、補正Z比0.90以上、Y比絶対値0.30以下、角速度70°/s以下を120 ms連続して満たすと1秒間armする。
 2. 前腕軸(Y)まわりに回内する（`gyro_y`積分30°以上・ピーク40°/s以上）。
-3. 回内成立後1500 ms以内に、逆符号の`gyro_y`（|gyro_y|≥12°/s）で回外を開始する。回外の積分角は不要。
-4. `abs(accel_y) / |accel| >= 0.94`（垂直±約20°）、角速度50°/s以下、線形加速度2.2 m/s²以下を500 ms連続して満たすと録音開始＋`0x01`を送信する。
+3. 回内成立後1500 ms以内に、逆符号の`gyro_y`（|gyro_y|≥10°/s）で回外を開始する。回外の積分角は不要。
+4. `abs(accel_y) / |accel| >= 0.94`（垂直±約20°）、角速度70°/s以下、線形加速度3.0 m/s²以下を500 ms連続して満たすと録音開始＋`0x01`を送信する。
 
 肘屈曲角・5 cm距離・Y重力維持は要求しない。詳細は`docs/flex_pronation_gesture.md`を参照する。
 
@@ -199,16 +199,16 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 | `GESTURE_RETURN_MAX_DURATION_MS` | 2500 ms | 復路の最長時間 |
 | `GESTURE_ROLL_ANGLE_MIN_DEG` | 30° | 回内のY軸積分角下限 |
 | `GESTURE_ROLL_PEAK_MIN_DPS` | 40°/s | 回内のY軸ピーク下限 |
-| `GESTURE_SUPINATE_START_RATE_DPS` | 12°/s | 回外開始の\|gyro_y\|下限 |
-| `GESTURE_DEBUG_GYRO_Y` | 1（現行） | 1で gyro_y 波形を BLE 送信 |
+| `GESTURE_SUPINATE_START_RATE_DPS` | 10°/s | 回外開始の\|gyro_y\|下限 |
+| `GESTURE_DEBUG_GYRO_Y` | 0（リリース） | 1で gyro_y 波形を BLE 送信 |
 | `GESTURE_FINAL_Y_MIN_RATIO` | 0.94 | 最終Y比絶対値（垂直から20°以内） |
 | `GESTURE_TURNAROUND_TIMEOUT_MS` | 1500 ms | 回外開始期限 |
 | `GESTURE_DISTANCE_MIN_M` | 0.05 m | 加速度・ジャイロ融合距離の下限 |
 | `GESTURE_EFFECTIVE_ARM_LENGTH_M` | 0.15 m | 円弧距離推定に使う有効腕長 |
 | `GESTURE_DISTANCE_LP_TAU_S` | 0.55 s | 車両加速度を追従除去する時定数 |
 | `GESTURE_QUIET_RATE_DPS` | 70°/s | 開始前静止の角速度上限（手ブレ許容） |
-| `GESTURE_FINAL_QUIET_RATE_DPS` | 50°/s | 垂直保持中の角速度上限 |
-| `GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2` | 2.2 m/s² | 垂直保持中の線形加速度上限 |
+| `GESTURE_FINAL_QUIET_RATE_DPS` | 70°/s | 垂直保持中の角速度上限 |
+| `GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2` | 3.0 m/s² | 垂直保持中の線形加速度上限 |
 | `GESTURE_FINAL_HOLD_MS` | 500 ms | 垂直姿勢の連続保持時間 |
 | `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 1500 ms | 復路終了後の保持成立期限 |
 | `GESTURE_SEQUENCE_TIMEOUT_MS` | 5000 ms | 全シーケンス期限 |

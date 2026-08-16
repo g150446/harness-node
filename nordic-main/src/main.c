@@ -121,7 +121,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_START_PALM_UP_Z_MIN_RATIO       0.90f
 #define GESTURE_START_Y_MAX_RATIO               0.30f  /* ~sin(17.5°) start pose */
 #define GESTURE_ROLL_START_RATE_DPS             35.0f
-#define GESTURE_SUPINATE_START_RATE_DPS         12.0f  /* reverse after pronation */
+#define GESTURE_SUPINATE_START_RATE_DPS         10.0f  /* reverse after pronation */
 #define GESTURE_MOTION_GYRO_ACTIVE_DPS          35.0f
 #define GESTURE_PHASE_MIN_DURATION_MS           180
 #define GESTURE_OUTBOUND_MAX_DURATION_MS       2000
@@ -134,8 +134,8 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_TURNAROUND_TIMEOUT_MS            1500
 #define GESTURE_FINAL_HOLD_MS                     500
 #define GESTURE_FINAL_HOLD_TIMEOUT_MS            1500
-#define GESTURE_FINAL_QUIET_RATE_DPS              50.0f
-#define GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2         2.2f
+#define GESTURE_FINAL_QUIET_RATE_DPS              70.0f
+#define GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2         3.0f
 #define GESTURE_SEQUENCE_TIMEOUT_MS              5000
 #define GESTURE_RETRIGGER_BLOCK_MS           1200
 /* Distance estimator retained for other motion metrics / future use. */
@@ -147,7 +147,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 
 /* Set to 1 only for debug OTA builds that stream gyro_y over BLE. */
 #ifndef GESTURE_DEBUG_GYRO_Y
-#define GESTURE_DEBUG_GYRO_Y                      1
+#define GESTURE_DEBUG_GYRO_Y                      0
 #endif
 #define GESTURE_DEBUG_GYRO_Y_PERIOD_MS           50
 
