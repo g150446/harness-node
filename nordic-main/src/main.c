@@ -54,9 +54,15 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 
 #define BLE_DEVICE_NAME         "HarnessNode"
 #define PCM_PACKET_SIZE         200
+#define AUDIO_FRAME_SAMPLES     320   /* 20 ms @ 16 kHz */
+#define AUDIO_FRAME_BYTES       (AUDIO_FRAME_SAMPLES * sizeof(int16_t))
+/* Software queue decouples DMIC capture from BLE Notify backpressure. */
+#define AUDIO_FRAME_QUEUE_LEN   16    /* 320 ms of PCM */
+#define AUDIO_CAPTURE_MAX_CONSEC_FAIL 20
 #define AUDIO_NOTIFY_IN_FLIGHT  6
 #define AUDIO_NOTIFY_RETRY_MS   2
 #define AUDIO_NOTIFY_DRAIN_TIMEOUT_MS 1000
+#define AUDIO_QUEUE_DRAIN_TIMEOUT_MS 500
 #define WDT_NODE                DT_NODELABEL(wdt0)
 #define WDT_TIMEOUT_MS          5000
 #define MAIN_LOOP_INTERVAL_MS   25
@@ -101,59 +107,78 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 /*
  * Volar-side gesture classifier.
  *
- * The board is mounted on the inner (palm) side of the wrist, with its long
- * component-side Z axis normal to the palm.  A horizontal palm therefore
- * places |Z| near gravity.  Elbow flexion brings the hand upright, moving
- * gravity into the board's X-Y plane.  Plane magnitudes avoid depending on
- * how the board is rotated inside the wristband.
+ * The board is mounted with X across the forearm, Y along the forearm and the
+ * component-side Z axis normal to the palm.  The gesture starts palm-up and
+ * horizontal, pronates about the forearm while staying horizontal (±10°), then
+ * reverses through flexion + supination into a vertical final hold.  Relative
+ * roll signs keep the sequence independent of hand and USB direction.
  */
 #define GESTURE_GRAVITY_MS2                  9.80665f
 #define GESTURE_RAD_TO_DEG                   57.29577951308232
 #define GESTURE_QUIET_RATE_DPS               19.0f
 #define GESTURE_QUIET_HOLD_MS                200
 #define GESTURE_START_ARM_MS                1000
-#define GESTURE_START_HORIZONTAL_Z_MIN_RATIO   0.80f
-#define GESTURE_FLEX_START_RATE_DPS          35.0f
-#define GESTURE_FLEX_PEAK_RATE_MIN_DPS       50.0f
-#define GESTURE_FLEX_ANGLE_MIN_DEG           60.0f
-#define GESTURE_FLEX_ACCEL_EVIDENCE_MIN_MS2   0.5f
-#define GESTURE_FLEX_MIN_DURATION_MS         180
-#define GESTURE_FLEX_MAX_DURATION_MS        2000
-#define GESTURE_FLEX_SETTLE_TIMEOUT_MS       350
-#define GESTURE_VERTICAL_PLANE_MIN_RATIO       0.80f
-#define GESTURE_VERTICAL_Z_MAX_RATIO           0.45f
-#define GESTURE_VERTICAL_HOLD_MS                250
-#define GESTURE_VERTICAL_HOLD_TIMEOUT_MS       1500
-#define GESTURE_VERTICAL_QUIET_RATE_DPS         19.0f
-#define GESTURE_VERTICAL_LINEAR_ACCEL_MAX_MS2    1.2f
+#define GESTURE_PALM_UP_Z_SIGN                 1.0f
+#define GESTURE_START_PALM_UP_Z_MIN_RATIO       0.90f
+#define GESTURE_START_Y_MAX_RATIO               0.17f  /* ~sin(10°) */
+#define GESTURE_HORIZONTAL_Y_MAX_RATIO          0.17f  /* outbound forearm level */
+#define GESTURE_ROLL_START_RATE_DPS             35.0f
+#define GESTURE_TRANSVERSE_START_RATE_DPS       35.0f
+#define GESTURE_TRANSVERSE_PEAK_MIN_DPS         50.0f
+#define GESTURE_TRANSVERSE_ANGLE_MIN_DEG        60.0f
+#define GESTURE_ACCEL_EVIDENCE_MIN_MS2           0.5f
+#define GESTURE_PHASE_MIN_DURATION_MS           180
+#define GESTURE_OUTBOUND_MAX_DURATION_MS       2000
+#define GESTURE_RETURN_MAX_DURATION_MS         2500
+#define GESTURE_INCOMPLETE_SETTLE_MS            350
+#define GESTURE_ROLL_INTEGRATE_RATE_DPS         20.0f
+#define GESTURE_ROLL_ANGLE_MIN_DEG              30.0f
+#define GESTURE_ROLL_PEAK_MIN_DPS               55.0f
+#define GESTURE_FINAL_Y_MIN_RATIO                0.94f
+#define GESTURE_TURNAROUND_RATE_DPS              25.0f
+#define GESTURE_TURNAROUND_TIMEOUT_MS             750
+#define GESTURE_FINAL_HOLD_MS                     500
+#define GESTURE_FINAL_HOLD_TIMEOUT_MS            1500
+#define GESTURE_FINAL_QUIET_RATE_DPS              19.0f
+#define GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2         1.2f
+#define GESTURE_SEQUENCE_TIMEOUT_MS              5000
 #define GESTURE_RETRIGGER_BLOCK_MS           1200
 #define GESTURE_DISTANCE_MIN_M                 0.05f
 #define GESTURE_EFFECTIVE_ARM_LENGTH_M         0.15f
 #define GESTURE_DISTANCE_ACCEL_ARC_CAP          1.5f
 #define GESTURE_DISTANCE_LP_TAU_S               0.55f
-#define GESTURE_DISTANCE_MAX_SAMPLES              80
+#define GESTURE_DISTANCE_MAX_SAMPLES             120
 
 /* BLE gesture diagnostics: event 0x30, stage/reason + three float values. */
-#define GESTURE_DIAG_FLEX_START               0x01
-#define GESTURE_DIAG_FLEX_COMPLETE            0x02
-#define GESTURE_DIAG_VERTICAL_HOLD_START       0x03
-#define GESTURE_DIAG_MATCH                     0x04
-#define GESTURE_DIAG_DISTANCE_READY            0x05
-#define GESTURE_DIAG_VERTICAL_READY             0x06
-#define GESTURE_DIAG_GYRO_BIAS_READY           0x07
+#define GESTURE_DIAG_OUTBOUND_START           0x01
+#define GESTURE_DIAG_OUTBOUND_READY           0x02
+#define GESTURE_DIAG_TURNAROUND_READY         0x03
+#define GESTURE_DIAG_RETURN_START             0x04
+#define GESTURE_DIAG_RETURN_READY             0x05
+#define GESTURE_DIAG_DISTANCE_READY           0x06
+#define GESTURE_DIAG_FINAL_HOLD_START         0x07
+#define GESTURE_DIAG_FINAL_READY              0x08
+#define GESTURE_DIAG_MATCH                    0x09
+#define GESTURE_DIAG_GYRO_BIAS_READY          0x0a
 #define GESTURE_DIAG_WAIT_REJECT               0x10
 #define GESTURE_DIAG_RESET                     0x80
 
 #define GESTURE_DIAG_REASON_NONE               0x00
 #define GESTURE_DIAG_REASON_QUIET_NOT_READY    0x01
-#define GESTURE_DIAG_REASON_START_NOT_HORIZONTAL 0x02
-#define GESTURE_DIAG_REASON_FLEX_RATE_LOW      0x03
-#define GESTURE_DIAG_REASON_FLEX_TIMEOUT       0x11
-#define GESTURE_DIAG_REASON_INCOMPLETE_FLEX    0x13
-#define GESTURE_DIAG_REASON_ENDPOINT_NOT_VERTICAL 0x14
-#define GESTURE_DIAG_REASON_DISTANCE_TOO_SHORT 0x16
-#define GESTURE_DIAG_REASON_VERTICAL_HOLD_INTERRUPTED 0x17
-#define GESTURE_DIAG_REASON_VERTICAL_HOLD_TIMEOUT 0x18
+#define GESTURE_DIAG_REASON_START_NOT_PALM_UP  0x02
+#define GESTURE_DIAG_REASON_OUTBOUND_RATE_LOW  0x03
+#define GESTURE_DIAG_REASON_OUTBOUND_TIMEOUT   0x11
+#define GESTURE_DIAG_REASON_INCOMPLETE_OUTBOUND 0x12
+#define GESTURE_DIAG_REASON_TURNAROUND_TIMEOUT 0x13
+#define GESTURE_DIAG_REASON_WRONG_ROLL_DIRECTION 0x14
+#define GESTURE_DIAG_REASON_HORIZONTAL_LOST    0x15
+#define GESTURE_DIAG_REASON_RETURN_TIMEOUT     0x16
+#define GESTURE_DIAG_REASON_INCOMPLETE_RETURN  0x17
+#define GESTURE_DIAG_REASON_DISTANCE_TOO_SHORT 0x18
+#define GESTURE_DIAG_REASON_FINAL_Y_NOT_REACHED 0x19
+#define GESTURE_DIAG_REASON_FINAL_HOLD_INTERRUPTED 0x1a
+#define GESTURE_DIAG_REASON_FINAL_HOLD_TIMEOUT 0x1b
+#define GESTURE_DIAG_REASON_SEQUENCE_TIMEOUT   0x1c
 
 /* ============================================================================
  * BLE UUIDs (Handy-compatible)
@@ -224,11 +249,41 @@ static uint8_t seq_num;
 static volatile bool is_recording;
 static volatile bool recording_requested;
 static volatile bool stop_requested;
+static volatile bool capture_enabled;
+static volatile bool capture_fatal;
 K_SEM_DEFINE(audio_notify_slots, AUDIO_NOTIFY_IN_FLIGHT, AUDIO_NOTIFY_IN_FLIGHT);
 
-/* Audio thread */
+struct audio_pcm_frame {
+    uint16_t nbytes;
+    uint8_t pcm[AUDIO_FRAME_BYTES];
+};
+
+K_MSGQ_DEFINE(audio_frame_q, sizeof(struct audio_pcm_frame),
+              AUDIO_FRAME_QUEUE_LEN, 4);
+
+struct audio_session_stats {
+    uint32_t frames_captured;
+    uint32_t frames_sent;
+    uint32_t bytes_sent;
+    uint32_t notifies_sent;
+    uint32_t notify_wait_count;
+    uint32_t notify_wait_max_ms;
+    uint32_t notify_retry_count;
+    uint32_t dmic_read_errors;
+    uint32_t last_dmic_errno;
+    uint32_t dmic_overruns;
+    uint32_t queue_high_watermark;
+    int64_t session_start_ms;
+    int64_t dmic_stop_ms;
+};
+
+static struct audio_session_stats audio_stats;
+
+/* Audio control/sender thread + dedicated DMIC capture thread */
 static K_THREAD_STACK_DEFINE(audio_stack, 4096);
+static K_THREAD_STACK_DEFINE(audio_capture_stack, 2048);
 static struct k_thread audio_thread_data;
+static struct k_thread audio_capture_thread_data;
 
 /* Serial command thread */
 static K_THREAD_STACK_DEFINE(serial_stack, 1024);
@@ -281,8 +336,10 @@ static const struct device *const imu     = DEVICE_DT_GET(IMU_NODE);
 /* Gesture state */
 typedef enum {
     GESTURE_WAITING,
-    GESTURE_FLEXING,
-    GESTURE_HOLDING_VERTICAL,
+    GESTURE_OUTBOUND,
+    GESTURE_TURNAROUND,
+    GESTURE_RETURNING,
+    GESTURE_HOLDING_FINAL,
 } gesture_phase_t;
 
 typedef struct {
@@ -295,8 +352,8 @@ typedef struct {
 static int64_t motion_active_start_ms;
 static gesture_phase_t gesture_phase;
 static int64_t gesture_sequence_start_ms;
-static int64_t gesture_flex_complete_ms;
-static int64_t gesture_vertical_since_ms;
+static int64_t gesture_phase_start_ms;
+static int64_t gesture_final_since_ms;
 static int64_t gesture_last_sample_ms;
 static int64_t gesture_quiet_since_ms;
 static int64_t gesture_armed_until_ms;
@@ -305,10 +362,19 @@ static int64_t gesture_diag_last_report_ms;
 static float gesture_quiet_accel_x, gesture_quiet_accel_y, gesture_quiet_accel_z;
 static bool gesture_quiet_accel_valid;
 static float gesture_start_accel_x, gesture_start_accel_y, gesture_start_accel_z;
-static float gesture_flex_angle_x_deg, gesture_flex_angle_y_deg;
-static float gesture_flex_peak_rate_dps;
-static float gesture_flex_accel_evidence_ms2;
-static bool gesture_flex_qualified;
+static float gesture_lead_roll_angle_deg;
+static float gesture_lead_roll_peak_dps;
+static float gesture_outbound_roll_angle_deg;
+static float gesture_outbound_roll_peak_dps;
+static float gesture_outbound_max_abs_y_ratio;
+static bool gesture_outbound_qualified;
+static bool gesture_turnaround_seen;
+static float gesture_return_angle_x_deg, gesture_return_angle_z_deg;
+static float gesture_return_peak_rate_dps;
+static float gesture_return_accel_evidence_ms2;
+static float gesture_return_roll_angle_deg;
+static float gesture_return_roll_peak_dps;
+static bool gesture_return_qualified;
 static float gesture_orientation_w, gesture_orientation_x;
 static float gesture_orientation_y, gesture_orientation_z;
 static float gesture_world_accel_lp_x, gesture_world_accel_lp_y;
@@ -1093,15 +1159,44 @@ static void reset_gesture_sequence(void)
 {
     gesture_phase = GESTURE_WAITING;
     gesture_sequence_start_ms = 0;
-    gesture_flex_complete_ms = 0;
-    gesture_vertical_since_ms = 0;
-    gesture_flex_angle_x_deg = 0.0f;
-    gesture_flex_angle_y_deg = 0.0f;
-    gesture_flex_peak_rate_dps = 0.0f;
-    gesture_flex_accel_evidence_ms2 = 0.0f;
-    gesture_flex_qualified = false;
+    gesture_phase_start_ms = 0;
+    gesture_final_since_ms = 0;
+    gesture_lead_roll_angle_deg = 0.0f;
+    gesture_lead_roll_peak_dps = 0.0f;
+    gesture_outbound_roll_angle_deg = 0.0f;
+    gesture_outbound_roll_peak_dps = 0.0f;
+    gesture_outbound_max_abs_y_ratio = 0.0f;
+    gesture_outbound_qualified = false;
+    gesture_turnaround_seen = false;
+    gesture_return_angle_x_deg = 0.0f;
+    gesture_return_angle_z_deg = 0.0f;
+    gesture_return_peak_rate_dps = 0.0f;
+    gesture_return_accel_evidence_ms2 = 0.0f;
+    gesture_return_roll_angle_deg = 0.0f;
+    gesture_return_roll_peak_dps = 0.0f;
+    gesture_return_qualified = false;
     reset_gesture_distance();
     gesture_armed_until_ms = 0;
+}
+
+static float gesture_transverse_angle_deg(float angle_x_deg,
+                                          float angle_z_deg)
+{
+    return sqrtf(angle_x_deg * angle_x_deg +
+                 angle_z_deg * angle_z_deg);
+}
+
+static void accumulate_gesture_roll(float *angle_deg, float *peak_dps,
+                                    float gy_dps, float dt_s)
+{
+    float rate = fabsf(gy_dps);
+
+    if (rate >= GESTURE_ROLL_INTEGRATE_RATE_DPS) {
+        *angle_deg += gy_dps * dt_s;
+    }
+    if (rate > *peak_dps) {
+        *peak_dps = rate;
+    }
 }
 
 static void update_quiet_accel_reference(float x, float y, float z)
@@ -1131,20 +1226,15 @@ static void process_gesture_sample(float ax, float ay, float az,
     gz_dps -= (float)gyro_bias_z_dps;
 
     float gyro_norm = vector_norm3(gx_dps, gy_dps, gz_dps);
-    float palm_plane_rate = sqrtf(gx_dps * gx_dps + gy_dps * gy_dps);
+    float transverse_rate = sqrtf(gx_dps * gx_dps + gz_dps * gz_dps);
     float accel_norm = vector_norm3(ax, ay, az);
     float accel_dynamic = fabsf(accel_norm - GESTURE_GRAVITY_MS2);
-    float x_gravity_ratio = accel_norm > 0.1f ? fabsf(ax) / accel_norm : 0.0f;
-    float y_gravity_ratio = accel_norm > 0.1f ? fabsf(ay) / accel_norm : 0.0f;
-    float z_gravity_ratio = accel_norm > 0.1f ? fabsf(az) / accel_norm : 0.0f;
-    float plane_gravity_ratio =
-        sqrtf(x_gravity_ratio * x_gravity_ratio +
-              y_gravity_ratio * y_gravity_ratio);
-    bool start_horizontal =
-        z_gravity_ratio >= GESTURE_START_HORIZONTAL_Z_MIN_RATIO;
-    bool endpoint_vertical =
-        plane_gravity_ratio >= GESTURE_VERTICAL_PLANE_MIN_RATIO &&
-        z_gravity_ratio <= GESTURE_VERTICAL_Z_MAX_RATIO;
+    float y_gravity_ratio = accel_norm > 0.1f ? ay / accel_norm : 0.0f;
+    float z_gravity_ratio = accel_norm > 0.1f ? az / accel_norm : 0.0f;
+    float palm_up_z_ratio = z_gravity_ratio * GESTURE_PALM_UP_Z_SIGN;
+    bool start_palm_up =
+        palm_up_z_ratio >= GESTURE_START_PALM_UP_Z_MIN_RATIO &&
+        fabsf(y_gravity_ratio) <= GESTURE_START_Y_MAX_RATIO;
     float dt_s = (gesture_last_sample_ms > 0)
                  ? (float)(now - gesture_last_sample_ms) / 1000.0f
                  : (float)MOTION_SAMPLE_INTERVAL_MS / 1000.0f;
@@ -1167,19 +1257,34 @@ static void process_gesture_sample(float ax, float ay, float az,
         return;
     }
 
+    if (gesture_phase != GESTURE_WAITING &&
+        (now - gesture_sequence_start_ms) > GESTURE_SEQUENCE_TIMEOUT_MS) {
+        send_gesture_diag(GESTURE_DIAG_RESET,
+                          GESTURE_DIAG_REASON_SEQUENCE_TIMEOUT,
+                          (float)(now - gesture_sequence_start_ms),
+                          y_gravity_ratio, gyro_norm);
+        reset_gesture_sequence();
+        gesture_quiet_since_ms = 0;
+        return;
+    }
+
     if (gesture_phase == GESTURE_WAITING) {
         if (gyro_norm <= GESTURE_QUIET_RATE_DPS) {
-            if (start_horizontal) {
+            if (start_palm_up) {
                 if (gesture_quiet_since_ms == 0) {
                     gesture_quiet_since_ms = now;
                 }
                 if ((now - gesture_quiet_since_ms) >= GESTURE_QUIET_HOLD_MS) {
                     gesture_armed_until_ms = now + GESTURE_START_ARM_MS;
+                    gesture_lead_roll_angle_deg = 0.0f;
+                    gesture_lead_roll_peak_dps = 0.0f;
                 }
                 update_quiet_accel_reference(ax, ay, az);
             } else {
                 gesture_quiet_since_ms = 0;
                 gesture_armed_until_ms = 0;
+                gesture_lead_roll_angle_deg = 0.0f;
+                gesture_lead_roll_peak_dps = 0.0f;
             }
             return;
         }
@@ -1187,117 +1292,243 @@ static void process_gesture_sample(float ax, float ay, float az,
         bool quiet_ready = gesture_armed_until_ms > 0 &&
                            now <= gesture_armed_until_ms;
 
-        if (quiet_ready &&
-            palm_plane_rate >= GESTURE_FLEX_START_RATE_DPS) {
-            gesture_phase = GESTURE_FLEXING;
+        if (quiet_ready) {
+            accumulate_gesture_roll(&gesture_lead_roll_angle_deg,
+                                    &gesture_lead_roll_peak_dps,
+                                    gy_dps, dt_s);
+        }
+
+        float roll_rate = fabsf(gy_dps);
+        if (quiet_ready && roll_rate >= GESTURE_ROLL_START_RATE_DPS) {
+            gesture_phase = GESTURE_OUTBOUND;
             gesture_sequence_start_ms = now;
+            gesture_phase_start_ms = now;
             gesture_start_accel_x = gesture_quiet_accel_x;
             gesture_start_accel_y = gesture_quiet_accel_y;
             gesture_start_accel_z = gesture_quiet_accel_z;
-            gesture_flex_angle_x_deg = gx_dps * dt_s;
-            gesture_flex_angle_y_deg = gy_dps * dt_s;
-            gesture_flex_peak_rate_dps = palm_plane_rate;
-            gesture_flex_accel_evidence_ms2 = accel_dynamic;
-            gesture_flex_qualified = false;
-            reset_gesture_distance();
-            update_gesture_distance(ax, ay, az,
-                                    gx_dps, gy_dps, gz_dps,
-                                    dt_s, true);
+            gesture_outbound_roll_angle_deg = gesture_lead_roll_angle_deg;
+            gesture_outbound_roll_peak_dps = gesture_lead_roll_peak_dps;
+            if (roll_rate > gesture_outbound_roll_peak_dps) {
+                gesture_outbound_roll_peak_dps = roll_rate;
+            }
+            gesture_outbound_max_abs_y_ratio = fabsf(y_gravity_ratio);
+            gesture_outbound_qualified = false;
             gesture_quiet_since_ms = 0;
             gesture_armed_until_ms = 0;
-            printk(">>> Gesture flex start: palm-plane=%.1f dps accel=%.2f m/s^2\n",
-                   (double)palm_plane_rate, (double)accel_dynamic);
-            send_gesture_diag(GESTURE_DIAG_FLEX_START,
+            printk(">>> Gesture outbound start: roll=%.1f dps\n",
+                   (double)roll_rate);
+            send_gesture_diag(GESTURE_DIAG_OUTBOUND_START,
                               GESTURE_DIAG_REASON_NONE,
-                              palm_plane_rate, z_gravity_ratio, accel_dynamic);
+                              roll_rate, palm_up_z_ratio,
+                              y_gravity_ratio);
         } else {
             gesture_quiet_since_ms = 0;
             uint8_t reason = !quiet_ready
-                                 ? (start_horizontal
+                                 ? (start_palm_up
                                         ? GESTURE_DIAG_REASON_QUIET_NOT_READY
-                                        : GESTURE_DIAG_REASON_START_NOT_HORIZONTAL)
-                                 : GESTURE_DIAG_REASON_FLEX_RATE_LOW;
+                                        : GESTURE_DIAG_REASON_START_NOT_PALM_UP)
+                                 : GESTURE_DIAG_REASON_OUTBOUND_RATE_LOW;
             if ((now - gesture_diag_last_report_ms) >= 250) {
                 send_gesture_diag(GESTURE_DIAG_WAIT_REJECT, reason,
-                                  z_gravity_ratio, plane_gravity_ratio, gyro_norm);
+                                  palm_up_z_ratio, y_gravity_ratio, gyro_norm);
                 gesture_diag_last_report_ms = now;
             }
 
-            if (!quiet_ready) {
+            if (!quiet_ready && now > gesture_armed_until_ms) {
                 gesture_armed_until_ms = 0;
+                gesture_lead_roll_angle_deg = 0.0f;
+                gesture_lead_roll_peak_dps = 0.0f;
             }
         }
         return;
     }
 
-    if (gesture_phase == GESTURE_FLEXING) {
-        int64_t flex_elapsed = now - gesture_sequence_start_ms;
-        if (flex_elapsed > GESTURE_FLEX_MAX_DURATION_MS) {
-            float flex_angle = sqrtf(
-                gesture_flex_angle_x_deg * gesture_flex_angle_x_deg +
-                gesture_flex_angle_y_deg * gesture_flex_angle_y_deg);
-            printk(">>> Gesture reset: flex timeout\n");
+    if (gesture_phase == GESTURE_OUTBOUND) {
+        int64_t elapsed_ms = now - gesture_phase_start_ms;
+        float abs_y = fabsf(y_gravity_ratio);
+        if (abs_y > gesture_outbound_max_abs_y_ratio) {
+            gesture_outbound_max_abs_y_ratio = abs_y;
+        }
+
+        if (abs_y > GESTURE_HORIZONTAL_Y_MAX_RATIO) {
             send_gesture_diag(GESTURE_DIAG_RESET,
-                              GESTURE_DIAG_REASON_FLEX_TIMEOUT,
-                              flex_angle, gesture_flex_peak_rate_dps,
-                              gesture_flex_accel_evidence_ms2);
+                              GESTURE_DIAG_REASON_HORIZONTAL_LOST,
+                              gesture_outbound_roll_angle_deg,
+                              gesture_outbound_roll_peak_dps,
+                              y_gravity_ratio);
             reset_gesture_sequence();
             gesture_quiet_since_ms = 0;
             return;
         }
 
+        accumulate_gesture_roll(&gesture_outbound_roll_angle_deg,
+                                &gesture_outbound_roll_peak_dps,
+                                gy_dps, dt_s);
+
+        gesture_outbound_qualified =
+            elapsed_ms >= GESTURE_PHASE_MIN_DURATION_MS &&
+            fabsf(gesture_outbound_roll_angle_deg) >=
+                GESTURE_ROLL_ANGLE_MIN_DEG &&
+            gesture_outbound_roll_peak_dps >= GESTURE_ROLL_PEAK_MIN_DPS &&
+            gesture_outbound_max_abs_y_ratio <=
+                GESTURE_HORIZONTAL_Y_MAX_RATIO;
+
+        if (gesture_outbound_qualified) {
+            gesture_phase = GESTURE_TURNAROUND;
+            gesture_phase_start_ms = now;
+            gesture_quiet_since_ms = 0;
+            printk(">>> Gesture outbound ready: roll=%.1f peak=%.1f max|y|=%.2f\n",
+                   (double)gesture_outbound_roll_angle_deg,
+                   (double)gesture_outbound_roll_peak_dps,
+                   (double)gesture_outbound_max_abs_y_ratio);
+            send_gesture_diag(GESTURE_DIAG_OUTBOUND_READY,
+                              GESTURE_DIAG_REASON_NONE,
+                              gesture_outbound_roll_angle_deg,
+                              gesture_outbound_roll_peak_dps,
+                              gesture_outbound_max_abs_y_ratio);
+            return;
+        }
+
+        if (elapsed_ms > GESTURE_OUTBOUND_MAX_DURATION_MS) {
+            send_gesture_diag(GESTURE_DIAG_RESET,
+                              GESTURE_DIAG_REASON_OUTBOUND_TIMEOUT,
+                              gesture_outbound_roll_angle_deg,
+                              gesture_outbound_roll_peak_dps,
+                              gesture_outbound_max_abs_y_ratio);
+            reset_gesture_sequence();
+            gesture_quiet_since_ms = 0;
+            return;
+        }
+
+        if (gyro_norm <= GESTURE_QUIET_RATE_DPS) {
+            if (gesture_quiet_since_ms == 0) {
+                gesture_quiet_since_ms = now;
+            } else if ((now - gesture_quiet_since_ms) >=
+                       GESTURE_INCOMPLETE_SETTLE_MS) {
+                send_gesture_diag(GESTURE_DIAG_RESET,
+                                  GESTURE_DIAG_REASON_INCOMPLETE_OUTBOUND,
+                                  gesture_outbound_roll_angle_deg,
+                                  gesture_outbound_roll_peak_dps,
+                                  gesture_outbound_max_abs_y_ratio);
+                reset_gesture_sequence();
+            }
+        } else {
+            gesture_quiet_since_ms = 0;
+        }
+        return;
+    }
+
+    if (gesture_phase == GESTURE_TURNAROUND) {
+        int64_t elapsed_ms = now - gesture_phase_start_ms;
+        bool transverse_quiet =
+            transverse_rate <= GESTURE_TURNAROUND_RATE_DPS &&
+            fabsf(gy_dps) <= GESTURE_TURNAROUND_RATE_DPS;
+        bool roll_reversing =
+            fabsf(gy_dps) >= GESTURE_ROLL_INTEGRATE_RATE_DPS &&
+            gesture_outbound_roll_angle_deg * gy_dps < 0.0f;
+
+        if (!gesture_turnaround_seen &&
+            (transverse_quiet || roll_reversing)) {
+            gesture_turnaround_seen = true;
+            send_gesture_diag(GESTURE_DIAG_TURNAROUND_READY,
+                              GESTURE_DIAG_REASON_NONE,
+                              (float)elapsed_ms, y_gravity_ratio, gyro_norm);
+        }
+
+        if (gesture_turnaround_seen &&
+            transverse_rate >= GESTURE_TRANSVERSE_START_RATE_DPS) {
+            gesture_phase = GESTURE_RETURNING;
+            gesture_phase_start_ms = now;
+            gesture_start_accel_x = ax;
+            gesture_start_accel_y = ay;
+            gesture_start_accel_z = az;
+            gesture_return_angle_x_deg = gx_dps * dt_s;
+            gesture_return_angle_z_deg = gz_dps * dt_s;
+            gesture_return_peak_rate_dps = transverse_rate;
+            gesture_return_accel_evidence_ms2 = accel_dynamic;
+            gesture_return_roll_angle_deg = 0.0f;
+            gesture_return_roll_peak_dps = 0.0f;
+            accumulate_gesture_roll(&gesture_return_roll_angle_deg,
+                                    &gesture_return_roll_peak_dps,
+                                    gy_dps, dt_s);
+            gesture_return_qualified = false;
+            reset_gesture_distance();
+            update_gesture_distance(ax, ay, az,
+                                    gx_dps, gy_dps, gz_dps,
+                                    dt_s, true);
+            gesture_quiet_since_ms = 0;
+            send_gesture_diag(GESTURE_DIAG_RETURN_START,
+                              GESTURE_DIAG_REASON_NONE,
+                              transverse_rate, gy_dps,
+                              gesture_outbound_roll_angle_deg);
+            return;
+        }
+
+        if (elapsed_ms > GESTURE_TURNAROUND_TIMEOUT_MS) {
+            send_gesture_diag(GESTURE_DIAG_RESET,
+                              GESTURE_DIAG_REASON_TURNAROUND_TIMEOUT,
+                              (float)elapsed_ms, y_gravity_ratio, gyro_norm);
+            reset_gesture_sequence();
+            gesture_quiet_since_ms = 0;
+        }
+        return;
+    }
+
+    if (gesture_phase == GESTURE_RETURNING) {
+        int64_t elapsed_ms = now - gesture_phase_start_ms;
         float accel_from_start = vector_norm3(ax - gesture_start_accel_x,
                                               ay - gesture_start_accel_y,
                                               az - gesture_start_accel_z);
         float accel_evidence = fmaxf(accel_dynamic, accel_from_start);
-        if (accel_evidence > gesture_flex_accel_evidence_ms2) {
-            gesture_flex_accel_evidence_ms2 = accel_evidence;
+        if (accel_evidence > gesture_return_accel_evidence_ms2) {
+            gesture_return_accel_evidence_ms2 = accel_evidence;
         }
 
-        gesture_flex_angle_x_deg += gx_dps * dt_s;
-        gesture_flex_angle_y_deg += gy_dps * dt_s;
+        gesture_return_angle_x_deg += gx_dps * dt_s;
+        gesture_return_angle_z_deg += gz_dps * dt_s;
+        if (transverse_rate > gesture_return_peak_rate_dps) {
+            gesture_return_peak_rate_dps = transverse_rate;
+        }
+        accumulate_gesture_roll(&gesture_return_roll_angle_deg,
+                                &gesture_return_roll_peak_dps,
+                                gy_dps, dt_s);
         update_gesture_distance(ax, ay, az,
                                 gx_dps, gy_dps, gz_dps,
                                 dt_s, true);
-        if (palm_plane_rate > gesture_flex_peak_rate_dps) {
-            gesture_flex_peak_rate_dps = palm_plane_rate;
-        }
 
-        float flex_angle = sqrtf(
-            gesture_flex_angle_x_deg * gesture_flex_angle_x_deg +
-            gesture_flex_angle_y_deg * gesture_flex_angle_y_deg);
+        float angle_deg = gesture_transverse_angle_deg(
+            gesture_return_angle_x_deg, gesture_return_angle_z_deg);
+        bool roll_opposite =
+            gesture_outbound_roll_angle_deg *
+                gesture_return_roll_angle_deg < 0.0f;
+        bool final_y_reached =
+            fabsf(y_gravity_ratio) >= GESTURE_FINAL_Y_MIN_RATIO;
 
-        gesture_flex_qualified =
-            gesture_flex_qualified ||
-            (flex_elapsed >= GESTURE_FLEX_MIN_DURATION_MS &&
-             flex_angle >= GESTURE_FLEX_ANGLE_MIN_DEG &&
-             gesture_flex_peak_rate_dps >= GESTURE_FLEX_PEAK_RATE_MIN_DPS &&
-             gesture_flex_accel_evidence_ms2 >=
-                 GESTURE_FLEX_ACCEL_EVIDENCE_MIN_MS2);
+        gesture_return_qualified =
+            elapsed_ms >= GESTURE_PHASE_MIN_DURATION_MS &&
+            angle_deg >= GESTURE_TRANSVERSE_ANGLE_MIN_DEG &&
+            gesture_return_peak_rate_dps >=
+                GESTURE_TRANSVERSE_PEAK_MIN_DPS &&
+            gesture_return_accel_evidence_ms2 >=
+                GESTURE_ACCEL_EVIDENCE_MIN_MS2 &&
+            fabsf(gesture_return_roll_angle_deg) >=
+                GESTURE_ROLL_ANGLE_MIN_DEG &&
+            gesture_return_roll_peak_dps >= GESTURE_ROLL_PEAK_MIN_DPS &&
+            roll_opposite && final_y_reached;
 
-        /* The flexion ends at the first angularly quiet sample after all flex
-         * requirements have been met. Distance is frozen at this boundary. */
-        if (gesture_flex_qualified &&
-            gyro_norm <= GESTURE_VERTICAL_QUIET_RATE_DPS) {
-            finalize_gesture_distance(flex_angle);
-            gesture_flex_complete_ms = now;
-            gesture_phase = GESTURE_HOLDING_VERTICAL;
-            gesture_vertical_since_ms = 0;
-            printk(">>> Gesture flex complete: angle=%.1f deg distance=%.1f cm\n",
-                   (double)flex_angle,
-                   (double)(gesture_fused_distance_m * 100.0f));
-            send_gesture_diag(GESTURE_DIAG_FLEX_COMPLETE,
+        if (gesture_return_qualified &&
+            gyro_norm <= GESTURE_FINAL_QUIET_RATE_DPS) {
+            finalize_gesture_distance(angle_deg);
+            send_gesture_diag(GESTURE_DIAG_RETURN_READY,
                               GESTURE_DIAG_REASON_NONE,
-                              flex_angle, gesture_flex_peak_rate_dps,
-                              gesture_flex_accel_evidence_ms2);
+                              angle_deg, gesture_return_roll_angle_deg,
+                              gesture_return_accel_evidence_ms2);
             send_gesture_diag(GESTURE_DIAG_DISTANCE_READY,
                               GESTURE_DIAG_REASON_NONE,
                               gesture_fused_distance_m * 100.0f,
                               gesture_accel_distance_m * 100.0f,
                               gesture_arc_distance_m * 100.0f);
             if (gesture_fused_distance_m < GESTURE_DISTANCE_MIN_M) {
-                printk(">>> Gesture reset: distance too short (%.1f cm)\n",
-                       (double)(gesture_fused_distance_m * 100.0f));
                 send_gesture_diag(GESTURE_DIAG_RESET,
                                   GESTURE_DIAG_REASON_DISTANCE_TOO_SHORT,
                                   gesture_fused_distance_m * 100.0f,
@@ -1305,21 +1536,45 @@ static void process_gesture_sample(float ax, float ay, float az,
                                   gesture_arc_distance_m * 100.0f);
                 reset_gesture_sequence();
                 gesture_quiet_since_ms = 0;
+                return;
             }
+
+            gesture_phase = GESTURE_HOLDING_FINAL;
+            gesture_phase_start_ms = now;
+            gesture_final_since_ms = now;
+            gesture_quiet_since_ms = 0;
+            send_gesture_diag(GESTURE_DIAG_FINAL_HOLD_START,
+                              GESTURE_DIAG_REASON_NONE,
+                              y_gravity_ratio, gyro_norm,
+                              gesture_linear_accel_norm_ms2);
             return;
         }
 
-        if (!gesture_flex_qualified &&
+        if (elapsed_ms > GESTURE_RETURN_MAX_DURATION_MS) {
+            uint8_t reason = !roll_opposite
+                                 ? GESTURE_DIAG_REASON_WRONG_ROLL_DIRECTION
+                                 : (!final_y_reached
+                                        ? GESTURE_DIAG_REASON_FINAL_Y_NOT_REACHED
+                                        : GESTURE_DIAG_REASON_RETURN_TIMEOUT);
+            send_gesture_diag(GESTURE_DIAG_RESET, reason,
+                              angle_deg, gesture_return_roll_angle_deg,
+                              y_gravity_ratio);
+            reset_gesture_sequence();
+            gesture_quiet_since_ms = 0;
+            return;
+        }
+
+        if (!gesture_return_qualified &&
             gyro_norm <= GESTURE_QUIET_RATE_DPS) {
             if (gesture_quiet_since_ms == 0) {
                 gesture_quiet_since_ms = now;
             } else if ((now - gesture_quiet_since_ms) >=
-                       GESTURE_FLEX_SETTLE_TIMEOUT_MS) {
-                printk(">>> Gesture reset: incomplete flexion\n");
+                       GESTURE_INCOMPLETE_SETTLE_MS) {
                 send_gesture_diag(GESTURE_DIAG_RESET,
-                                  GESTURE_DIAG_REASON_INCOMPLETE_FLEX,
-                                  flex_angle, gesture_flex_peak_rate_dps,
-                                  gesture_flex_accel_evidence_ms2);
+                                  GESTURE_DIAG_REASON_INCOMPLETE_RETURN,
+                                  angle_deg,
+                                  gesture_return_roll_angle_deg,
+                                  y_gravity_ratio);
                 reset_gesture_sequence();
             }
         } else {
@@ -1332,33 +1587,34 @@ static void process_gesture_sample(float ax, float ay, float az,
                             gx_dps, gy_dps, gz_dps,
                             dt_s, false);
 
-    int64_t vertical_wait_ms = now - gesture_flex_complete_ms;
-    bool vertical_quiet =
-        gyro_norm <= GESTURE_VERTICAL_QUIET_RATE_DPS &&
+    bool final_pose =
+        fabsf(y_gravity_ratio) >= GESTURE_FINAL_Y_MIN_RATIO;
+    bool final_quiet =
+        gyro_norm <= GESTURE_FINAL_QUIET_RATE_DPS &&
         gesture_linear_accel_norm_ms2 <=
-            GESTURE_VERTICAL_LINEAR_ACCEL_MAX_MS2;
+            GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2;
 
-    if (endpoint_vertical && vertical_quiet) {
-        if (gesture_vertical_since_ms == 0) {
-            gesture_vertical_since_ms = now;
-            send_gesture_diag(GESTURE_DIAG_VERTICAL_HOLD_START,
+    if (final_pose && final_quiet) {
+        if (gesture_final_since_ms == 0) {
+            gesture_final_since_ms = now;
+            send_gesture_diag(GESTURE_DIAG_FINAL_HOLD_START,
                               GESTURE_DIAG_REASON_NONE,
-                              plane_gravity_ratio, z_gravity_ratio,
+                              y_gravity_ratio, gyro_norm,
                               gesture_linear_accel_norm_ms2);
         }
 
-        int64_t vertical_hold_ms = now - gesture_vertical_since_ms;
-        if (vertical_hold_ms >= GESTURE_VERTICAL_HOLD_MS) {
-            printk(">>> Gesture MATCH: horizontal palm, flex, vertical hold\n");
-            send_gesture_diag(GESTURE_DIAG_VERTICAL_READY,
+        int64_t hold_ms = now - gesture_final_since_ms;
+        if (hold_ms >= GESTURE_FINAL_HOLD_MS) {
+            float tilt_deg = acosf(fminf(1.0f, fabsf(y_gravity_ratio))) *
+                             (float)GESTURE_RAD_TO_DEG;
+            printk(">>> Gesture MATCH: horizontal pronation, return flexion/supination, final hold\n");
+            send_gesture_diag(GESTURE_DIAG_FINAL_READY,
                               GESTURE_DIAG_REASON_NONE,
-                              plane_gravity_ratio, z_gravity_ratio,
-                              (float)vertical_hold_ms);
+                              y_gravity_ratio, (float)hold_ms, tilt_deg);
             send_gesture_diag(GESTURE_DIAG_MATCH,
                               GESTURE_DIAG_REASON_NONE,
                               gesture_fused_distance_m * 100.0f,
-                              plane_gravity_ratio,
-                              (float)vertical_hold_ms);
+                              y_gravity_ratio, (float)hold_ms);
             recording_requested = true;
             gesture_block_until_ms = now + GESTURE_RETRIGGER_BLOCK_MS;
             last_activity_ms = now;
@@ -1367,25 +1623,22 @@ static void process_gesture_sample(float ax, float ay, float az,
             return;
         }
     } else {
-        if (gesture_vertical_since_ms > 0 &&
+        if (gesture_final_since_ms > 0 &&
             (now - gesture_diag_last_report_ms) >= 250) {
             send_gesture_diag(GESTURE_DIAG_WAIT_REJECT,
-                              GESTURE_DIAG_REASON_VERTICAL_HOLD_INTERRUPTED,
-                              z_gravity_ratio, plane_gravity_ratio, gyro_norm);
+                              GESTURE_DIAG_REASON_FINAL_HOLD_INTERRUPTED,
+                              y_gravity_ratio, gyro_norm,
+                              gesture_linear_accel_norm_ms2);
             gesture_diag_last_report_ms = now;
         }
-        gesture_vertical_since_ms = 0;
+        gesture_final_since_ms = 0;
     }
 
-    if (vertical_wait_ms >= GESTURE_VERTICAL_HOLD_TIMEOUT_MS) {
-        uint8_t reason = endpoint_vertical
-                             ? GESTURE_DIAG_REASON_VERTICAL_HOLD_TIMEOUT
-                             : GESTURE_DIAG_REASON_ENDPOINT_NOT_VERTICAL;
-        printk(">>> Gesture reset: vertical endpoint not held\n");
+    if ((now - gesture_phase_start_ms) >= GESTURE_FINAL_HOLD_TIMEOUT_MS) {
         send_gesture_diag(GESTURE_DIAG_RESET,
-                          reason,
-                          plane_gravity_ratio, z_gravity_ratio,
-                          gesture_fused_distance_m * 100.0f);
+                          GESTURE_DIAG_REASON_FINAL_HOLD_TIMEOUT,
+                          y_gravity_ratio, gyro_norm,
+                          gesture_linear_accel_norm_ms2);
         reset_gesture_sequence();
         gesture_quiet_since_ms = 0;
     }
@@ -1488,7 +1741,7 @@ static void process_motion_sample(void)
     if (!motion_active) {
         bool accel_active = activity >= MOTION_ENTRY_ACTIVITY_MS2 &&
                             peak >= MOTION_ENTRY_PEAK_MS2;
-        bool gyro_active = gyro_norm >= GESTURE_FLEX_START_RATE_DPS;
+        bool gyro_active = gyro_norm >= GESTURE_TRANSVERSE_START_RATE_DPS;
         if (accel_active || gyro_active) {
             active_high_count++;
         } else {
@@ -1690,6 +1943,60 @@ static void send_event_packet_settle(float x, float y, float z, uint32_t elapsed
  * Audio Streaming
  * ============================================================================ */
 
+static void audio_stats_reset(void)
+{
+    memset(&audio_stats, 0, sizeof(audio_stats));
+    audio_stats.session_start_ms = k_uptime_get();
+}
+
+static void audio_stats_print(const char *reason)
+{
+    int64_t now = k_uptime_get();
+    int64_t session_ms = now - audio_stats.session_start_ms;
+    int64_t dmic_ms = 0;
+
+    if (audio_stats.dmic_stop_ms > 0) {
+        dmic_ms = audio_stats.dmic_stop_ms - audio_stats.session_start_ms;
+    } else if (session_ms > 0) {
+        dmic_ms = session_ms;
+    }
+
+    printk("Audio stats (%s): sess=%lldms dmic=%lldms cap=%u sent=%u bytes=%u "
+           "ntfy=%u wait=%u wait_max=%ums retry=%u read_err=%u last_err=%d "
+           "overrun=%u q_hi=%u\n",
+           reason,
+           (long long)session_ms,
+           (long long)dmic_ms,
+           audio_stats.frames_captured,
+           audio_stats.frames_sent,
+           audio_stats.bytes_sent,
+           audio_stats.notifies_sent,
+           audio_stats.notify_wait_count,
+           audio_stats.notify_wait_max_ms,
+           audio_stats.notify_retry_count,
+           audio_stats.dmic_read_errors,
+           (int)audio_stats.last_dmic_errno,
+           audio_stats.dmic_overruns,
+           audio_stats.queue_high_watermark);
+}
+
+static void audio_queue_purge(void)
+{
+    struct audio_pcm_frame drop;
+
+    while (k_msgq_get(&audio_frame_q, &drop, K_NO_WAIT) == 0) {
+    }
+}
+
+static void audio_queue_note_depth(void)
+{
+    uint32_t depth = (uint32_t)k_msgq_num_used_get(&audio_frame_q);
+
+    if (depth > audio_stats.queue_high_watermark) {
+        audio_stats.queue_high_watermark = depth;
+    }
+}
+
 static void audio_notify_complete(struct bt_conn *conn, void *user_data)
 {
     ARG_UNUSED(conn);
@@ -1697,11 +2004,39 @@ static void audio_notify_complete(struct bt_conn *conn, void *user_data)
     k_sem_give(&audio_notify_slots);
 }
 
-static int send_audio_notification(const uint8_t *data, uint16_t len)
+static int send_audio_notification_deadline(const uint8_t *data, uint16_t len,
+                                            int64_t deadline_ms)
 {
-    while (is_recording && !stop_requested) {
-        if (k_sem_take(&audio_notify_slots, K_MSEC(100)) != 0) {
+    while (k_uptime_get() < deadline_ms) {
+        if (!get_primary_conn()) {
+            return -ENOTCONN;
+        }
+
+        int64_t wait_start = k_uptime_get();
+        int64_t remaining_ms = deadline_ms - wait_start;
+        if (remaining_ms <= 0) {
+            break;
+        }
+        if (remaining_ms > 100) {
+            remaining_ms = 100;
+        }
+
+        if (k_sem_take(&audio_notify_slots, K_MSEC(remaining_ms)) != 0) {
+            uint32_t waited = (uint32_t)(k_uptime_get() - wait_start);
+
+            audio_stats.notify_wait_count++;
+            if (waited > audio_stats.notify_wait_max_ms) {
+                audio_stats.notify_wait_max_ms = waited;
+            }
             continue;
+        }
+
+        uint32_t waited = (uint32_t)(k_uptime_get() - wait_start);
+        if (waited > 0) {
+            audio_stats.notify_wait_count++;
+            if (waited > audio_stats.notify_wait_max_ms) {
+                audio_stats.notify_wait_max_ms = waited;
+            }
         }
 
         struct bt_conn *conn = get_primary_conn();
@@ -1719,6 +2054,7 @@ static int send_audio_notification(const uint8_t *data, uint16_t len)
         };
         int ret = bt_gatt_notify_cb(conn, &params);
         if (ret == 0) {
+            audio_stats.notifies_sent++;
             return 0;
         }
 
@@ -1726,7 +2062,22 @@ static int send_audio_notification(const uint8_t *data, uint16_t len)
         if (ret != -ENOMEM && ret != -EAGAIN) {
             return ret;
         }
+        audio_stats.notify_retry_count++;
         k_msleep(AUDIO_NOTIFY_RETRY_MS);
+    }
+
+    return -ECANCELED;
+}
+
+static int send_audio_notification(const uint8_t *data, uint16_t len)
+{
+    while (is_recording && !stop_requested) {
+        int ret = send_audio_notification_deadline(
+            data, len, k_uptime_get() + 100);
+        if (ret != -ECANCELED) {
+            return ret;
+        }
+        /* Still recording: keep trying through transient slot starvation. */
     }
 
     return -ECANCELED;
@@ -1758,7 +2109,8 @@ static bool drain_audio_notifications(void)
     return true;
 }
 
-static int stream_audio_frame(const int16_t *audio_buffer, size_t audio_size)
+static int stream_audio_frame_deadline(const uint8_t *pcm, size_t audio_size,
+                                       int64_t deadline_ms, bool use_deadline)
 {
     size_t total_samples = audio_size / sizeof(int16_t);
     size_t offset = 0;
@@ -1771,20 +2123,154 @@ static int stream_audio_frame(const int16_t *audio_buffer, size_t audio_size)
 
         tx_packet[0] = seq_num;
         tx_packet[1] = 0xAA;
-        memcpy(&tx_packet[2], &audio_buffer[offset],
+        memcpy(&tx_packet[2], &pcm[offset * sizeof(int16_t)],
                samples_to_send * sizeof(int16_t));
 
-        int ret = send_audio_notification(
-            tx_packet, 2 + (samples_to_send * sizeof(int16_t)));
+        int ret;
+        if (use_deadline) {
+            ret = send_audio_notification_deadline(
+                tx_packet, 2 + (samples_to_send * sizeof(int16_t)), deadline_ms);
+        } else {
+            ret = send_audio_notification(
+                tx_packet, 2 + (samples_to_send * sizeof(int16_t)));
+        }
         if (ret != 0) {
             return ret;
         }
 
         seq_num++;
         offset += samples_to_send;
+        audio_stats.bytes_sent += samples_to_send * sizeof(int16_t);
+    }
+
+    audio_stats.frames_sent++;
+    return 0;
+}
+
+static int stream_audio_frame(const uint8_t *pcm, size_t audio_size)
+{
+    return stream_audio_frame_deadline(pcm, audio_size, 0, false);
+}
+
+static int stream_queued_frames(bool blocking)
+{
+    struct audio_pcm_frame frame;
+    k_timeout_t timeout = blocking ? K_MSEC(20) : K_NO_WAIT;
+
+    while (is_recording && !stop_requested && get_primary_conn()) {
+        int get_ret = k_msgq_get(&audio_frame_q, &frame, timeout);
+        if (get_ret != 0) {
+            return 0;
+        }
+
+        int ret = stream_audio_frame(frame.pcm, frame.nbytes);
+        if (ret < 0 && ret != -ECANCELED && ret != -ENOTCONN) {
+            printk("Audio notify failed: %d\n", ret);
+            k_msleep(AUDIO_NOTIFY_RETRY_MS);
+        } else if (ret == -ENOTCONN || ret == -ECANCELED) {
+            return ret;
+        }
+
+        /* After the first frame, prefer draining without sleeping. */
+        timeout = K_NO_WAIT;
     }
 
     return 0;
+}
+
+static void drain_queued_frames_before_stop(void)
+{
+    struct audio_pcm_frame frame;
+    int64_t deadline = k_uptime_get() + AUDIO_QUEUE_DRAIN_TIMEOUT_MS;
+
+    while (k_uptime_get() < deadline) {
+        if (k_msgq_get(&audio_frame_q, &frame, K_MSEC(10)) != 0) {
+            if (k_msgq_num_used_get(&audio_frame_q) == 0) {
+                break;
+            }
+            continue;
+        }
+        if (!get_primary_conn()) {
+            break;
+        }
+        if (stream_audio_frame_deadline(frame.pcm, frame.nbytes,
+                                        deadline, true) != 0) {
+            break;
+        }
+    }
+
+    audio_queue_purge();
+}
+
+/*
+ * Dedicated capture path: always free DMIC blocks promptly by copying into the
+ * software queue. BLE Notify backpressure must never stall dmic_read().
+ */
+static void audio_capture_thread(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
+
+    int consec_fail = 0;
+
+    printk("Audio capture thread started\n");
+
+    while (1) {
+        if (!capture_enabled) {
+            consec_fail = 0;
+            k_msleep(5);
+            continue;
+        }
+
+        int16_t *audio_buffer = NULL;
+        size_t audio_size = 0;
+        int ret = audio_capture_get_data(&audio_buffer, &audio_size);
+        if (ret < 0) {
+            audio_stats.dmic_read_errors++;
+            audio_stats.last_dmic_errno = (uint32_t)(-ret);
+            consec_fail++;
+
+            /*
+             * Transient stalls are expected under radio contention. Only mark
+             * the capture path fatal after repeated failures; the sender keeps
+             * draining whatever was already queued.
+             */
+            if (consec_fail >= AUDIO_CAPTURE_MAX_CONSEC_FAIL) {
+                printk("Audio read failed: %d (giving up after %d errors)\n",
+                       ret, consec_fail);
+                if (audio_stats.dmic_stop_ms == 0) {
+                    audio_stats.dmic_stop_ms = k_uptime_get();
+                }
+                capture_fatal = true;
+                capture_enabled = false;
+                (void)audio_capture_stop();
+                consec_fail = 0;
+            }
+            continue;
+        }
+
+        consec_fail = 0;
+        if (audio_buffer == NULL || audio_size == 0) {
+            continue;
+        }
+
+        struct audio_pcm_frame frame;
+        size_t copy_len = audio_size;
+
+        if (copy_len > AUDIO_FRAME_BYTES) {
+            copy_len = AUDIO_FRAME_BYTES;
+        }
+        frame.nbytes = (uint16_t)copy_len;
+        memcpy(frame.pcm, audio_buffer, copy_len);
+        audio_stats.frames_captured++;
+
+        if (k_msgq_put(&audio_frame_q, &frame, K_NO_WAIT) != 0) {
+            audio_stats.dmic_overruns++;
+        } else {
+            audio_queue_note_depth();
+        }
+    }
 }
 
 static void audio_thread(void *p1, void *p2, void *p3)
@@ -1794,8 +2280,6 @@ static void audio_thread(void *p1, void *p2, void *p3)
     ARG_UNUSED(p3);
 
     int ret;
-    int16_t *audio_buffer;
-    size_t audio_size;
     bool dmic_available = false;
     bool dmic_session_active = false;
 
@@ -1813,7 +2297,10 @@ static void audio_thread(void *p1, void *p2, void *p3)
         if (recording_requested && !is_recording) {
             recording_requested = false;
             stop_requested = false;
+            capture_fatal = false;
             seq_num = 0;
+            audio_stats_reset();
+            audio_queue_purge();
 
             if (dmic_available) {
                 mic_power_on();
@@ -1822,8 +2309,10 @@ static void audio_thread(void *p1, void *p2, void *p3)
                     printk("Audio start failed: %d\n", ret);
                     mic_power_off();
                     dmic_session_active = false;
+                    capture_enabled = false;
                 } else {
                     dmic_session_active = true;
+                    capture_enabled = true;
                     printk("Audio capture running\n");
                 }
             }
@@ -1833,11 +2322,17 @@ static void audio_thread(void *p1, void *p2, void *p3)
             send_event_packet(0x01);
         }
 
-        if (stop_requested && is_recording) {
+        if ((stop_requested || capture_fatal) && is_recording) {
+            bool was_fatal = capture_fatal;
+
             stop_requested = false;
-            is_recording = false;
+            capture_fatal = false;
+            capture_enabled = false;
 
             if (dmic_session_active) {
+                if (audio_stats.dmic_stop_ms == 0) {
+                    audio_stats.dmic_stop_ms = k_uptime_get();
+                }
                 ret = audio_capture_stop();
                 if (ret < 0) {
                     printk("Audio stop failed: %d\n", ret);
@@ -1846,36 +2341,41 @@ static void audio_thread(void *p1, void *p2, void *p3)
                 dmic_session_active = false;
             }
 
+            /* Flush any frames captured before stop under light contention. */
+            drain_queued_frames_before_stop();
+            is_recording = false;
+
             /* Preserve ordering: all accepted PCM notifications must complete before stop. */
             (void)drain_audio_notifications();
-            printk("Recording stopped\n");
+            printk("Recording stopped%s\n", was_fatal ? " (capture fault)" : "");
+            audio_stats_print(was_fatal ? "fault" : "stop");
             send_event_packet(0x02);
             battery_update();
             last_activity_ms = k_uptime_get();   /* reset idle timer after recording */
+            continue;
         }
 
         if (is_recording && get_primary_conn()) {
-            if (dmic_session_active) {
-                ret = audio_capture_get_data(&audio_buffer, &audio_size);
-                if (ret < 0) {
-                    printk("Audio read failed: %d\n", ret);
-                    (void)audio_capture_stop();
-                    dmic_session_active = false;
-                    continue;
-                }
-                ret = stream_audio_frame(audio_buffer, audio_size);
-                if (ret < 0 && ret != -ECANCELED && ret != -ENOTCONN) {
-                    printk("Audio notify failed: %d\n", ret);
-                    k_msleep(AUDIO_NOTIFY_RETRY_MS);
-                }
-            }
+            (void)stream_queued_frames(true);
             continue;
         }
 
         if (!get_primary_conn() && dmic_session_active) {
+            capture_enabled = false;
+            if (audio_stats.dmic_stop_ms == 0) {
+                audio_stats.dmic_stop_ms = k_uptime_get();
+            }
             (void)audio_capture_stop();
             mic_power_off();
             dmic_session_active = false;
+            audio_queue_purge();
+            if (is_recording) {
+                is_recording = false;
+                (void)drain_audio_notifications();
+                printk("Recording stopped (disconnected)\n");
+                audio_stats_print("disconnect");
+                send_event_packet(0x02);
+            }
         }
 
         k_msleep(20);
@@ -2106,7 +2606,11 @@ int main(void)
     k_work_init_delayable(&adv_work, adv_work_handler);
     k_work_init_delayable(&conn_param_work, conn_param_work_handler);
 
-    /* Start audio thread (priority 14, below BLE stack) */
+    /* Capture runs above sender so DMIC blocks are freed under BLE backpressure. */
+    k_thread_create(&audio_capture_thread_data, audio_capture_stack,
+                    K_THREAD_STACK_SIZEOF(audio_capture_stack),
+                    audio_capture_thread, NULL, NULL, NULL, 13, 0, K_NO_WAIT);
+    /* Sender/control thread (priority 14, below BLE stack) */
     k_thread_create(&audio_thread_data, audio_stack, K_THREAD_STACK_SIZEOF(audio_stack),
                     audio_thread, NULL, NULL, NULL, 14, 0, K_NO_WAIT);
 

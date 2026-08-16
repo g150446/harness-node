@@ -32,8 +32,12 @@ LOG_MODULE_REGISTER(audio_capture, LOG_LEVEL_INF);
 #define FRAME_SAMPLES       (SAMPLE_RATE * FRAME_MS / 1000)
 #define FRAME_BYTES         (FRAME_SAMPLES * BYTES_PER_SAMPLE * CHANNELS)
 
-/* Memory slab for DMIC driver buffers */
-#define BLOCK_COUNT         4
+/*
+ * DMIC driver slab. Keep well above one BLE backpressure stall so the PDM
+ * DMA path can continue while the sender thread drains Notify slots.
+ * 12 × 20 ms = 240 ms of hardware buffering.
+ */
+#define BLOCK_COUNT         12
 K_MEM_SLAB_DEFINE_STATIC(pdm_mem_slab, FRAME_BYTES, BLOCK_COUNT, 4);
 
 /* ============================================================================
