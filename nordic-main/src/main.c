@@ -107,47 +107,49 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 /*
  * Volar-side gesture classifier.
  *
- * The board is mounted with X across the forearm, Y along the forearm and the
- * component-side Z axis normal to the palm.  The gesture starts palm-up and
- * horizontal, pronates about the forearm while staying horizontal (±10°), then
- * reverses through flexion + supination into a vertical final hold.  Relative
- * roll signs keep the sequence independent of hand and USB direction.
+ * Board axes: X across forearm, Y along forearm (pronation/supination axis),
+ * Z normal to the palm.  Sequence: palm-up start → gyro_y pronation →
+ * immediate opposite gyro_y supination → forearm vertical (±20°) hold.
+ * Relative roll signs keep the sequence independent of hand/USB direction.
  */
 #define GESTURE_GRAVITY_MS2                  9.80665f
 #define GESTURE_RAD_TO_DEG                   57.29577951308232
-#define GESTURE_QUIET_RATE_DPS               19.0f
-#define GESTURE_QUIET_HOLD_MS                200
+#define GESTURE_QUIET_RATE_DPS               70.0f
+#define GESTURE_QUIET_HOLD_MS                120
 #define GESTURE_START_ARM_MS                1000
 #define GESTURE_PALM_UP_Z_SIGN                 1.0f
 #define GESTURE_START_PALM_UP_Z_MIN_RATIO       0.90f
-#define GESTURE_START_Y_MAX_RATIO               0.17f  /* ~sin(10°) */
-#define GESTURE_HORIZONTAL_Y_MAX_RATIO          0.17f  /* outbound forearm level */
+#define GESTURE_START_Y_MAX_RATIO               0.30f  /* ~sin(17.5°) start pose */
 #define GESTURE_ROLL_START_RATE_DPS             35.0f
-#define GESTURE_TRANSVERSE_START_RATE_DPS       35.0f
-#define GESTURE_TRANSVERSE_PEAK_MIN_DPS         50.0f
-#define GESTURE_TRANSVERSE_ANGLE_MIN_DEG        60.0f
-#define GESTURE_ACCEL_EVIDENCE_MIN_MS2           0.5f
+#define GESTURE_SUPINATE_START_RATE_DPS         12.0f  /* reverse after pronation */
+#define GESTURE_MOTION_GYRO_ACTIVE_DPS          35.0f
 #define GESTURE_PHASE_MIN_DURATION_MS           180
 #define GESTURE_OUTBOUND_MAX_DURATION_MS       2000
-#define GESTURE_RETURN_MAX_DURATION_MS         2500
+#define GESTURE_RETURN_MAX_DURATION_MS         2000
 #define GESTURE_INCOMPLETE_SETTLE_MS            350
-#define GESTURE_ROLL_INTEGRATE_RATE_DPS         20.0f
-#define GESTURE_ROLL_ANGLE_MIN_DEG              30.0f
-#define GESTURE_ROLL_PEAK_MIN_DPS               55.0f
-#define GESTURE_FINAL_Y_MIN_RATIO                0.94f
-#define GESTURE_TURNAROUND_RATE_DPS              25.0f
-#define GESTURE_TURNAROUND_TIMEOUT_MS             750
+#define GESTURE_ROLL_INTEGRATE_RATE_DPS         15.0f
+#define GESTURE_ROLL_ANGLE_MIN_DEG              30.0f  /* pronation only */
+#define GESTURE_ROLL_PEAK_MIN_DPS               40.0f  /* pronation peak */
+#define GESTURE_FINAL_Y_MIN_RATIO                0.94f  /* vertical ±~20° */
+#define GESTURE_TURNAROUND_TIMEOUT_MS            1500
 #define GESTURE_FINAL_HOLD_MS                     500
 #define GESTURE_FINAL_HOLD_TIMEOUT_MS            1500
-#define GESTURE_FINAL_QUIET_RATE_DPS              19.0f
-#define GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2         1.2f
+#define GESTURE_FINAL_QUIET_RATE_DPS              50.0f
+#define GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2         2.2f
 #define GESTURE_SEQUENCE_TIMEOUT_MS              5000
 #define GESTURE_RETRIGGER_BLOCK_MS           1200
+/* Distance estimator retained for other motion metrics / future use. */
 #define GESTURE_DISTANCE_MIN_M                 0.05f
 #define GESTURE_EFFECTIVE_ARM_LENGTH_M         0.15f
 #define GESTURE_DISTANCE_ACCEL_ARC_CAP          1.5f
 #define GESTURE_DISTANCE_LP_TAU_S               0.55f
 #define GESTURE_DISTANCE_MAX_SAMPLES             120
+
+/* Set to 1 only for debug OTA builds that stream gyro_y over BLE. */
+#ifndef GESTURE_DEBUG_GYRO_Y
+#define GESTURE_DEBUG_GYRO_Y                      1
+#endif
+#define GESTURE_DEBUG_GYRO_Y_PERIOD_MS           50
 
 /* BLE gesture diagnostics: event 0x30, stage/reason + three float values. */
 #define GESTURE_DIAG_OUTBOUND_START           0x01
@@ -160,6 +162,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_DIAG_FINAL_READY              0x08
 #define GESTURE_DIAG_MATCH                    0x09
 #define GESTURE_DIAG_GYRO_BIAS_READY          0x0a
+#define GESTURE_DIAG_GYRO_Y_SAMPLE            0x20
 #define GESTURE_DIAG_WAIT_REJECT               0x10
 #define GESTURE_DIAG_RESET                     0x80
 
@@ -171,10 +174,8 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_DIAG_REASON_INCOMPLETE_OUTBOUND 0x12
 #define GESTURE_DIAG_REASON_TURNAROUND_TIMEOUT 0x13
 #define GESTURE_DIAG_REASON_WRONG_ROLL_DIRECTION 0x14
-#define GESTURE_DIAG_REASON_HORIZONTAL_LOST    0x15
 #define GESTURE_DIAG_REASON_RETURN_TIMEOUT     0x16
 #define GESTURE_DIAG_REASON_INCOMPLETE_RETURN  0x17
-#define GESTURE_DIAG_REASON_DISTANCE_TOO_SHORT 0x18
 #define GESTURE_DIAG_REASON_FINAL_Y_NOT_REACHED 0x19
 #define GESTURE_DIAG_REASON_FINAL_HOLD_INTERRUPTED 0x1a
 #define GESTURE_DIAG_REASON_FINAL_HOLD_TIMEOUT 0x1b
@@ -366,15 +367,16 @@ static float gesture_lead_roll_angle_deg;
 static float gesture_lead_roll_peak_dps;
 static float gesture_outbound_roll_angle_deg;
 static float gesture_outbound_roll_peak_dps;
-static float gesture_outbound_max_abs_y_ratio;
 static bool gesture_outbound_qualified;
 static bool gesture_turnaround_seen;
-static float gesture_return_angle_x_deg, gesture_return_angle_z_deg;
-static float gesture_return_peak_rate_dps;
-static float gesture_return_accel_evidence_ms2;
 static float gesture_return_roll_angle_deg;
 static float gesture_return_roll_peak_dps;
 static bool gesture_return_qualified;
+#if GESTURE_DEBUG_GYRO_Y
+static int64_t gesture_debug_gyro_last_ms;
+static float gesture_turnaround_max_pos_gy_dps;
+static float gesture_turnaround_min_neg_gy_dps;
+#endif
 static float gesture_orientation_w, gesture_orientation_x;
 static float gesture_orientation_y, gesture_orientation_z;
 static float gesture_world_accel_lp_x, gesture_world_accel_lp_y;
@@ -1165,26 +1167,53 @@ static void reset_gesture_sequence(void)
     gesture_lead_roll_peak_dps = 0.0f;
     gesture_outbound_roll_angle_deg = 0.0f;
     gesture_outbound_roll_peak_dps = 0.0f;
-    gesture_outbound_max_abs_y_ratio = 0.0f;
     gesture_outbound_qualified = false;
     gesture_turnaround_seen = false;
-    gesture_return_angle_x_deg = 0.0f;
-    gesture_return_angle_z_deg = 0.0f;
-    gesture_return_peak_rate_dps = 0.0f;
-    gesture_return_accel_evidence_ms2 = 0.0f;
     gesture_return_roll_angle_deg = 0.0f;
     gesture_return_roll_peak_dps = 0.0f;
     gesture_return_qualified = false;
+#if GESTURE_DEBUG_GYRO_Y
+    gesture_debug_gyro_last_ms = 0;
+    gesture_turnaround_max_pos_gy_dps = 0.0f;
+    gesture_turnaround_min_neg_gy_dps = 0.0f;
+#endif
     reset_gesture_distance();
     gesture_armed_until_ms = 0;
 }
 
-static float gesture_transverse_angle_deg(float angle_x_deg,
-                                          float angle_z_deg)
+#if GESTURE_DEBUG_GYRO_Y
+static void maybe_send_debug_gyro_y(float gy_dps, float y_ratio, int64_t now)
 {
-    return sqrtf(angle_x_deg * angle_x_deg +
-                 angle_z_deg * angle_z_deg);
+    if (gesture_phase != GESTURE_OUTBOUND &&
+        gesture_phase != GESTURE_TURNAROUND &&
+        gesture_phase != GESTURE_RETURNING) {
+        return;
+    }
+    if (gesture_sequence_start_ms <= 0) {
+        return;
+    }
+    if (gesture_debug_gyro_last_ms > 0 &&
+        (now - gesture_debug_gyro_last_ms) < GESTURE_DEBUG_GYRO_Y_PERIOD_MS) {
+        return;
+    }
+    gesture_debug_gyro_last_ms = now;
+    send_gesture_diag(GESTURE_DIAG_GYRO_Y_SAMPLE,
+                      GESTURE_DIAG_REASON_NONE,
+                      gy_dps,
+                      y_ratio,
+                      (float)(now - gesture_sequence_start_ms));
 }
+
+static void note_turnaround_gyro_y(float gy_dps)
+{
+    if (gy_dps > gesture_turnaround_max_pos_gy_dps) {
+        gesture_turnaround_max_pos_gy_dps = gy_dps;
+    }
+    if (gy_dps < gesture_turnaround_min_neg_gy_dps) {
+        gesture_turnaround_min_neg_gy_dps = gy_dps;
+    }
+}
+#endif
 
 static void accumulate_gesture_roll(float *angle_deg, float *peak_dps,
                                     float gy_dps, float dt_s)
@@ -1226,9 +1255,7 @@ static void process_gesture_sample(float ax, float ay, float az,
     gz_dps -= (float)gyro_bias_z_dps;
 
     float gyro_norm = vector_norm3(gx_dps, gy_dps, gz_dps);
-    float transverse_rate = sqrtf(gx_dps * gx_dps + gz_dps * gz_dps);
     float accel_norm = vector_norm3(ax, ay, az);
-    float accel_dynamic = fabsf(accel_norm - GESTURE_GRAVITY_MS2);
     float y_gravity_ratio = accel_norm > 0.1f ? ay / accel_norm : 0.0f;
     float z_gravity_ratio = accel_norm > 0.1f ? az / accel_norm : 0.0f;
     float palm_up_z_ratio = z_gravity_ratio * GESTURE_PALM_UP_Z_SIGN;
@@ -1311,7 +1338,6 @@ static void process_gesture_sample(float ax, float ay, float az,
             if (roll_rate > gesture_outbound_roll_peak_dps) {
                 gesture_outbound_roll_peak_dps = roll_rate;
             }
-            gesture_outbound_max_abs_y_ratio = fabsf(y_gravity_ratio);
             gesture_outbound_qualified = false;
             gesture_quiet_since_ms = 0;
             gesture_armed_until_ms = 0;
@@ -1345,21 +1371,9 @@ static void process_gesture_sample(float ax, float ay, float az,
 
     if (gesture_phase == GESTURE_OUTBOUND) {
         int64_t elapsed_ms = now - gesture_phase_start_ms;
-        float abs_y = fabsf(y_gravity_ratio);
-        if (abs_y > gesture_outbound_max_abs_y_ratio) {
-            gesture_outbound_max_abs_y_ratio = abs_y;
-        }
-
-        if (abs_y > GESTURE_HORIZONTAL_Y_MAX_RATIO) {
-            send_gesture_diag(GESTURE_DIAG_RESET,
-                              GESTURE_DIAG_REASON_HORIZONTAL_LOST,
-                              gesture_outbound_roll_angle_deg,
-                              gesture_outbound_roll_peak_dps,
-                              y_gravity_ratio);
-            reset_gesture_sequence();
-            gesture_quiet_since_ms = 0;
-            return;
-        }
+#if GESTURE_DEBUG_GYRO_Y
+        maybe_send_debug_gyro_y(gy_dps, y_gravity_ratio, now);
+#endif
 
         accumulate_gesture_roll(&gesture_outbound_roll_angle_deg,
                                 &gesture_outbound_roll_peak_dps,
@@ -1369,23 +1383,25 @@ static void process_gesture_sample(float ax, float ay, float az,
             elapsed_ms >= GESTURE_PHASE_MIN_DURATION_MS &&
             fabsf(gesture_outbound_roll_angle_deg) >=
                 GESTURE_ROLL_ANGLE_MIN_DEG &&
-            gesture_outbound_roll_peak_dps >= GESTURE_ROLL_PEAK_MIN_DPS &&
-            gesture_outbound_max_abs_y_ratio <=
-                GESTURE_HORIZONTAL_Y_MAX_RATIO;
+            gesture_outbound_roll_peak_dps >= GESTURE_ROLL_PEAK_MIN_DPS;
 
         if (gesture_outbound_qualified) {
             gesture_phase = GESTURE_TURNAROUND;
             gesture_phase_start_ms = now;
+            gesture_turnaround_seen = false;
             gesture_quiet_since_ms = 0;
-            printk(">>> Gesture outbound ready: roll=%.1f peak=%.1f max|y|=%.2f\n",
+#if GESTURE_DEBUG_GYRO_Y
+            gesture_turnaround_max_pos_gy_dps = 0.0f;
+            gesture_turnaround_min_neg_gy_dps = 0.0f;
+#endif
+            printk(">>> Gesture outbound ready: roll=%.1f peak=%.1f\n",
                    (double)gesture_outbound_roll_angle_deg,
-                   (double)gesture_outbound_roll_peak_dps,
-                   (double)gesture_outbound_max_abs_y_ratio);
+                   (double)gesture_outbound_roll_peak_dps);
             send_gesture_diag(GESTURE_DIAG_OUTBOUND_READY,
                               GESTURE_DIAG_REASON_NONE,
                               gesture_outbound_roll_angle_deg,
                               gesture_outbound_roll_peak_dps,
-                              gesture_outbound_max_abs_y_ratio);
+                              y_gravity_ratio);
             return;
         }
 
@@ -1394,7 +1410,7 @@ static void process_gesture_sample(float ax, float ay, float az,
                               GESTURE_DIAG_REASON_OUTBOUND_TIMEOUT,
                               gesture_outbound_roll_angle_deg,
                               gesture_outbound_roll_peak_dps,
-                              gesture_outbound_max_abs_y_ratio);
+                              y_gravity_ratio);
             reset_gesture_sequence();
             gesture_quiet_since_ms = 0;
             return;
@@ -1409,7 +1425,7 @@ static void process_gesture_sample(float ax, float ay, float az,
                                   GESTURE_DIAG_REASON_INCOMPLETE_OUTBOUND,
                                   gesture_outbound_roll_angle_deg,
                                   gesture_outbound_roll_peak_dps,
-                                  gesture_outbound_max_abs_y_ratio);
+                                  y_gravity_ratio);
                 reset_gesture_sequence();
             }
         } else {
@@ -1420,54 +1436,50 @@ static void process_gesture_sample(float ax, float ay, float az,
 
     if (gesture_phase == GESTURE_TURNAROUND) {
         int64_t elapsed_ms = now - gesture_phase_start_ms;
-        bool transverse_quiet =
-            transverse_rate <= GESTURE_TURNAROUND_RATE_DPS &&
-            fabsf(gy_dps) <= GESTURE_TURNAROUND_RATE_DPS;
+#if GESTURE_DEBUG_GYRO_Y
+        maybe_send_debug_gyro_y(gy_dps, y_gravity_ratio, now);
+        note_turnaround_gyro_y(gy_dps);
+#endif
         bool roll_reversing =
-            fabsf(gy_dps) >= GESTURE_ROLL_INTEGRATE_RATE_DPS &&
+            fabsf(gy_dps) >= GESTURE_SUPINATE_START_RATE_DPS &&
             gesture_outbound_roll_angle_deg * gy_dps < 0.0f;
 
-        if (!gesture_turnaround_seen &&
-            (transverse_quiet || roll_reversing)) {
+        if (!gesture_turnaround_seen && roll_reversing) {
             gesture_turnaround_seen = true;
             send_gesture_diag(GESTURE_DIAG_TURNAROUND_READY,
                               GESTURE_DIAG_REASON_NONE,
-                              (float)elapsed_ms, y_gravity_ratio, gyro_norm);
+                              (float)elapsed_ms, gy_dps, y_gravity_ratio);
         }
 
-        if (gesture_turnaround_seen &&
-            transverse_rate >= GESTURE_TRANSVERSE_START_RATE_DPS) {
+        if (roll_reversing) {
             gesture_phase = GESTURE_RETURNING;
             gesture_phase_start_ms = now;
-            gesture_start_accel_x = ax;
-            gesture_start_accel_y = ay;
-            gesture_start_accel_z = az;
-            gesture_return_angle_x_deg = gx_dps * dt_s;
-            gesture_return_angle_z_deg = gz_dps * dt_s;
-            gesture_return_peak_rate_dps = transverse_rate;
-            gesture_return_accel_evidence_ms2 = accel_dynamic;
             gesture_return_roll_angle_deg = 0.0f;
             gesture_return_roll_peak_dps = 0.0f;
             accumulate_gesture_roll(&gesture_return_roll_angle_deg,
                                     &gesture_return_roll_peak_dps,
                                     gy_dps, dt_s);
             gesture_return_qualified = false;
-            reset_gesture_distance();
-            update_gesture_distance(ax, ay, az,
-                                    gx_dps, gy_dps, gz_dps,
-                                    dt_s, true);
             gesture_quiet_since_ms = 0;
             send_gesture_diag(GESTURE_DIAG_RETURN_START,
                               GESTURE_DIAG_REASON_NONE,
-                              transverse_rate, gy_dps,
+                              fabsf(gy_dps), gy_dps,
                               gesture_outbound_roll_angle_deg);
             return;
         }
 
         if (elapsed_ms > GESTURE_TURNAROUND_TIMEOUT_MS) {
+#if GESTURE_DEBUG_GYRO_Y
+            send_gesture_diag(GESTURE_DIAG_RESET,
+                              GESTURE_DIAG_REASON_TURNAROUND_TIMEOUT,
+                              (float)elapsed_ms,
+                              gesture_turnaround_max_pos_gy_dps,
+                              gesture_turnaround_min_neg_gy_dps);
+#else
             send_gesture_diag(GESTURE_DIAG_RESET,
                               GESTURE_DIAG_REASON_TURNAROUND_TIMEOUT,
                               (float)elapsed_ms, y_gravity_ratio, gyro_norm);
+#endif
             reset_gesture_sequence();
             gesture_quiet_since_ms = 0;
         }
@@ -1476,68 +1488,29 @@ static void process_gesture_sample(float ax, float ay, float az,
 
     if (gesture_phase == GESTURE_RETURNING) {
         int64_t elapsed_ms = now - gesture_phase_start_ms;
-        float accel_from_start = vector_norm3(ax - gesture_start_accel_x,
-                                              ay - gesture_start_accel_y,
-                                              az - gesture_start_accel_z);
-        float accel_evidence = fmaxf(accel_dynamic, accel_from_start);
-        if (accel_evidence > gesture_return_accel_evidence_ms2) {
-            gesture_return_accel_evidence_ms2 = accel_evidence;
-        }
+#if GESTURE_DEBUG_GYRO_Y
+        maybe_send_debug_gyro_y(gy_dps, y_gravity_ratio, now);
+#endif
 
-        gesture_return_angle_x_deg += gx_dps * dt_s;
-        gesture_return_angle_z_deg += gz_dps * dt_s;
-        if (transverse_rate > gesture_return_peak_rate_dps) {
-            gesture_return_peak_rate_dps = transverse_rate;
-        }
         accumulate_gesture_roll(&gesture_return_roll_angle_deg,
                                 &gesture_return_roll_peak_dps,
                                 gy_dps, dt_s);
-        update_gesture_distance(ax, ay, az,
-                                gx_dps, gy_dps, gz_dps,
-                                dt_s, true);
 
-        float angle_deg = gesture_transverse_angle_deg(
-            gesture_return_angle_x_deg, gesture_return_angle_z_deg);
-        bool roll_opposite =
-            gesture_outbound_roll_angle_deg *
-                gesture_return_roll_angle_deg < 0.0f;
+        /* Supination start already proved opposite gyro_y; no min integral. */
         bool final_y_reached =
             fabsf(y_gravity_ratio) >= GESTURE_FINAL_Y_MIN_RATIO;
 
         gesture_return_qualified =
             elapsed_ms >= GESTURE_PHASE_MIN_DURATION_MS &&
-            angle_deg >= GESTURE_TRANSVERSE_ANGLE_MIN_DEG &&
-            gesture_return_peak_rate_dps >=
-                GESTURE_TRANSVERSE_PEAK_MIN_DPS &&
-            gesture_return_accel_evidence_ms2 >=
-                GESTURE_ACCEL_EVIDENCE_MIN_MS2 &&
-            fabsf(gesture_return_roll_angle_deg) >=
-                GESTURE_ROLL_ANGLE_MIN_DEG &&
-            gesture_return_roll_peak_dps >= GESTURE_ROLL_PEAK_MIN_DPS &&
-            roll_opposite && final_y_reached;
+            final_y_reached;
 
         if (gesture_return_qualified &&
             gyro_norm <= GESTURE_FINAL_QUIET_RATE_DPS) {
-            finalize_gesture_distance(angle_deg);
             send_gesture_diag(GESTURE_DIAG_RETURN_READY,
                               GESTURE_DIAG_REASON_NONE,
-                              angle_deg, gesture_return_roll_angle_deg,
-                              gesture_return_accel_evidence_ms2);
-            send_gesture_diag(GESTURE_DIAG_DISTANCE_READY,
-                              GESTURE_DIAG_REASON_NONE,
-                              gesture_fused_distance_m * 100.0f,
-                              gesture_accel_distance_m * 100.0f,
-                              gesture_arc_distance_m * 100.0f);
-            if (gesture_fused_distance_m < GESTURE_DISTANCE_MIN_M) {
-                send_gesture_diag(GESTURE_DIAG_RESET,
-                                  GESTURE_DIAG_REASON_DISTANCE_TOO_SHORT,
-                                  gesture_fused_distance_m * 100.0f,
-                                  gesture_accel_distance_m * 100.0f,
-                                  gesture_arc_distance_m * 100.0f);
-                reset_gesture_sequence();
-                gesture_quiet_since_ms = 0;
-                return;
-            }
+                              gesture_return_roll_angle_deg,
+                              gesture_return_roll_peak_dps,
+                              y_gravity_ratio);
 
             gesture_phase = GESTURE_HOLDING_FINAL;
             gesture_phase_start_ms = now;
@@ -1551,13 +1524,12 @@ static void process_gesture_sample(float ax, float ay, float az,
         }
 
         if (elapsed_ms > GESTURE_RETURN_MAX_DURATION_MS) {
-            uint8_t reason = !roll_opposite
-                                 ? GESTURE_DIAG_REASON_WRONG_ROLL_DIRECTION
-                                 : (!final_y_reached
-                                        ? GESTURE_DIAG_REASON_FINAL_Y_NOT_REACHED
-                                        : GESTURE_DIAG_REASON_RETURN_TIMEOUT);
+            uint8_t reason = !final_y_reached
+                                 ? GESTURE_DIAG_REASON_FINAL_Y_NOT_REACHED
+                                 : GESTURE_DIAG_REASON_RETURN_TIMEOUT;
             send_gesture_diag(GESTURE_DIAG_RESET, reason,
-                              angle_deg, gesture_return_roll_angle_deg,
+                              gesture_return_roll_angle_deg,
+                              gesture_return_roll_peak_dps,
                               y_gravity_ratio);
             reset_gesture_sequence();
             gesture_quiet_since_ms = 0;
@@ -1572,8 +1544,8 @@ static void process_gesture_sample(float ax, float ay, float az,
                        GESTURE_INCOMPLETE_SETTLE_MS) {
                 send_gesture_diag(GESTURE_DIAG_RESET,
                                   GESTURE_DIAG_REASON_INCOMPLETE_RETURN,
-                                  angle_deg,
                                   gesture_return_roll_angle_deg,
+                                  gesture_return_roll_peak_dps,
                                   y_gravity_ratio);
                 reset_gesture_sequence();
             }
@@ -1582,10 +1554,6 @@ static void process_gesture_sample(float ax, float ay, float az,
         }
         return;
     }
-
-    update_gesture_distance(ax, ay, az,
-                            gx_dps, gy_dps, gz_dps,
-                            dt_s, false);
 
     bool final_pose =
         fabsf(y_gravity_ratio) >= GESTURE_FINAL_Y_MIN_RATIO;
@@ -1607,13 +1575,13 @@ static void process_gesture_sample(float ax, float ay, float az,
         if (hold_ms >= GESTURE_FINAL_HOLD_MS) {
             float tilt_deg = acosf(fminf(1.0f, fabsf(y_gravity_ratio))) *
                              (float)GESTURE_RAD_TO_DEG;
-            printk(">>> Gesture MATCH: horizontal pronation, return flexion/supination, final hold\n");
+            printk(">>> Gesture MATCH: pronation, supination, vertical hold\n");
             send_gesture_diag(GESTURE_DIAG_FINAL_READY,
                               GESTURE_DIAG_REASON_NONE,
                               y_gravity_ratio, (float)hold_ms, tilt_deg);
             send_gesture_diag(GESTURE_DIAG_MATCH,
                               GESTURE_DIAG_REASON_NONE,
-                              gesture_fused_distance_m * 100.0f,
+                              gesture_outbound_roll_angle_deg,
                               y_gravity_ratio, (float)hold_ms);
             recording_requested = true;
             gesture_block_until_ms = now + GESTURE_RETRIGGER_BLOCK_MS;
@@ -1741,7 +1709,7 @@ static void process_motion_sample(void)
     if (!motion_active) {
         bool accel_active = activity >= MOTION_ENTRY_ACTIVITY_MS2 &&
                             peak >= MOTION_ENTRY_PEAK_MS2;
-        bool gyro_active = gyro_norm >= GESTURE_TRANSVERSE_START_RATE_DPS;
+        bool gyro_active = gyro_norm >= GESTURE_MOTION_GYRO_ACTIVE_DPS;
         if (accel_active || gyro_active) {
             active_high_count++;
         } else {
