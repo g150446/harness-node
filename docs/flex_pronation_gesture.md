@@ -1,149 +1,102 @@
-# 回内→直後回外→垂直静止ジェスチャー仕様
+# 回内→上昇→静止ジェスチャー仕様
 
-対象デバイス: Seeed Studio XIAO nRF52840 Sense
-対象ファームウェア: HarnessNode `0.0.33` 以降
+対象デバイス: Seeed Studio XIAO nRF52840 Sense  
+対象ファームウェア: HarnessNode `0.0.41` 以降
 
 ## 発動条件
 
-- XIAO をリストバンドの手首・前腕の内側（掌側）へ置く
+- XIAO をリストバンドの**手の甲側**に置く
 - 部品面を皮膚側にし、基板 X 軸を前腕と直交、Y 軸を前腕に沿わせる
-- 手のひらを上向き水平にし、120 ms 以上静止する（角速度 70°/s 以下）
+- 手のひらを上向きにし、120 ms 以上静止する（角速度 70°/s 以下）
+  - 掌上は補正 Z 比 ≥ 0.90 のみ（開始時の |Y| 上限は設けない。車載の横 G を許容）
 - 静止成立後 1 秒以内に、前腕軸まわり（`gyro_y`）で回内する
-- 回内成立後 1500 ms 以内に、逆符号の `gyro_y`（|gyro_y| ≥ 10°/s）で回外を開始する
-- 回外開始後、前腕を地面に対して垂直から約 20°以内にする
-- 最終姿勢で 500 ms 連続静止すると録音を開始する
+- 回内後、重力に逆らって手を上げる（物理目安 **約 5 cm 以上**）
+- 上げた位置で **500 ms** 静止する（線形加速度 ≤ 3.0 m/s²。最終静止に角速度は使わない）
 
-右手・左手および USB 向きの差は、回内と回外の相対符号で吸収する。
-肘屈曲角・5 cm 距離・往路の Y 重力維持は要求しない。回外の積分角も不要
-（逆符号 `gyro_y` の開始検出のみ）。
+右手・左手および USB 向きの差は、回内の相対符号で吸収する。  
+最終姿勢の仰角帯・甲上条件・回外は要求しない。
 
-## 装着条件とセンサー軸
+## 装着と軸
 
-| 軸 | XIAO 基板上の方向 | 判定での役割 |
+| 軸 | 基板上 | 役割 |
 |---|---|---|
-| `X` | 基板長手方向、USB 端子から離れる方向 | 前腕を横切る |
-| `Y` | 基板短い辺に平行（5V/GND/3V 側） | **前腕に沿う＝回内・回外軸**（`gyro_y`） |
-| `Z` | 基板・部品面に垂直 | 手のひら上向き水平の開始姿勢 |
+| `X` | 長手（USB から離れる） | 前腕を横切る |
+| `Y` | 短い辺方向（5V/GND 側） | 前腕軸＝回内軸（`gyro_y`） |
+| `Z` | 部品面外向き | 掌上開始判定 |
 
-部品面が皮膚側の場合、掌上水平の静止値は `GESTURE_PALM_UP_Z_SIGN = +1` 前提。
-反対ならこの定数だけを `-1` へ変更する。
-
-## 姿勢と回転の判定
+実測（甲側・部品面皮膚）: 掌上で raw `z` は**負**。  
+このため `GESTURE_PALM_UP_Z_SIGN = -1`。
 
 ```text
-y_ratio = accel_y / |a|
-z_ratio = accel_z / |a|
-palm_up_z_ratio = z_ratio * GESTURE_PALM_UP_Z_SIGN
-roll_angle = integral(gyro_y)  // |gyro_y| >= GESTURE_ROLL_INTEGRATE_RATE_DPS（回内）
+palm_up_z_ratio = z_ratio * (-1)
 ```
 
-開始姿勢:
+- 掌上: `palm_up_z_ratio` が大きく正
 
-```text
-palm_up_z_ratio >= 0.90
-abs(y_ratio) <= 0.30
-```
+## 上昇量の測り方（IMU 換算）
 
-最終姿勢（垂直 ±約 20°）:
+回内完了後:
 
-```text
-abs(y_ratio) >= 0.94
-```
+1. 角速度が落ちるまで短い整定待ち（約 80 ms）
+2. その時点の重力方向（低通した世界座標加速度）を基準として固定
+3. 線形加速度を「重力の逆方向」へ投影し、動作中のみ二重積分
+4. **ピーク上昇量（cm）** が閾値以上なら上昇成立
+
+しきい値 `GESTURE_FINAL_LIFT_MIN_CM = 2.5` は **IMU 積分 cm**。  
+短時間積分のため物理変位より小さめに出る。実機では物理約 5 cm 以上の明確な上昇で、ピークが 2.5 cm を超えることを確認済み（例: 29 cm ピークで PASS）。
 
 ## 状態遷移
 
-```mermaid
-stateDiagram-v2
-    [*] --> 掌上水平待機
-    掌上水平待機 --> 回内: 120 ms静止後、|gyro_y| 35°/s以上
-    回内 --> 回外待ち: 回内角30°以上・peak40°/s以上
-    回内 --> 掌上水平待機: 不完全／2秒超過
-    回外待ち --> 回外: 逆符号 |gyro_y| 10°/s以上
-    回外待ち --> 掌上水平待機: 1500 ms超過
-    回外 --> 垂直保持: 垂直到達かつ静止（最短180 ms）
-    回外 --> 掌上水平待機: 不完全／2秒超過
-    垂直保持 --> 録音開始: 垂直かつ静止を500 ms
-    垂直保持 --> 掌上水平待機: 1.5秒以内に未成立
+```text
+WAITING → OUTBOUND(回内) → HOLDING_FINAL(上昇積分 → 静止保持)
 ```
 
-シーケンス全体は開始から 5 秒で打ち切る。録音開始後 1200 ms は再トリガ抑制。
-
-## しきい値一覧
+## しきい値
 
 | 項目 | 値 |
 |---|---:|
-| 開始補正 Z 比 | 0.90 以上 |
-| 開始 Y 比絶対値 | 0.30 以下 |
-| 開始前静止 | 角速度 70°/s 以下を 120 ms |
-| 回内開始 \|gyro_y\| | 35°/s 以上 |
-| 回内積分角 | 30° 以上 |
-| 回内ピーク | 40°/s 以上 |
-| 回外開始 \|gyro_y\| | 10°/s 以上・回内と逆符号 |
-| 回外積分角 | **不要** |
-| 回外開始期限（回内後） | 1500 ms |
-| 回内／回外最長 | 各 2000 ms |
-| 最終 Y 比 | 0.94 以上（垂直 ±約 20°） |
-| 最終静止 | 角速度 70°/s 以下、線形加速度 3.0 m/s² 以下を 500 ms |
-| 全シーケンス期限 | 5000 ms |
+| 開始補正 Z | ≥ 0.90 |
+| 開始 \|Y\| | **なし**（撤廃） |
+| 開始静止 | ≤ 70°/s を 120 ms |
+| 回内開始 \|gyro_y\| | ≥ 25°/s |
+| 回内積分 / ピーク | ≥ 15° / ≥ 30°/s |
+| 上昇アーム整定 | gyro ≤ 80°/s を 80 ms |
+| 上昇 IMU 換算下限 | ≥ 2.5 cm（ピーク） |
+| 最終静止 | 線形加速度 ≤ 3.0 m/s² を 500 ms |
+| 最終到達期限 | 回内後 3000 ms |
+| 全シーケンス | 5000 ms |
 
-定数の正本は `nordic-main/src/main.c` の `GESTURE_*` 定義である。
+## 診断イベント（抜粋）
 
-## BLE 診断（0x30）
-
-| stage | 名前 | value1 / value2 / value3 |
-|---:|---|---|
-| `0x01` | `outbound_start` | 回内開始角速度 / 補正 Z 比 / 開始 Y 比 |
-| `0x02` | `outbound_ready` | 回内積分角 / 回内ピーク / Y 比 |
-| `0x03` | `turnaround_ready` | 経過 ms / gyro_y / Y 比 |
-| `0x04` | `return_start` | \|gyro_y\| / gyro_y / 往路回内角 |
-| `0x05` | `return_ready` | 回外積分（参考） / 回外ピーク（参考） / 最終 Y |
-| `0x07` | `final_hold_start` | 最終 Y / 合成角速度 / 線形加速度 |
-| `0x08` | `final_ready` | 最終 Y / 保持 ms / 傾き° |
-| `0x09` | `match` | 回内角 / 最終 Y / 保持 ms |
-| `0x20` | `gyro_y_sample` | gyro_y / Y 比 / 経過 ms（デバッグ時のみ） |
-| `0x80` | `reset` | 理由依存 |
-
-## デバッグ: gyro_y 波形
-
-`nordic-main/src/main.c` の `GESTURE_DEBUG_GYRO_Y` が `1` のときのみ、
-回内〜回外待ち〜回外中に約 50 ms 間隔で `gyro_y_sample`（stage `0x20`）を送る。
-
-`turnaround_timeout` 時（デバッグ ON）:
-
-| value | 内容 |
+| stage | 意味 |
 |---|---|
-| value1 | 経過 ms |
-| value2 | 待ち中の最大 **正** gyro_y |
-| value3 | 待ち中の最小 **負** gyro_y |
+| `outbound_start` / `outbound_ready` | 回内開始 / 回内完了 |
+| `final_sample` (0x21) | 上昇中 100 ms 周期: peak_cm, a_up, gyro |
+| `final_hold_start` / `final_ready` | 静止保持開始 / 完了 |
+| `match` | 発動 |
+| `reset` reason `final_lift_too_short` | 上昇不足でタイムアウト |
+
+## 検証
 
 ```bash
 cd mac_client
 venv/bin/python gesture_validator.py --trials 1 \
-  --json-output /tmp/gesture-debug.json \
-  --gyro-csv /tmp/gyro_y.csv --show-gyro
+  --json-output /tmp/gesture-lift.json
 ```
 
-リリースビルドでは `GESTURE_DEBUG_GYRO_Y` は `0`（既定）。波形が必要なときだけ
-`1` にしてデバッグ OTA する。
+表示条件: 掌上開始、開始静止、回内、重力に逆らう上昇、0.5 秒静止、単一動作、発動。
 
-## BLE 検証
+## ビルド・OTA
 
 ```bash
-cd mac_client
-venv/bin/python gesture_validator.py --trials 1 \
-  --json-output /private/tmp/harness-node-volar-sequence.json
-venv/bin/python gesture_validator.py --self-test
+# 必要に応じて NCS / west を PATH に
+export NCS_BASE=/opt/nordic/ncs/v2.9.2
+export PATH="/opt/nordic/ncs/toolchains/<id>/bin:$PATH"
+
+nordic-main/build_and_package_ota.sh
+cd mac_client && venv/bin/python ota_updater.py --device HarnessNode \
+  ../nordic-main/ota_update.bin
 ```
 
-## ビルドと OTA
-
-```bash
-cd nordic-main
-NRFUTIL=/path/to/nrfutil ./build_and_package_ota.sh
-
-cd ../mac_client
-venv/bin/python ota_updater.py --device HarnessNode ../nordic-main/ota_update.bin
-```
-
-USB 書き込みは行わない。更新後、`0.0.33` が slot 0 で `active` かつ `confirmed`
-であることを確認する。
+`prj.conf` の `CONFIG_MCUBOOT_IMGTOOL_SIGN_VERSION` と `VERSION` を揃えてからビルドすること。  
+更新後 version `0.0.41` が slot0 active+confirmed であること。

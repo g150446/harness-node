@@ -61,9 +61,15 @@ class SMPClient:
             total_expected = SMP_HEADER_SIZE + cbor_len
             if len(self._buf) >= total_expected:
                 result = self._buf[:total_expected]
+                fut = self._response
+
+                def _set(res=result, f=fut):
+                    if f is not None and not f.done():
+                        f.set_result(res)
+
                 # thread-safe set_result (bleak on macOS uses a separate CB thread)
                 try:
-                    self._loop.call_soon_threadsafe(self._response.set_result, result)
+                    self._loop.call_soon_threadsafe(_set)
                 except Exception:
                     pass
 
@@ -220,6 +226,7 @@ async def ota_update(bin_path: str, verify_timeout: float = 60.0) -> None:
 
         # Query image list to get the hash MCUboot recorded for the uploaded image
         print("Querying image state...", flush=True)
+        await asyncio.sleep(0.5)
         state_resp = await query_image_state(smp)
         images = state_resp.get("images", [])
         # Find slot 1 (secondary) image hash
@@ -228,6 +235,15 @@ async def ota_update(bin_path: str, verify_timeout: float = 60.0) -> None:
             if img.get("slot", -1) == 1:
                 slot1_hash = bytes(img["hash"])
                 break
+        if slot1_hash is None:
+            # Retry once after a short settle; SMP notify races can drop a reply.
+            await asyncio.sleep(1.0)
+            state_resp = await query_image_state(smp)
+            images = state_resp.get("images", [])
+            for img in images:
+                if img.get("slot", -1) == 1:
+                    slot1_hash = bytes(img["hash"])
+                    break
         if slot1_hash is None:
             raise RuntimeError(f"No image in slot 1 found. State: {state_resp}")
         print(f"Slot 1 image hash: {slot1_hash.hex()}", flush=True)
