@@ -34,8 +34,61 @@ nordic-main/
 ├── sysbuild.conf                 # SB_CONFIG_BOOTLOADER_MCUBOOT=y
 ├── pm_static.yml                 # フラッシュパーティション定義
 ├── build_and_flash.sh            # 初回 UF2 フラッシュスクリプト
-└── build_and_package_ota.sh      # OTA バイナリ生成スクリプト（→ ota_update.bin）
+├── build_and_package_ota.sh      # OTA バイナリ生成スクリプト（→ ota_update.bin）
+└── AGENTS.md                     # エージェント向け board / ビルド注意
 ```
+
+---
+
+## ビルド手順とよくある失敗
+
+### 正しいボードターゲット
+
+| 正しい | 誤り（よくある） |
+|--------|------------------|
+| **`xiao_ble/nrf52840/sense`** | `xiao_ble/nrf52840`（`/sense` なし） |
+| | `xiao_ble` のみ |
+
+- NCS 上の identifier: `zephyr/boards/seeed/xiao_ble/xiao_ble_nrf52840_sense.yaml`
+- アプリ overlay は board 名に紐づく:
+  `boards/xiao_ble_nrf52840_sense.overlay`
+  → **`/sense` 付きターゲットのときだけ**自動適用される
+- overlay が載らないと `imu0`・マイク電源・バッテリ ADC・slot パーティションが
+  DT 上に存在せず、`main.c` や flash_map 周りで **未定義マクロの嵐**になる。
+  これは C ロジックのバグではなく **ボード指定ミス**である
+
+### 推奨コマンド
+
+```bash
+cd nordic-main
+./build_and_package_ota.sh    # sysbuild + 署名 OTA → ota_update.bin（書込みなし）
+./build_and_flash.sh          # 初回 UF2 向け（ある場合）
+```
+
+手動 west（スクリプトと同等）:
+
+```bash
+# NCS v2.9.2 の west ワークスペースで実行すること
+west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
+  /path/to/harness-node/nordic-main \
+  --build-dir /path/to/harness-node/nordic-main/build
+```
+
+- **必ず** `--sysbuild`（`sysbuild.conf` で MCUboot 有効）
+- sysbuild なしのアプリ単体ビルドはパーティション / MCUmgr 前提が崩れやすい
+- NCS: **v2.9.2**（`NCS_BASE` でパス上書き可）
+
+### 失敗の切り分け
+
+| 症状 | 原因 | 対処 |
+|------|------|------|
+| `DT_N_ALIAS_imu0_*` / `zephyr_user` / mic GPIO 未定義 | board に `/sense` がない | `xiao_ble/nrf52840/sense` |
+| `slot0_partition` / flash_map 関連 | board 誤り or sysbuild なし | sense + `--sysbuild`、必要なら `-p always` |
+| `west: unknown command "build"` | NCS 外で west を実行 | NCS ルートへ移動 or 付属スクリプト |
+| `ccache: command not found` | ツールチェーン PATH 不足 | NCS toolchain の `bin` を PATH へ |
+
+エージェント向けの短縮版はリポジトリ直下 `AGENTS.md` / `CLAUDE.md`、
+および `nordic-main/AGENTS.md` を参照。
 
 ---
 
@@ -123,7 +176,7 @@ Seeed Studio 公式の XIAO nRF52840 Sense KiCad 基板データと ST の LSM6D
 | 軸 | XIAO 基板上の向き | リストバンド装着時の用途 |
 |----|------------------|------------------------|
 | `+X` | 基板長手方向、USB 端子から離れる向き | 前腕を横切る方向 |
-| `+Y` | 基板短い辺に平行（5V/GND/3V 側） | 前腕に沿う＝回内・回外軸（`gyro_y`） |
+| `+Y` | 基板短い辺に平行（5V/GND/3V 側） | 前腕に沿う＝回内・回外軸 |
 | `+Z` | 部品面から外向き | 手のひら上向き水平の開始判定 |
 
 資料: [Seeed Studio XIAO nRF52840 Series](https://wiki.seeedstudio.com/XIAO_BLE/)、[LSM6DS3TR-C datasheet](https://www.st.com/resource/en/datasheet/lsm6ds3tr-c.pdf)
@@ -133,10 +186,10 @@ Seeed Studio 公式の XIAO nRF52840 Sense KiCad 基板データと ST の LSM6D
 XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基板X軸を前腕と直交、Y軸を
 前腕に沿わせる。右手・左手とUSB端子方向の違いは、回内の相対符号で吸収する。
 
-1. 甲側装着で手のひら上向き、補正Z比0.90以上、角速度70°/s以下を120 msでarmする（`PALM_UP_Z_SIGN=-1`。開始|Y|上限なし）。
-2. 前腕軸(Y)まわりに回内（`gyro_y`積分15°以上・ピーク30°/s以上）。
-3. 重力に逆らって上昇（IMU積分ピーク ≥ 2.5 cm。物理目安約5 cm以上）。
-4. 線形加速度3.0 m/s²以下を500 msで録音開始（最終静止に角速度は使わない）。
+1. 甲側装着で手のひら上向き、Z絶対比0.85以上かつ線形加速度3.0 m/s²以下を50 ms維持してarmする（開始|Y|上限なし）。
+2. 重力ベクトルのXZ平面角（phi）がarm時の実測値から20°以上変化したら回内成立とする。
+3. 重力LPで姿勢成分を除いた線形加速度を現在の重力方向へ投影し、上向き加速→逆向き減速の双極パルスを検出する（物理動作の目安は約5 cm上昇。変位cmは積分しない）。
+4. 短時間の線形加速度RMSが静止を示した時点の重力方向を固定し、そこからの角度差10°以内を500 ms維持すると録音を開始する。
 
 回外・最終仰角帯・甲上条件は要求しない。詳細は`docs/flex_pronation_gesture.md`を参照する。
 
@@ -166,8 +219,6 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
 | `ACCEL_ODR_HZ` | 416 | 加速度センサ ODR（Hz） |
-| `GYRO_ODR_HZ` | 104 | ジャイロ ODR（Hz） |
-| `GYRO_FULL_SCALE_DPS` | ±500°/s | ジャイロ測定レンジ |
 | `MOTION_SAMPLE_INTERVAL_MS` | 25 | ソフトウェアポーリング間隔（ms） |
 | `CALIBRATION_SAMPLES` | 25 | 起動時ベースライン計測サンプル数 |
 | `ACTIVITY_WINDOW_SAMPLES` | 4 | アクティビティ判定ウィンドウ（サンプル数） |
@@ -189,26 +240,25 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
-| `GESTURE_QUIET_HOLD_MS` | 120 ms | 開始前に必要な角速度安定時間 |
+| `GESTURE_QUIET_HOLD_MS` | 50 ms | 開始前に必要な加速度安定時間 |
 | `GESTURE_START_ARM_MS` | 1000 ms | 静止成立後の開始受付時間 |
-| `GESTURE_START_PALM_UP_Z_MIN_RATIO` | 0.90 | 手のひら上向き開始時の補正Z比下限 |
-| `GESTURE_ROLL_START_RATE_DPS` | 25°/s | 回内開始のY軸角速度 |
+| `GESTURE_START_PALM_UP_Z_MIN_RATIO` | 0.85 | 掌上開始時のZ絶対比下限 |
+| `GESTURE_QUIET_ACCEL_MS2` | 3.0 m/s² | 開始静止の線形加速度上限 |
+| `GESTURE_PRONATION_START_DEG` | 10° | 重力phiによる回内開始角 |
+| `GESTURE_PRONATION_MIN_DEG` | 20° | 重力phiによる回内成立角 |
 | `GESTURE_PHASE_MIN_DURATION_MS` | 120 ms | 回内フェーズ最短時間 |
 | `GESTURE_OUTBOUND_MAX_DURATION_MS` | 2000 ms | 回内の最長時間 |
-| `GESTURE_ROLL_ANGLE_MIN_DEG` | 15° | 回内のY軸積分角下限 |
-| `GESTURE_ROLL_PEAK_MIN_DPS` | 30°/s | 回内のY軸ピーク下限 |
-| `GESTURE_FINAL_LIFT_MIN_CM` | 2.5 cm | 上昇のIMU積分ピーク下限 |
+| `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.80 m/s² | 上向き加速パルス下限 |
+| `GESTURE_LIFT_BRAKE_MIN_MS2` | 0.30 m/s² | 逆向き減速パルス下限 |
+| `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.08 m/s | 正インパルス下限 |
+| `GESTURE_LIFT_NEG_IMPULSE_MIN_MS` | 0.03 m/s | 負インパルス下限 |
+| `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.08 | 減速/加速インパルス比下限 |
+| `GESTURE_LIFT_PULSE_MIN_MS` / `MAX_MS` | 150 / 900 ms | 双極パルスの時間窓 |
+| `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 10° | 静止開始時の重力方向からの保持中姿勢差上限 |
+| `GESTURE_FINAL_STILL_RMS_MS2` | 0.50 m/s² | 4サンプル静止RMS上限 |
 | `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止保持時間 |
-| `GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2` | 3.0 m/s² | 最終静止の線形加速度上限 |
-| `GESTURE_LIFT_ARM_GYRO_DPS` | 80°/s | 回内後の上昇積分アーム整定 |
-| `GESTURE_DEBUG_GYRO_Y` | 0（リリース） | 1で gyro_y 波形を BLE 送信 |
-| `GESTURE_PALM_UP_Z_SIGN` | -1 | 甲側装着の掌上Z符号 |
-| `GESTURE_DISTANCE_LP_TAU_S` | 0.55 s | 車両加速度を追従除去する時定数 |
-| `GESTURE_QUIET_RATE_DPS` | 70°/s | 開始前静止の角速度上限（手ブレ許容） |
-| `GESTURE_FINAL_QUIET_RATE_DPS` | 70°/s | 垂直保持中の角速度上限 |
-| `GESTURE_FINAL_LINEAR_ACCEL_MAX_MS2` | 3.0 m/s² | 垂直保持中の線形加速度上限 |
-| `GESTURE_FINAL_HOLD_MS` | 500 ms | 垂直姿勢の連続保持時間 |
-| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 1500 ms | 復路終了後の保持成立期限 |
+| `GESTURE_GRAVITY_LP_TAU_S` | 0.30 s | 重力推定の低通時定数 |
+| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 3000 ms | 回内成立後の最終成立期限 |
 | `GESTURE_SEQUENCE_TIMEOUT_MS` | 5000 ms | 全シーケンス期限 |
 | `SLEEP_IDLE_TIMEOUT_MS` | 10000 ms | ライトスリープ移行までの無動作時間 |
 | `SLEEP_POLL_INTERVAL_MS` | 50 ms | スリープ中の IMU ポーリング間隔 |
@@ -298,17 +348,13 @@ python3 gesture_monitor.py
 
 ### gesture_validator.py — 回内→上昇→静止ジェスチャー検証
 
-試行ごとにカウントダウンと Ping 音を合図に、回内→上昇→0.5秒静止を
+試行ごとにカウントダウンと Ping 音を合図に、回内→約5 cm上昇→0.5秒静止を
 対話検証する。条件ごとの `[OK]` / `[NG]` / `[--]` を表示し、生の診断ログは JSON へ保存する。
 
 ```bash
 cd mac_client
 venv/bin/python gesture_validator.py --trials 1 \
   --json-output /private/tmp/harness-node-volar-sequence.json
-# デバッグ波形（GESTURE_DEBUG_GYRO_Y=1 時）
-venv/bin/python gesture_validator.py --trials 1 \
-  --json-output /tmp/gesture-debug.json \
-  --gyro-csv /tmp/gyro_y.csv --show-gyro
 venv/bin/python gesture_validator.py --self-test
 ```
 

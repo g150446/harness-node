@@ -80,22 +80,25 @@ DIAG_REASON_NAMES = {
     0x03: "outbound_rate_low",
     0x11: "outbound_timeout",
     0x12: "incomplete_outbound",
-    0x19: "final_pose_not_reached",
     0x1A: "final_hold_interrupted",
     0x1B: "final_hold_timeout",
     0x1C: "sequence_timeout",
-    0x1D: "final_lift_too_short",
+    0x1D: "final_accel_missing",
+    0x1E: "final_brake_missing",
+    0x1F: "final_brake_ratio_low",
+    0x20: "final_tilt_unstable",
+    0x21: "final_pulse_duration_invalid",
 }
 
-START_PALM_UP_Z_MIN_RATIO = 0.90
-START_QUIET_HOLD_MS = 120
-START_QUIET_RATE_MAX_DPS = 70.0
-ROLL_START_RATE_MIN_DPS = 25.0
-ROLL_ANGLE_MIN_DEG = 15.0
-ROLL_PEAK_RATE_MIN_DPS = 30.0
-# Final: IMU-integrated lift (≈ physical ~5 cm), then hold still for 500 ms.
-FINAL_LIFT_MIN_CM = 2.5
-FINAL_LINEAR_ACCEL_MAX_MS2 = 3.00
+START_PALM_UP_Z_MIN_RATIO = 0.85
+START_QUIET_HOLD_MS = 50
+START_QUIET_ACCEL_MAX_MS2 = 3.0
+PRONATION_ANGLE_MIN_DEG = 20.0
+# Final: upward acceleration pulse, braking pulse, stable pose, then hold.
+FINAL_POS_IMPULSE_MIN_MS = 0.08
+FINAL_NEG_IMPULSE_MIN_MS = 0.03
+FINAL_BRAKE_RATIO_MIN = 0.08
+FINAL_TILT_MAX_DEG = 10.0
 FINAL_HOLD_MIN_MS = 500
 
 
@@ -140,15 +143,20 @@ class TrialResult:
 
 def gesture_gate_eligible(
     palm_up_z_ratio: float,
-    outbound_roll_deg: float,
-    final_lift_cm: float,
+    pronation_deg: float,
+    positive_impulse_ms: float,
+    negative_impulse_ms: float,
+    final_tilt_deg: float,
     final_hold_ms: int,
 ) -> bool:
-    """Mirror the firmware's palm-up, pronation, lift and hold gates."""
+    """Mirror the firmware's palm-up, pronation, lift-pulse and hold gates."""
     return (
         palm_up_z_ratio >= START_PALM_UP_Z_MIN_RATIO
-        and abs(outbound_roll_deg) >= ROLL_ANGLE_MIN_DEG
-        and final_lift_cm >= FINAL_LIFT_MIN_CM
+        and abs(pronation_deg) >= PRONATION_ANGLE_MIN_DEG
+        and positive_impulse_ms >= FINAL_POS_IMPULSE_MIN_MS
+        and negative_impulse_ms >= FINAL_NEG_IMPULSE_MIN_MS
+        and negative_impulse_ms / positive_impulse_ms >= FINAL_BRAKE_RATIO_MIN
+        and final_tilt_deg <= FINAL_TILT_MAX_DEG
         and final_hold_ms >= FINAL_HOLD_MIN_MS
     )
 
@@ -208,52 +216,121 @@ def build_condition_results(
         diagnostics,
         stage="reset",
         reasons=(
-            "final_lift_too_short",
+            "final_accel_missing",
+            "final_brake_missing",
+            "final_brake_ratio_low",
+            "final_pulse_duration_invalid",
+            "final_tilt_unstable",
             "final_hold_timeout",
         ),
     )
 
     conditions: list[ConditionResult] = []
 
-    start_evidence = outbound_start or wait_rate or wait_quiet or wait_pose
+    # wait_reject encoding (firmware accel-only):
+    #   start_not_palm_up: v1=z_ratio, v2=min_ratio, v3=linear_accel
+    #   quiet_not_ready (hold incomplete while quiet):
+    #       v1=z_ratio, v2=elapsed_ms, v3=need_ms
+    #   quiet_not_ready (moving / linear too high):
+    #       v1=z_ratio, v2=linear_accel, v3=max_linear
+    #   outbound_rate_low: v1=phi_deg, v2=min_phi, v3=linear_accel
+    pose_fail_detail: Optional[str] = None
+    quiet_fail_detail: Optional[str] = None
+    best_z = -1.0
+    best_hold_ms = -1.0
+    worst_linear = -1.0
+
+    for rec in diagnostics:
+        if rec.get("stage") != "wait_reject":
+            continue
+        reason = rec.get("reason")
+        v1 = float(rec.get("value1") or 0.0)
+        v2 = float(rec.get("value2") or 0.0)
+        v3 = float(rec.get("value3") or 0.0)
+        if reason == "start_not_palm_up":
+            best_z = max(best_z, v1)
+            thr = v2 if v2 > 0.1 else START_PALM_UP_Z_MIN_RATIO
+            pose_fail_detail = (
+                f"Z絶対比 {v1:.2f} < {thr:.2f}"
+                f"（線形加速度 {v3:.2f} m/s²）"
+            )
+        elif reason == "quiet_not_ready":
+            best_z = max(best_z, v1)
+            # Hold progress: v3 is need_ms (~80) and v2 < need
+            if 20.0 <= v3 <= 500.0 and v2 <= v3 + 50.0:
+                best_hold_ms = max(best_hold_ms, v2)
+                quiet_fail_detail = (
+                    f"静止継続 {v2:.0f} ms < 必要 {v3:.0f} ms"
+                    f"（Z絶対比 {v1:.2f}）"
+                )
+            else:
+                worst_linear = max(worst_linear, v2)
+                thr = v3 if v3 > 0.05 else START_QUIET_ACCEL_MAX_MS2
+                quiet_fail_detail = (
+                    f"線形加速度 {v2:.2f} > 上限 {thr:.2f} m/s²"
+                    f"（Z絶対比 {v1:.2f}）"
+                )
+
     if outbound_start is not None:
         z_ratio = float(outbound_start["value2"])
         conditions.append(
             ConditionResult(
                 "手のひら上向き開始姿勢",
                 "PASS",
-                f"補正Z比 {z_ratio:.2f} ≥ {START_PALM_UP_Z_MIN_RATIO:.2f}",
+                f"arm成立済み（回内開始時Z絶対比 {z_ratio:.2f}）",
             )
         )
         conditions.append(
             ConditionResult(
                 "開始前の静止",
                 "PASS",
-                f"{START_QUIET_HOLD_MS} ms以上・角速度 "
-                f"≤ {START_QUIET_RATE_MAX_DPS:.0f}°/s が成立",
+                f"線形加速度 ≤ {START_QUIET_ACCEL_MAX_MS2:.1f} m/s² を "
+                f"{START_QUIET_HOLD_MS} ms 以上",
             )
         )
-    elif start_evidence is not None:
-        z_ratio = float(start_evidence["value1"])
-        pose_passed = z_ratio >= START_PALM_UP_Z_MIN_RATIO
+    elif wait_rate is not None or wait_quiet is not None or wait_pose is not None:
+        if best_z < 0.0 and wait_pose is not None:
+            best_z = float(wait_pose.get("value1") or 0.0)
+        if best_z < 0.0 and wait_quiet is not None:
+            best_z = float(wait_quiet.get("value1") or 0.0)
+        pose_passed = best_z >= START_PALM_UP_Z_MIN_RATIO
         conditions.append(
             ConditionResult(
                 "手のひら上向き開始姿勢",
                 "PASS" if pose_passed else "FAIL",
-                f"補正Z比 {z_ratio:.2f}",
+                (
+                    f"Z絶対比 {best_z:.2f} ≥ {START_PALM_UP_Z_MIN_RATIO:.2f}"
+                    if pose_passed
+                    else (pose_fail_detail or f"Z絶対比 {best_z:.2f}")
+                ),
             )
         )
         quiet_passed = wait_rate is not None
+        if quiet_passed:
+            quiet_detail = (
+                f"線形加速度 ≤ {START_QUIET_ACCEL_MAX_MS2:.1f} m/s² を "
+                f"{START_QUIET_HOLD_MS} ms 以上"
+            )
+        else:
+            parts = []
+            if quiet_fail_detail:
+                parts.append(quiet_fail_detail)
+            if best_hold_ms >= 0.0 and "静止継続" not in (quiet_fail_detail or ""):
+                parts.append(
+                    f"最大静止継続 {best_hold_ms:.0f} ms "
+                    f"(要 {START_QUIET_HOLD_MS} ms)"
+                )
+            if worst_linear >= 0.0 and "線形加速度" not in (quiet_fail_detail or ""):
+                parts.append(
+                    f"最大線形加速度 {worst_linear:.2f} m/s² "
+                    f"(上限 {START_QUIET_ACCEL_MAX_MS2:.1f})"
+                )
+            quiet_detail = " / ".join(parts) if parts else "開始アーム未成立"
         conditions.append(
             ConditionResult(
                 "開始前の静止",
                 "PASS" if quiet_passed else "FAIL",
-                (
-                    f"{START_QUIET_HOLD_MS} ms以上・角速度 "
-                    f"≤ {START_QUIET_RATE_MAX_DPS:.0f}°/s が成立"
-                    if quiet_passed
-                    else f"{START_QUIET_HOLD_MS} msの静止を確認できず"
-                ),
+                quiet_detail,
             )
         )
     else:
@@ -269,89 +346,161 @@ def build_condition_results(
         )
 
     if outbound_ready is not None and outbound_start is not None:
-        start_rate = float(outbound_start["value1"])
-        roll = float(outbound_ready["value1"])
-        peak = float(outbound_ready["value2"])
-        roll_ok = (
-            abs(roll) >= ROLL_ANGLE_MIN_DEG
-            and peak >= ROLL_PEAK_RATE_MIN_DPS
-            and start_rate >= ROLL_START_RATE_MIN_DPS
+        phi_start = float(outbound_start["value1"])
+        phi = float(outbound_ready["value1"])
+        phi_peak = float(outbound_ready["value2"])
+        # Firmware: gravity phi in XZ plane (accel-only).
+        phi_ok = (
+            abs(phi) >= PRONATION_ANGLE_MIN_DEG
+            or abs(phi_peak) >= PRONATION_ANGLE_MIN_DEG
         )
         conditions.append(
             ConditionResult(
-                "gyro_y 回内",
-                "PASS" if roll_ok else "FAIL",
-                f"開始 {start_rate:.1f} ≥ {ROLL_START_RATE_MIN_DPS:.0f}°/s、"
-                f"Y軸積分 {roll:+.1f}°（|角度|≥{ROLL_ANGLE_MIN_DEG:.0f}°・"
-                f"peak≥{ROLL_PEAK_RATE_MIN_DPS:.0f}°/s）",
+                "回内（重力角）",
+                "PASS" if phi_ok else "FAIL",
+                f"phi開始 {phi_start:.1f}° → ピーク {phi_peak:.1f}° "
+                f"（要 ≥ {PRONATION_ANGLE_MIN_DEG:.0f}°）",
             )
         )
     elif outbound_reset is not None:
         conditions.append(
             ConditionResult(
-                "gyro_y 回内",
+                "回内（重力角）",
                 "FAIL",
-                f"Y軸積分 {float(outbound_reset['value1']):+.1f}° "
+                f"phi {float(outbound_reset['value1']):+.1f}° "
                 f"({outbound_reset['reason']})",
             )
         )
     elif outbound_start is not None:
         conditions.append(
-            ConditionResult("gyro_y 回内", "FAIL", "回内完了条件まで到達せず")
+            ConditionResult("回内（重力角）", "FAIL", "回内完了条件まで到達せず")
         )
     else:
         conditions.append(
-            ConditionResult("gyro_y 回内", "NOT_REACHED", "回内開始を検出せず")
+            ConditionResult("回内（重力角）", "NOT_REACHED", "回内開始を検出せず")
         )
 
-    # final_hold_start: v1=lift_cm, v2=linear_accel_ms2, v3=reserved
-    # final_ready:   v1=lift_cm, v2=hold_ms, v3=linear_accel_ms2
-    pose_src = final_ready or final_start
-    if pose_src is not None:
-        lift_cm = float(pose_src["value1"])
-        ok = lift_cm >= FINAL_LIFT_MIN_CM
+    # final_hold_start: v1=positive impulse, v2=negative impulse, v3=tilt
+    # final_ready:      v1=positive impulse, v2=hold_ms, v3=tilt
+    pulse_src = final_ready or final_start
+    if pulse_src is not None:
+        pos_impulse = float(pulse_src["value1"])
+        neg_impulse = (
+            float(final_start["value2"])
+            if final_start is not None
+            else FINAL_NEG_IMPULSE_MIN_MS
+        )
+        pulse_ok = (
+            pos_impulse >= FINAL_POS_IMPULSE_MIN_MS
+            and neg_impulse >= FINAL_NEG_IMPULSE_MIN_MS
+            and neg_impulse / pos_impulse >= FINAL_BRAKE_RATIO_MIN
+        )
+        brake_ratio = neg_impulse / pos_impulse if pos_impulse > 0.0 else 0.0
         conditions.append(
             ConditionResult(
-                "重力に逆らう上昇",
-                "PASS" if ok else "FAIL",
-                f"上昇 {lift_cm:.1f} cm ≥ {FINAL_LIFT_MIN_CM:.1f} cm（IMU換算）",
+                "上昇の加速→減速パルス",
+                "PASS" if pulse_ok else "FAIL",
+                f"加速 {pos_impulse:.3f} m/s ≥ {FINAL_POS_IMPULSE_MIN_MS:.2f}、"
+                f"減速 {neg_impulse:.3f} m/s ≥ {FINAL_NEG_IMPULSE_MIN_MS:.2f}、"
+                f"比率 {brake_ratio:.2f} ≥ {FINAL_BRAKE_RATIO_MIN:.2f}",
+            )
+        )
+    elif final_reset is not None and final_reset["reason"] in (
+        "final_tilt_unstable",
+        "final_hold_timeout",
+    ):
+        pos_impulse = float(final_reset.get("value1") or 0.0)
+        neg_impulse = float(final_reset.get("value2") or 0.0)
+        conditions.append(
+            ConditionResult(
+                "上昇の加速→減速パルス",
+                "PASS",
+                f"加速 {pos_impulse:.3f} m/s、減速 {neg_impulse:.3f} m/s（成立済み）",
             )
         )
     elif final_reset is not None:
+        reason = str(final_reset["reason"])
+        pos_impulse = float(final_reset.get("value1") or 0.0)
+        neg_impulse = float(final_reset.get("value2") or 0.0)
+        if reason == "final_brake_ratio_low":
+            detail = (
+                f"減速/加速比 {float(final_reset.get('value3') or 0.0):.2f} "
+                f"< {FINAL_BRAKE_RATIO_MIN:.2f}"
+            )
+        elif reason == "final_pulse_duration_invalid":
+            detail = (
+                f"パルス時間 {pos_impulse:.0f} ms "
+                "（許容 150–900 ms）"
+            )
+        else:
+            detail = (
+                f"{reason}: 加速 {pos_impulse:.3f} m/s、"
+                f"減速 {neg_impulse:.3f} m/s"
+            )
         conditions.append(
             ConditionResult(
-                "重力に逆らう上昇",
+                "上昇の加速→減速パルス",
                 "FAIL",
-                f"{final_reset['reason']}",
+                detail,
             )
         )
     elif outbound_ready is not None:
         conditions.append(
             ConditionResult(
-                "重力に逆らう上昇",
+                "上昇の加速→減速パルス",
                 "FAIL",
-                "回内後に必要な上昇量に到達せず",
+                "回内後に必要な加速→減速パルスが成立せず",
             )
         )
     else:
         conditions.append(
             ConditionResult(
-                "重力に逆らう上昇",
+                "上昇の加速→減速パルス",
                 "NOT_REACHED",
                 "上昇判定まで到達せず",
             )
         )
 
+    tilt_src = final_ready or final_start
+    if final_reset is not None and final_reset["reason"] == "final_tilt_unstable":
+        tilt_deg = float(final_reset.get("value3") or 0.0)
+        conditions.append(
+            ConditionResult(
+                "上昇後の姿勢安定",
+                "FAIL",
+                f"静止開始姿勢から {tilt_deg:.1f}° > {FINAL_TILT_MAX_DEG:.1f}°",
+            )
+        )
+    elif tilt_src is not None:
+        tilt_deg = float(tilt_src["value3"])
+        conditions.append(
+            ConditionResult(
+                "上昇後の姿勢安定",
+                "PASS" if tilt_deg <= FINAL_TILT_MAX_DEG else "FAIL",
+                f"静止開始姿勢から {tilt_deg:.1f}° ≤ {FINAL_TILT_MAX_DEG:.1f}°",
+            )
+        )
+    elif final_reset is not None and final_reset["reason"] == "final_hold_timeout":
+        tilt_deg = float(final_reset.get("value3") or 0.0)
+        conditions.append(
+            ConditionResult(
+                "上昇後の姿勢安定",
+                "PASS",
+                f"静止開始姿勢から {tilt_deg:.1f}° ≤ {FINAL_TILT_MAX_DEG:.1f}°",
+            )
+        )
+    else:
+        conditions.append(
+            ConditionResult("上昇後の姿勢安定", "NOT_REACHED", "パルス成立前")
+        )
+
     if final_ready is not None:
         hold_ms = float(final_ready["value2"])
-        linear_accel = float(final_ready["value3"])
         conditions.append(
             ConditionResult(
                 "上昇位置での0.5秒静止",
                 "PASS",
-                f"{hold_ms:.0f} ms ≥ {FINAL_HOLD_MIN_MS} ms、"
-                f"線形加速度 {linear_accel:.2f} m/s² "
-                f"≤ {FINAL_LINEAR_ACCEL_MAX_MS2:.2f} m/s²",
+                f"{hold_ms:.0f} ms ≥ {FINAL_HOLD_MIN_MS} ms",
             )
         )
     elif final_start is not None:
@@ -360,6 +509,14 @@ def build_condition_results(
                 "上昇位置での0.5秒静止",
                 "FAIL",
                 f"{FINAL_HOLD_MIN_MS} msの連続静止を確認できず",
+            )
+        )
+    elif final_reset is not None and final_reset["reason"] == "final_hold_timeout":
+        conditions.append(
+            ConditionResult(
+                "上昇位置での0.5秒静止",
+                "FAIL",
+                f"{FINAL_HOLD_MIN_MS} msの静止を開始できずタイムアウト",
             )
         )
     else:
@@ -490,13 +647,13 @@ def format_event(event: GestureEvent) -> str:
         v3 = event.value3 or 0.0
         if stage == "outbound_start":
             suffix = (
-                f" roll_rate={v1:.1f}dps palm_up_z={v2:.2f} "
-                f"start_y={v3:+.2f}"
+                f" phi={v1:.1f}deg palm_up_z={v2:.2f} "
+                f"accel_norm={v3:.2f}m/s^2"
             )
         elif stage == "outbound_ready":
             suffix = (
-                f" pronation={v1:+.1f}deg peak={v2:.1f}dps "
-                f"y={v3:+.2f}"
+                f" pronation={v1:+.1f}deg peak_phi={v2:.1f}deg "
+                f"accel_norm={v3:.2f}m/s^2"
             )
         elif stage == "turnaround_ready":
             suffix = (
@@ -514,16 +671,17 @@ def format_event(event: GestureEvent) -> str:
             )
         elif stage == "final_sample":
             suffix = (
-                f" lift={v1:.1f}cm a_up={v2:+.2f}m/s^2 "
-                f"gyro={v3:.1f}dps"
+                f" pulse_stage={v1:.0f} a_up={v2:+.2f}m/s^2 "
+                f"net_impulse={v3:+.3f}m/s"
             )
         elif stage == "final_hold_start":
             suffix = (
-                f" lift={v1:.1f}cm linear_accel={v2:.2f}m/s^2"
+                f" positive_impulse={v1:.3f}m/s "
+                f"negative_impulse={v2:.3f}m/s tilt={v3:.1f}deg"
             )
         elif stage == "match":
             suffix = (
-                f" pronation={v1:+.1f}deg lift={v2:.1f}cm "
+                f" pronation={v1:+.1f}deg positive_impulse={v2:.3f}m/s "
                 f"hold={v3:.0f}ms"
             )
         elif stage == "distance_ready":
@@ -532,8 +690,8 @@ def format_event(event: GestureEvent) -> str:
             )
         elif stage == "final_ready":
             suffix = (
-                f" lift={v1:.1f}cm hold={v2:.0f}ms "
-                f"linear_accel={v3:.2f}m/s^2"
+                f" positive_impulse={v1:.3f}m/s hold={v2:.0f}ms "
+                f"tilt={v3:.1f}deg"
             )
         elif stage == "gyro_bias_ready":
             suffix = (
@@ -593,8 +751,8 @@ def diagnostic_record(event: GestureEvent) -> dict[str, Any]:
     elif stage == "outbound_ready":
         record["metrics"] = {
             "pronation_angle_deg": event.value1,
-            "pronation_peak_dps": event.value2,
-            "y_ratio": event.value3,
+            "pronation_peak_deg": event.value2,
+            "accel_norm_ms2": event.value3,
         }
     elif stage == "return_ready":
         record["metrics"] = {
@@ -614,27 +772,51 @@ def diagnostic_record(event: GestureEvent) -> dict[str, Any]:
             "max_pos_gyro_y_dps": event.value2,
             "min_neg_gyro_y_dps": event.value3,
         }
+    elif stage == "reset" and reason == "final_pulse_duration_invalid":
+        record["metrics"] = {
+            "pulse_duration_ms": event.value1,
+            "positive_impulse_ms": event.value2,
+            "negative_impulse_ms": event.value3,
+        }
+    elif stage == "reset" and reason == "final_brake_ratio_low":
+        record["metrics"] = {
+            "positive_impulse_ms": event.value1,
+            "negative_impulse_ms": event.value2,
+            "brake_ratio": event.value3,
+        }
+    elif stage == "reset" and reason in (
+        "final_accel_missing",
+        "final_brake_missing",
+        "final_tilt_unstable",
+        "final_hold_timeout",
+    ):
+        record["metrics"] = {
+            "positive_impulse_ms": event.value1,
+            "negative_impulse_ms": event.value2,
+            "tilt_deg": event.value3,
+        }
     elif stage == "final_sample":
         record["metrics"] = {
-            "lift_cm": event.value1,
+            "pulse_stage": event.value1,
             "a_up_ms2": event.value2,
-            "gyro_dps": event.value3,
+            "net_impulse_ms": event.value3,
         }
     elif stage == "final_hold_start":
         record["metrics"] = {
-            "lift_cm": event.value1,
-            "linear_accel_ms2": event.value2,
+            "positive_impulse_ms": event.value1,
+            "negative_impulse_ms": event.value2,
+            "tilt_deg": event.value3,
         }
     elif stage == "final_ready":
         record["metrics"] = {
-            "lift_cm": event.value1,
+            "positive_impulse_ms": event.value1,
             "final_hold_ms": event.value2,
-            "linear_accel_ms2": event.value3,
+            "tilt_deg": event.value3,
         }
     elif stage == "match":
         record["metrics"] = {
             "pronation_angle_deg": event.value1,
-            "lift_cm": event.value2,
+            "positive_impulse_ms": event.value2,
             "final_hold_ms": event.value3,
         }
     elif stage == "gyro_bias_ready":
@@ -971,7 +1153,7 @@ class GestureValidator:
         await self.connect()
         print("", flush=True)
         print("=" * 64, flush=True)
-        print("HarnessNode 回内→5cm上昇→0.5秒静止 BLE検証", flush=True)
+        print("HarnessNode 回内→上昇パルス→0.5秒静止 BLE検証", flush=True)
         print(f"期待結果: {self.args.expect}", flush=True)
         print(f"試行回数: {self.args.trials} / 判定時間: {self.args.window:g}秒", flush=True)
         print("=" * 64, flush=True)
@@ -1061,7 +1243,7 @@ def run_self_test() -> int:
     final_packet = bytearray(
         [0x00, 0x55, EVT_GESTURE_DIAG, 0x08, 0x00]
     )
-    final_packet.extend(struct.pack("<fff", -0.95, 525.0, 18.2))
+    final_packet.extend(struct.pack("<fff", 0.12, 525.0, 8.2))
     final = parse_event_packet(bytes(final_packet), now=16.0)
     assert final is not None
     assert final.diag_stage == 0x08
@@ -1078,12 +1260,15 @@ def run_self_test() -> int:
     bias_record = diagnostic_record(bias)
     assert math.isclose(bias_record["metrics"]["correction_dps"], 22.0)
 
-    # Firmware boundary: palm-up start, pronation, 5 cm lift, 500 ms hold.
-    eligible = (0.90, 15.0, 2.5, 500)
+    # Firmware boundary: palm-up, pronation, bipolar lift pulse, pose, hold.
+    eligible = (0.90, 20.0, 0.08, 0.03, 10.0, 500)
     assert gesture_gate_eligible(*eligible)
-    assert not gesture_gate_eligible(0.89, *eligible[1:])
-    assert not gesture_gate_eligible(0.90, 14.0, *eligible[2:])
-    assert not gesture_gate_eligible(0.90, 15.0, 2.4, 500)
+    assert not gesture_gate_eligible(0.84, *eligible[1:])
+    assert not gesture_gate_eligible(0.90, 19.0, *eligible[2:])
+    assert not gesture_gate_eligible(0.90, 20.0, 0.079, *eligible[3:])
+    assert not gesture_gate_eligible(0.90, 20.0, 0.08, 0.029, *eligible[4:])
+    assert not gesture_gate_eligible(0.90, 20.0, 0.50, 0.03, 10.0, 500)
+    assert not gesture_gate_eligible(0.90, 20.0, 0.08, 0.03, 10.1, 500)
     assert not gesture_gate_eligible(*eligible[:-1], 499)
     assert not sequence_reset_seen([])
     assert not sequence_reset_seen([{"stage": "outbound_ready"}])
@@ -1103,23 +1288,23 @@ def run_self_test() -> int:
             {
                 "stage": "outbound_ready",
                 "reason": "none",
-                "value1": 20.0,
+                "value1": 35.0,
                 "value2": 45.0,
-                "value3": 0.10,
+                "value3": 9.81,
             },
             {
                 "stage": "final_hold_start",
                 "reason": "none",
-                "value1": 3.2,
-                "value2": 1.5,
-                "value3": 0.0,
+                "value1": 0.12,
+                "value2": 0.10,
+                "value3": 6.0,
             },
             {
                 "stage": "final_ready",
                 "reason": "none",
-                "value1": 3.2,
+                "value1": 0.12,
                 "value2": 525.0,
-                "value3": 1.5,
+                "value3": 6.0,
             },
         ],
         matched=True,
@@ -1140,13 +1325,41 @@ def run_self_test() -> int:
     )
     assert rejected_conditions[0].status == "FAIL"
     assert rejected_conditions[-1].status == "FAIL"
+    for reason, values in (
+        ("final_accel_missing", (0.02, 0.0, 2.0)),
+        ("final_brake_missing", (0.10, 0.01, 2.0)),
+        ("final_brake_ratio_low", (0.50, 0.06, 0.12)),
+        ("final_pulse_duration_invalid", (100.0, 0.10, 0.08)),
+        ("final_tilt_unstable", (0.12, 0.10, 18.0)),
+        ("final_hold_timeout", (0.12, 0.10, 5.0)),
+    ):
+        conditions = build_condition_results(
+            [
+                {
+                    "stage": "outbound_ready",
+                    "reason": "none",
+                    "value1": 35.0,
+                    "value2": 35.0,
+                    "value3": 9.81,
+                },
+                {
+                    "stage": "reset",
+                    "reason": reason,
+                    "value1": values[0],
+                    "value2": values[1],
+                    "value3": values[2],
+                },
+            ],
+            matched=False,
+        )
+        assert any(condition.status == "FAIL" for condition in conditions)
     print("SELF_TEST: PASS", flush=True)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="HarnessNodeの回内→5cm上昇→0.5秒静止をBLEで検証"
+        description="HarnessNodeの回内→上昇パルス→0.5秒静止をBLEで検証"
     )
     parser.add_argument("--device", default=DEVICE_NAME, help="BLEデバイス名")
     parser.add_argument("--address", help="スキャンせず接続するBLEアドレス/UUID")
@@ -1221,7 +1434,7 @@ def main() -> int:
     if args.instruction is None:
         args.instruction = (
             "手の甲側装着で手のひらを上向きに静止し、回内したあと、"
-            "手を重力に逆らって5cm以上上げ、そのまま0.5秒静止してください"
+            "手を重力に逆らって約5cm上げ、そのまま0.5秒静止してください"
             if args.expect == "match"
             else "指定された非対象動作を行ってください"
         )
