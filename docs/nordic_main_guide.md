@@ -13,7 +13,7 @@
 | ブートローダ | MCUboot（Adafruit UF2 ブートローダ経由で 0x27000 に配置） |
 | OTA | MCUboot + BLE SMP（MCUmgr） |
 | PDM マイク | DMIC（Zephyr DMIC API、RIGHT チャンネル、マイク電源制御あり） |
-| IMU | LSM6DS3TR-C（LSM6DSL ドライバ経由、Zephyr センサー API） |
+| IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロは無効） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 起動後は待機時消灯。録音ジェスチャー成立後の録音中のみ赤 |
 
@@ -186,10 +186,11 @@ Seeed Studio 公式の XIAO nRF52840 Sense KiCad 基板データと ST の LSM6D
 XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基板X軸を前腕と直交、Y軸を
 前腕に沿わせる。右手・左手とUSB端子方向の違いは、回内の相対符号で吸収する。
 
-1. 甲側装着で手のひら上向き、Z絶対比0.85以上かつ線形加速度3.0 m/s²以下を50 ms維持してarmする（開始|Y|上限なし）。
-2. 重力ベクトルのXZ平面角（phi）がarm時の実測値から20°以上変化したら回内成立とする。
-3. 重力LPで姿勢成分を除いた線形加速度を現在の重力方向へ投影し、上向き加速→逆向き減速の双極パルスを検出する（物理動作の目安は約5 cm上昇。変位cmは積分しない）。
-4. 短時間の線形加速度RMSが静止を示した時点の重力方向を固定し、そこからの角度差10°以内を500 ms維持すると録音を開始する。
+1. 甲側装着で手のひら上向き、Z絶対比0.80以上かつ線形加速度3.0 m/s²以下を50 ms維持してarmする（開始|Y|上限なし）。基準phiとazはこの時点で固定する。
+2. arm後2.5秒以内に、重力phiが8°以上、またはZ比が0.25以上変化する、またはZ符号が反転する、またはZピーク間が4.0 m/s²以上なら回内開始。静止中でも判定し、Zが掌上を下回ってもarmは維持する。
+3. 最短120 msのあと、phiが20°以上、またはZ比が0.50以上変化、またはZ符号反転で回内成立。成立後の静止は上昇検出まで許容する。
+4. 重力LPで姿勢成分を除いた線形加速度を現在の重力方向へ投影し、上向き加速パルスを検出する（物理動作の目安は約5 cm上昇。変位cmは積分しない）。減速パルスがあれば早期にholdへ進み、なくても正インパルスが下限以上なら1800 ms後にholdへ進む。
+5. 短時間の線形加速度RMSが静止を示した時点の重力方向を固定し、そこからの角度差10°以内を500 ms維持すると録音を開始する。
 
 回外・最終仰角帯・甲上条件は要求しない。詳細は`docs/flex_pronation_gesture.md`を参照する。
 
@@ -241,21 +242,26 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
 | `GESTURE_QUIET_HOLD_MS` | 50 ms | 開始前に必要な加速度安定時間 |
-| `GESTURE_START_ARM_MS` | 1000 ms | 静止成立後の開始受付時間 |
-| `GESTURE_START_PALM_UP_Z_MIN_RATIO` | 0.85 | 掌上開始時のZ絶対比下限 |
+| `GESTURE_START_ARM_MS` | 2500 ms | 静止成立後の開始受付時間 |
+| `GESTURE_START_PALM_UP_Z_MIN_RATIO` | 0.80 | 掌上開始時のZ絶対比下限（初回armのみ） |
 | `GESTURE_QUIET_ACCEL_MS2` | 3.0 m/s² | 開始静止の線形加速度上限 |
-| `GESTURE_PRONATION_START_DEG` | 10° | 重力phiによる回内開始角 |
+| `GESTURE_PRONATION_START_DEG` | 8° | 重力phiによる回内開始角 |
 | `GESTURE_PRONATION_MIN_DEG` | 20° | 重力phiによる回内成立角 |
+| `GESTURE_PRONATION_Z_RATIO_START` | 0.25 | 回内開始のZ比変化 |
+| `GESTURE_PRONATION_Z_RATIO_DONE` | 0.50 | 回内成立のZ比変化 |
+| `GESTURE_PRONATION_Z_PTP_START_MS2` | 4.0 m/s² | 回内開始のZピーク間 |
+| `GESTURE_PRONATION_Z_SIGN_MIN_MS2` | 2.0 m/s² | Z符号反転と認める\|az\|下限 |
+| `GESTURE_INCOMPLETE_SETTLE_MS` | 800 ms | 回内未完了の静止リセット |
 | `GESTURE_PHASE_MIN_DURATION_MS` | 120 ms | 回内フェーズ最短時間 |
 | `GESTURE_OUTBOUND_MAX_DURATION_MS` | 2000 ms | 回内の最長時間 |
-| `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.80 m/s² | 上向き加速パルス下限 |
-| `GESTURE_LIFT_BRAKE_MIN_MS2` | 0.30 m/s² | 逆向き減速パルス下限 |
-| `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.08 m/s | 正インパルス下限 |
-| `GESTURE_LIFT_NEG_IMPULSE_MIN_MS` | 0.03 m/s | 負インパルス下限 |
-| `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.08 | 減速/加速インパルス比下限 |
-| `GESTURE_LIFT_PULSE_MIN_MS` / `MAX_MS` | 150 / 900 ms | 双極パルスの時間窓 |
+| `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.40 m/s² | 上向き加速パルス下限 |
+| `GESTURE_LIFT_BRAKE_MIN_MS2` | 0.15 m/s² | 逆向き減速パルス下限 |
+| `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.04 m/s | 正インパルス下限 |
+| `GESTURE_LIFT_NEG_IMPULSE_MIN_MS` | 0.015 m/s | 負インパルス下限 |
+| `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
+| `GESTURE_LIFT_PULSE_MIN_MS` / `MAX_MS` | 150 / 1800 ms | 双極パルスの時間窓 |
 | `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 10° | 静止開始時の重力方向からの保持中姿勢差上限 |
-| `GESTURE_FINAL_STILL_RMS_MS2` | 0.50 m/s² | 4サンプル静止RMS上限 |
+| `GESTURE_FINAL_STILL_RMS_MS2` | 2.0 m/s² | 4サンプル静止RMS上限 |
 | `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止保持時間 |
 | `GESTURE_GRAVITY_LP_TAU_S` | 0.30 s | 重力推定の低通時定数 |
 | `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 3000 ms | 回内成立後の最終成立期限 |

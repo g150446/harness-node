@@ -90,14 +90,17 @@ DIAG_REASON_NAMES = {
     0x21: "final_pulse_duration_invalid",
 }
 
-START_PALM_UP_Z_MIN_RATIO = 0.85
+START_PALM_UP_Z_MIN_RATIO = 0.80
 START_QUIET_HOLD_MS = 50
 START_QUIET_ACCEL_MAX_MS2 = 3.0
 PRONATION_ANGLE_MIN_DEG = 20.0
+PRONATION_START_DEG = 8.0
+PRONATION_Z_RATIO_START = 0.25
+PRONATION_Z_RATIO_DONE = 0.50
 # Final: upward acceleration pulse, braking pulse, stable pose, then hold.
-FINAL_POS_IMPULSE_MIN_MS = 0.08
-FINAL_NEG_IMPULSE_MIN_MS = 0.03
-FINAL_BRAKE_RATIO_MIN = 0.08
+FINAL_POS_IMPULSE_MIN_MS = 0.04
+FINAL_NEG_IMPULSE_MIN_MS = 0.015
+FINAL_BRAKE_RATIO_MIN = 0.05
 FINAL_TILT_MAX_DEG = 10.0
 FINAL_HOLD_MIN_MS = 500
 
@@ -148,14 +151,19 @@ def gesture_gate_eligible(
     negative_impulse_ms: float,
     final_tilt_deg: float,
     final_hold_ms: int,
+    z_ratio_delta: float = 0.0,
+    z_sign_flip: bool = False,
 ) -> bool:
     """Mirror the firmware's palm-up, pronation, lift-pulse and hold gates."""
+    pronation_ok = (
+        abs(pronation_deg) >= PRONATION_ANGLE_MIN_DEG
+        or z_ratio_delta >= PRONATION_Z_RATIO_DONE
+        or z_sign_flip
+    )
     return (
         palm_up_z_ratio >= START_PALM_UP_Z_MIN_RATIO
-        and abs(pronation_deg) >= PRONATION_ANGLE_MIN_DEG
+        and pronation_ok
         and positive_impulse_ms >= FINAL_POS_IMPULSE_MIN_MS
-        and negative_impulse_ms >= FINAL_NEG_IMPULSE_MIN_MS
-        and negative_impulse_ms / positive_impulse_ms >= FINAL_BRAKE_RATIO_MIN
         and final_tilt_deg <= FINAL_TILT_MAX_DEG
         and final_hold_ms >= FINAL_HOLD_MIN_MS
     )
@@ -224,6 +232,15 @@ def build_condition_results(
             "final_hold_timeout",
         ),
     )
+    pulse_retry = _latest_diagnostic(
+        diagnostics,
+        stage="wait_reject",
+        reasons=(
+            "final_brake_missing",
+            "final_brake_ratio_low",
+            "final_pulse_duration_invalid",
+        ),
+    )
 
     conditions: list[ConditionResult] = []
 
@@ -233,7 +250,7 @@ def build_condition_results(
     #       v1=z_ratio, v2=elapsed_ms, v3=need_ms
     #   quiet_not_ready (moving / linear too high):
     #       v1=z_ratio, v2=linear_accel, v3=max_linear
-    #   outbound_rate_low: v1=phi_deg, v2=min_phi, v3=linear_accel
+    #   outbound_rate_low: v1=phi_deg, v2=z_ratio_delta, v3=z_peak_to_peak
     pose_fail_detail: Optional[str] = None
     quiet_fail_detail: Optional[str] = None
     best_z = -1.0
@@ -349,23 +366,26 @@ def build_condition_results(
         phi_start = float(outbound_start["value1"])
         phi = float(outbound_ready["value1"])
         phi_peak = float(outbound_ready["value2"])
-        # Firmware: gravity phi in XZ plane (accel-only).
+        z_delta = abs(float(outbound_ready.get("value3") or 0.0))
         phi_ok = (
             abs(phi) >= PRONATION_ANGLE_MIN_DEG
             or abs(phi_peak) >= PRONATION_ANGLE_MIN_DEG
+            or z_delta >= PRONATION_Z_RATIO_DONE
         )
         conditions.append(
             ConditionResult(
-                "回内（重力角）",
+                "回内（重力角またはZ方向）",
                 "PASS" if phi_ok else "FAIL",
-                f"phi開始 {phi_start:.1f}° → ピーク {phi_peak:.1f}° "
-                f"（要 ≥ {PRONATION_ANGLE_MIN_DEG:.0f}°）",
+                f"phi開始 {phi_start:.1f}° → ピーク {phi_peak:.1f}°、"
+                f"Δz比 {z_delta:.2f}"
+                f"（要 phi ≥ {PRONATION_ANGLE_MIN_DEG:.0f}° または "
+                f"Δz ≥ {PRONATION_Z_RATIO_DONE:.2f}）",
             )
         )
     elif outbound_reset is not None:
         conditions.append(
             ConditionResult(
-                "回内（重力角）",
+                "回内（重力角またはZ方向）",
                 "FAIL",
                 f"phi {float(outbound_reset['value1']):+.1f}° "
                 f"({outbound_reset['reason']})",
@@ -373,11 +393,11 @@ def build_condition_results(
         )
     elif outbound_start is not None:
         conditions.append(
-            ConditionResult("回内（重力角）", "FAIL", "回内完了条件まで到達せず")
+            ConditionResult("回内（重力角またはZ方向）", "FAIL", "回内完了条件まで到達せず")
         )
     else:
         conditions.append(
-            ConditionResult("回内（重力角）", "NOT_REACHED", "回内開始を検出せず")
+            ConditionResult("回内（重力角またはZ方向）", "NOT_REACHED", "回内開始を検出せず")
         )
 
     # final_hold_start: v1=positive impulse, v2=negative impulse, v3=tilt
@@ -390,19 +410,19 @@ def build_condition_results(
             if final_start is not None
             else FINAL_NEG_IMPULSE_MIN_MS
         )
-        pulse_ok = (
-            pos_impulse >= FINAL_POS_IMPULSE_MIN_MS
-            and neg_impulse >= FINAL_NEG_IMPULSE_MIN_MS
-            and neg_impulse / pos_impulse >= FINAL_BRAKE_RATIO_MIN
-        )
+        pulse_ok = pos_impulse >= FINAL_POS_IMPULSE_MIN_MS
         brake_ratio = neg_impulse / pos_impulse if pos_impulse > 0.0 else 0.0
         conditions.append(
             ConditionResult(
                 "上昇の加速→減速パルス",
                 "PASS" if pulse_ok else "FAIL",
                 f"加速 {pos_impulse:.3f} m/s ≥ {FINAL_POS_IMPULSE_MIN_MS:.2f}、"
-                f"減速 {neg_impulse:.3f} m/s ≥ {FINAL_NEG_IMPULSE_MIN_MS:.2f}、"
-                f"比率 {brake_ratio:.2f} ≥ {FINAL_BRAKE_RATIO_MIN:.2f}",
+                f"減速 {neg_impulse:.3f} m/s"
+                + (
+                    f"、比率 {brake_ratio:.2f}"
+                    if pos_impulse > 0.0
+                    else ""
+                ),
             )
         )
     elif final_reset is not None and final_reset["reason"] in (
@@ -430,12 +450,38 @@ def build_condition_results(
         elif reason == "final_pulse_duration_invalid":
             detail = (
                 f"パルス時間 {pos_impulse:.0f} ms "
-                "（許容 150–900 ms）"
+                "（許容 150–1800 ms）"
             )
         else:
             detail = (
                 f"{reason}: 加速 {pos_impulse:.3f} m/s、"
                 f"減速 {neg_impulse:.3f} m/s"
+            )
+        conditions.append(
+            ConditionResult(
+                "上昇の加速→減速パルス",
+                "FAIL",
+                detail,
+            )
+        )
+    elif pulse_retry is not None:
+        reason = str(pulse_retry["reason"])
+        pos_impulse = float(pulse_retry.get("value1") or 0.0)
+        neg_impulse = float(pulse_retry.get("value2") or 0.0)
+        if reason == "final_brake_ratio_low":
+            detail = (
+                f"減速/加速比 {float(pulse_retry.get('value3') or 0.0):.2f} "
+                f"< {FINAL_BRAKE_RATIO_MIN:.2f}（パルス再試行）"
+            )
+        elif reason == "final_pulse_duration_invalid":
+            detail = (
+                f"パルス時間 {pos_impulse:.0f} ms "
+                "（許容 150–1800 ms、パルス再試行）"
+            )
+        else:
+            detail = (
+                f"{reason}: 加速 {pos_impulse:.3f} m/s、"
+                f"減速 {neg_impulse:.3f} m/s（パルス再試行）"
             )
         conditions.append(
             ConditionResult(
@@ -653,7 +699,7 @@ def format_event(event: GestureEvent) -> str:
         elif stage == "outbound_ready":
             suffix = (
                 f" pronation={v1:+.1f}deg peak_phi={v2:.1f}deg "
-                f"accel_norm={v3:.2f}m/s^2"
+                f"z_delta={v3:.2f}"
             )
         elif stage == "turnaround_ready":
             suffix = (
@@ -752,7 +798,7 @@ def diagnostic_record(event: GestureEvent) -> dict[str, Any]:
         record["metrics"] = {
             "pronation_angle_deg": event.value1,
             "pronation_peak_deg": event.value2,
-            "accel_norm_ms2": event.value3,
+            "z_ratio_delta": event.value3,
         }
     elif stage == "return_ready":
         record["metrics"] = {
@@ -1260,20 +1306,72 @@ def run_self_test() -> int:
     bias_record = diagnostic_record(bias)
     assert math.isclose(bias_record["metrics"]["correction_dps"], 22.0)
 
-    # Firmware boundary: palm-up, pronation, bipolar lift pulse, pose, hold.
-    eligible = (0.90, 20.0, 0.08, 0.03, 10.0, 500)
+    # Firmware boundary: palm-up, pronation (phi or Z), bipolar lift pulse, pose, hold.
+    eligible = (0.90, 20.0, 0.04, 0.015, 10.0, 500)
     assert gesture_gate_eligible(*eligible)
-    assert not gesture_gate_eligible(0.84, *eligible[1:])
+    assert gesture_gate_eligible(0.80, *eligible[1:])
+    assert not gesture_gate_eligible(0.79, *eligible[1:])
     assert not gesture_gate_eligible(0.90, 19.0, *eligible[2:])
-    assert not gesture_gate_eligible(0.90, 20.0, 0.079, *eligible[3:])
-    assert not gesture_gate_eligible(0.90, 20.0, 0.08, 0.029, *eligible[4:])
-    assert not gesture_gate_eligible(0.90, 20.0, 0.50, 0.03, 10.0, 500)
-    assert not gesture_gate_eligible(0.90, 20.0, 0.08, 0.03, 10.1, 500)
+    assert gesture_gate_eligible(0.90, 12.0, 0.04, 0.015, 10.0, 500, 0.50)
+    assert gesture_gate_eligible(0.90, 12.0, 0.04, 0.015, 10.0, 500, 0.0, True)
+    assert not gesture_gate_eligible(0.90, 20.0, 0.039, *eligible[3:])
+    assert not gesture_gate_eligible(0.90, 20.0, 0.04, 0.015, 10.1, 500)
     assert not gesture_gate_eligible(*eligible[:-1], 499)
     assert not sequence_reset_seen([])
     assert not sequence_reset_seen([{"stage": "outbound_ready"}])
     assert sequence_reset_seen(
         [{"stage": "outbound_ready"}, {"stage": "reset"}]
+    )
+    retry_then_match = [
+        {
+            "stage": "outbound_start",
+            "reason": "none",
+            "value1": 16.0,
+            "value2": 0.92,
+            "value3": 9.8,
+        },
+        {
+            "stage": "outbound_ready",
+            "reason": "none",
+            "value1": 35.0,
+            "value2": 45.0,
+            "value3": 0.55,
+        },
+        {
+            "stage": "wait_reject",
+            "reason": "final_brake_missing",
+            "value1": 1.96,
+            "value2": 0.0,
+            "value3": 0.0,
+        },
+        {
+            "stage": "final_hold_start",
+            "reason": "none",
+            "value1": 0.12,
+            "value2": 0.10,
+            "value3": 1.0,
+        },
+        {
+            "stage": "final_ready",
+            "reason": "none",
+            "value1": 0.12,
+            "value2": 525.0,
+            "value3": 1.0,
+        },
+        {
+            "stage": "match",
+            "reason": "none",
+            "value1": 35.0,
+            "value2": 0.12,
+            "value3": 525.0,
+        },
+    ]
+    assert not sequence_reset_seen(retry_then_match)
+    retry_conditions = build_condition_results(
+        retry_then_match, matched=True
+    )
+    assert all(
+        condition.status == "PASS" for condition in retry_conditions
     )
 
     passing_conditions = build_condition_results(
@@ -1290,7 +1388,7 @@ def run_self_test() -> int:
                 "reason": "none",
                 "value1": 35.0,
                 "value2": 45.0,
-                "value3": 9.81,
+                "value3": 0.55,
             },
             {
                 "stage": "final_hold_start",
@@ -1340,7 +1438,7 @@ def run_self_test() -> int:
                     "reason": "none",
                     "value1": 35.0,
                     "value2": 35.0,
-                    "value3": 9.81,
+                    "value3": 0.55,
                 },
                 {
                     "stage": "reset",
@@ -1353,6 +1451,40 @@ def run_self_test() -> int:
             matched=False,
         )
         assert any(condition.status == "FAIL" for condition in conditions)
+    z_only_conditions = build_condition_results(
+        [
+            {
+                "stage": "outbound_start",
+                "reason": "none",
+                "value1": 6.0,
+                "value2": 0.92,
+                "value3": 9.8,
+            },
+            {
+                "stage": "outbound_ready",
+                "reason": "none",
+                "value1": 12.0,
+                "value2": 12.0,
+                "value3": 0.55,
+            },
+            {
+                "stage": "final_hold_start",
+                "reason": "none",
+                "value1": 0.12,
+                "value2": 0.10,
+                "value3": 6.0,
+            },
+            {
+                "stage": "final_ready",
+                "reason": "none",
+                "value1": 0.12,
+                "value2": 525.0,
+                "value3": 6.0,
+            },
+        ],
+        matched=True,
+    )
+    assert all(condition.status == "PASS" for condition in z_only_conditions)
     print("SELF_TEST: PASS", flush=True)
     return 0
 
