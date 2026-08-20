@@ -166,7 +166,7 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 ## ジェスチャー検出アルゴリズム
 
 この章は運用時の概要です。軸調査の根拠、判定式、状態遷移、全閾値、既知の
-制約、実機テスト項目は [回内→上昇→静止仕様](flex_pronation_gesture.md)
+制約、実機テスト項目は [シェイク→掌上→挙上→掌下静止仕様](flex_pronation_gesture.md)
 を参照してください。
 
 ### IMU 軸と取り付け方向
@@ -177,26 +177,25 @@ Seeed Studio 公式の XIAO nRF52840 Sense KiCad 基板データと ST の LSM6D
 |----|------------------|------------------------|
 | `+X` | 基板長手方向、USB 端子から離れる向き | 前腕を横切る方向 |
 | `+Y` | 基板短い辺に平行（5V/GND/3V 側） | 前腕に沿う＝回内・回外軸 |
-| `+Z` | 部品面から外向き | 手のひら上向き水平の開始判定 |
+| `+Z` | 部品面から外向き | 基板水平（\|Z 比\|）と掌向きの相対判定 |
 
 資料: [Seeed Studio XIAO nRF52840 Series](https://wiki.seeedstudio.com/XIAO_BLE/)、[LSM6DS3TR-C datasheet](https://www.st.com/resource/en/datasheet/lsm6ds3tr-c.pdf)
 
-### 録音開始トリガー（回内 → 上昇 → 静止）
+### 録音開始トリガー（シェイク → 掌上 → 挙上 → 掌下静止）
 
 XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基板X軸を前腕と直交、Y軸を
-前腕に沿わせる。右手・左手とUSB端子方向の違いは、回内の相対符号で吸収する。
+前腕に沿わせる。右手・左手とUSB端子方向の違いは、シェイク後の相対符号で吸収する。
 
-1. 甲側装着で手のひら上向き、Z絶対比0.80以上かつ線形加速度3.0 m/s²以下を50 ms維持してarmする（開始|Y|上限なし）。基準phiとazはこの時点で固定する。
-2. arm後2.5秒以内に、重力phiが8°以上、またはZ比が0.25以上変化する、またはZ符号が反転する、またはZピーク間が4.0 m/s²以上なら回内開始。静止中でも判定し、Zが掌上を下回ってもarmは維持する。
-3. 最短120 msのあと、phiが20°以上、またはZ比が0.50以上変化、またはZ符号反転で回内成立。成立後の静止は上昇検出まで許容する。
-4. 重力LPで姿勢成分を除いた線形加速度を現在の重力方向へ投影し、上向き加速パルスを検出する（物理動作の目安は約5 cm上昇。変位cmは積分しない）。減速パルスがあれば早期にholdへ進み、なくても正インパルスが下限以上なら1800 ms後にholdへ進む。
-5. 短時間の線形加速度RMSが静止を示した時点の重力方向を固定し、そこからの角度差10°以内を500 ms維持すると録音を開始する。
+1. 甲側装着で手のひら下向き、Z絶対比0.80以上の水平姿勢で短く1回シェイクする。重力直交の線形加速度について、500 ms窓の峰間が5.0 m/s²以上かつ`|平均| < 0.4 × 峰間`なら成立。持続する同じ符号の横Gでは不成立。
+2. シェイク後2.5秒以内に掌上。基準はシェイク窓開始時の重力LP。3D角15°以上、phi 8°以上、Z比0.25以上の変化、またはZ符号反転で成立。成立時に基準を取り直す。
+3. 重力LPで姿勢成分を除いた線形加速度を現在の重力方向へ投影し、上向き加速パルスを検出する（掌向きは見ない。物理動作の目安は約5 cm上昇）。
+4. holdは掌上基準からの反転（phi 20° / Δz 0.50 / Z符号）が取れてから開始する。短時間の線形加速度RMSが静止を示した時点の重力方向を固定し、そこからの角度差10°以内を500 ms維持すると録音を開始する。
 
 回外・最終仰角帯・甲上条件は要求しない。詳細は`docs/flex_pronation_gesture.md`を参照する。
 
 ### 録音停止トリガー
 
-録音中に次の `motion_active` イベントが発生すると `stop_requested = true` となり、DMIC を停止して `0x02` を送信します。
+録音開始時点の重力 LP（掌下）を基準に保存する。開始後 1200 ms を過ぎたあと、シェイク後掌上と同じ緩い反転（3D 角 ≥ 15°、phi ≥ 8°、Z 比変化 ≥ 0.25、または Z 符号反転、かつ `|a|` が 7.5–12.5 m/s²）で `stop_requested = true` となり、DMIC を停止して `0x02` を送信する。手を下ろすだけでは停止しない。`motion_active` は睡眠タイマーとイベント通知用に残し、録音停止には使わない。ホスト `0x00` とシリアル `'s'` による停止は従来どおり。
 
 ### ライトスリープ
 
@@ -241,19 +240,20 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
-| `GESTURE_QUIET_HOLD_MS` | 50 ms | 開始前に必要な加速度安定時間 |
-| `GESTURE_START_ARM_MS` | 2500 ms | 静止成立後の開始受付時間 |
-| `GESTURE_START_PALM_UP_Z_MIN_RATIO` | 0.80 | 掌上開始時のZ絶対比下限（初回armのみ） |
-| `GESTURE_QUIET_ACCEL_MS2` | 3.0 m/s² | 開始静止の線形加速度上限 |
-| `GESTURE_PRONATION_START_DEG` | 8° | 重力phiによる回内開始角 |
-| `GESTURE_PRONATION_MIN_DEG` | 20° | 重力phiによる回内成立角 |
-| `GESTURE_PRONATION_Z_RATIO_START` | 0.25 | 回内開始のZ比変化 |
-| `GESTURE_PRONATION_Z_RATIO_DONE` | 0.50 | 回内成立のZ比変化 |
-| `GESTURE_PRONATION_Z_PTP_START_MS2` | 4.0 m/s² | 回内開始のZピーク間 |
+| `GESTURE_START_PALM_UP_Z_MIN_RATIO` | 0.80 | 開始時の基板水平（\|Z比\|） |
+| `GESTURE_SHAKE_WINDOW_SAMPLES` | 20 | シェイク窓（約500 ms） |
+| `GESTURE_SHAKE_PTP_MIN_MS2` | 5.0 m/s² | 重力直交成分の峰間 |
+| `GESTURE_SHAKE_MEAN_RATIO_MAX` | 0.4 | \|平均\| / 峰間 の上限 |
+| `GESTURE_SHAKE_AXIS_MIN_MS2` | 2.0 m/s² | シェイク軸固定の直交成分下限 |
+| `GESTURE_QUIET_ACCEL_MS2` | 3.0 m/s² | 静止判定の線形加速度上限 |
+| `GESTURE_PRONATION_MIN_DEG` | 20° | hold 反転の重力phi |
+| `GESTURE_PRONATION_Z_RATIO_DONE` | 0.50 | hold 反転のZ比変化 |
 | `GESTURE_PRONATION_Z_SIGN_MIN_MS2` | 2.0 m/s² | Z符号反転と認める\|az\|下限 |
-| `GESTURE_INCOMPLETE_SETTLE_MS` | 800 ms | 回内未完了の静止リセット |
-| `GESTURE_PHASE_MIN_DURATION_MS` | 120 ms | 回内フェーズ最短時間 |
-| `GESTURE_OUTBOUND_MAX_DURATION_MS` | 2000 ms | 回内の最長時間 |
+| `GESTURE_OUTBOUND_MIN_DEG` | 8° | シェイク後掌上のXZ phi |
+| `GESTURE_OUTBOUND_TILT_MIN_DEG` | 15° | シェイク後掌上の重力3D角 |
+| `GESTURE_OUTBOUND_Z_RATIO_DONE` | 0.25 | シェイク後掌上のZ比変化 |
+| `GESTURE_PHASE_MIN_DURATION_MS` | 120 ms | 掌上フェーズ最短時間 |
+| `GESTURE_OUTBOUND_MAX_DURATION_MS` | 2500 ms | シェイク後の掌上期限 |
 | `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.40 m/s² | 上向き加速パルス下限 |
 | `GESTURE_LIFT_BRAKE_MIN_MS2` | 0.15 m/s² | 逆向き減速パルス下限 |
 | `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.04 m/s | 正インパルス下限 |
@@ -264,8 +264,9 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 | `GESTURE_FINAL_STILL_RMS_MS2` | 2.0 m/s² | 4サンプル静止RMS上限 |
 | `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止保持時間 |
 | `GESTURE_GRAVITY_LP_TAU_S` | 0.30 s | 重力推定の低通時定数 |
-| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 3000 ms | 回内成立後の最終成立期限 |
-| `GESTURE_SEQUENCE_TIMEOUT_MS` | 5000 ms | 全シーケンス期限 |
+| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 5000 ms | 掌上成立後の最終成立期限 |
+| `GESTURE_SEQUENCE_TIMEOUT_MS` | 9000 ms | 全シーケンス期限 |
+| `GESTURE_RETRIGGER_BLOCK_MS` | 1200 ms | 開始直後の停止抑制 / 停止後の再開始抑制 |
 | `SLEEP_IDLE_TIMEOUT_MS` | 10000 ms | ライトスリープ移行までの無動作時間 |
 | `SLEEP_POLL_INTERVAL_MS` | 50 ms | スリープ中の IMU ポーリング間隔 |
 
@@ -352,14 +353,16 @@ python3 gesture_monitor.py
 
 表示イベント: `motion_active`（x/y/z）、`motion_settled`（x/y/z + elapsed/peak/dist）、`recording_start`、`recording_stop`、`sleep_enter`、`sleep_wake`
 
-### gesture_validator.py — 回内→上昇→静止ジェスチャー検証
+### gesture_validator.py — シェイク→掌上→挙上→掌下静止ジェスチャー検証
 
-試行ごとにカウントダウンと Ping 音を合図に、回内→約5 cm上昇→0.5秒静止を
-対話検証する。条件ごとの `[OK]` / `[NG]` / `[--]` を表示し、生の診断ログは JSON へ保存する。
+試行ごとにカウントダウンと Ping 音を合図に、シェイク→掌上→挙上→掌下で0.5秒静止、
+続けて掌上で録音終了するかを対話検証する。条件ごとの `[OK]` / `[NG]` / `[--]` を表示し、
+生の診断ログは JSON へ保存する。GO後の判定時間は既定15秒。開始後はホスト `0x00` を送らず、
+掌上の `recording_stop` を待つ。
 
 ```bash
 cd mac_client
-venv/bin/python gesture_validator.py --trials 1 \
+venv/bin/python gesture_validator.py --trials 1 --window 15 \
   --json-output /private/tmp/harness-node-volar-sequence.json
 venv/bin/python gesture_validator.py --self-test
 ```
