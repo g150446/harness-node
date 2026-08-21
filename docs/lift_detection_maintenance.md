@@ -23,14 +23,14 @@ nRF52840 Sense の加速度センサだけを使用する。
    - `|Z 比| ≥ 0.80` で基板が水平なときだけ、重力直交の線形加速度をシェイク窓へ入れる。
    - 500 ms 窓の峰間と平均比で 1 回の短い振りを確認し、持続横 G を落とす。
 2. `GESTURE_OUTBOUND`
-   - シェイク窓開始時の重力 LP 基準から、3D 角 / 緩い phi / Δz / Z 符号反転で掌上成立。
-   - 成立時に phi / az を掌上基準として取り直す。未完了のまま 2500 ms で reset。
+   - シェイク窓開始時の重力 LP 基準から、3D 角 / phi / Δz / Z 符号反転で掌上成立。
+   - 成立時に phi / az を掌上基準として取り直す。未完了のまま 1500 ms で reset。
 3. `GESTURE_HOLDING_FINAL`
    - `WAIT_ACCEL` / `WAIT_BRAKE`: `a_up` パルス。掌向きは見ない。
    - `WAIT_HOLD`: 掌上基準からの反転が取れてから RMS 静止と 500 ms hold。
    - 反転できずに期限切れなら `lift_palm_still_up`。
 4. 録音中
-   - 開始時の重力 LP を基準に保存し、緩い掌上反転で録音停止。
+   - 開始時の重力 LP を基準に保存し、掌上反転で録音停止。
    - 手下ろしでは止めない。`motion_active` でも止めない。
 
 上向き加速と逆向き減速は、連続サンプル数、正負インパルス、
@@ -49,10 +49,10 @@ nRF52840 Sense の加速度センサだけを使用する。
 | `GESTURE_PRONATION_MIN_DEG` | 20° | hold 反転角（phi）。Z 比 0.50 または符号反転でも成立 |
 | `GESTURE_PRONATION_Z_RATIO_DONE` | 0.50 | hold 反転の Z 比変化 |
 | `GESTURE_PRONATION_Z_SIGN_MIN_MS2` | 2.0 m/s² | Z 符号反転と認める \|az\| 下限 |
-| `GESTURE_OUTBOUND_MIN_DEG` | 8° | シェイク後掌上の XZ phi |
-| `GESTURE_OUTBOUND_TILT_MIN_DEG` | 15° | シェイク後掌上の重力 3D 角 |
-| `GESTURE_OUTBOUND_Z_RATIO_DONE` | 0.25 | シェイク後掌上の Z 比変化 |
-| `GESTURE_OUTBOUND_MAX_DURATION_MS` | 2500 ms | シェイク後の掌上期限 |
+| `GESTURE_OUTBOUND_MIN_DEG` | 12° | シェイク後掌上の XZ phi |
+| `GESTURE_OUTBOUND_TILT_MIN_DEG` | 20° | シェイク後掌上の重力 3D 角 |
+| `GESTURE_OUTBOUND_Z_RATIO_DONE` | 0.35 | シェイク後掌上の Z 比変化 |
+| `GESTURE_OUTBOUND_MAX_DURATION_MS` | 1500 ms | シェイク後の掌上期限 |
 | `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.40 m/s² | 上向き加速パルス下限 |
 | `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.04 m/s | 正インパルス下限 |
 | `GESTURE_LIFT_BRAKE_MIN_MS2` | 0.15 m/s² | 逆向き減速パルス下限 |
@@ -60,10 +60,10 @@ nRF52840 Sense の加速度センサだけを使用する。
 | `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
 | `GESTURE_LIFT_PULSE_MIN_MS` / `MAX_MS` | 150 / 1800 ms | パルス時間窓 |
 | `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 10° | hold 中の姿勢差上限 |
-| `GESTURE_FINAL_STILL_RMS_MS2` | 2.0 m/s² | 静止進入 RMS 上限 |
+| `GESTURE_FINAL_STILL_RMS_MS2` | 2.5 m/s² | 静止進入 RMS 上限 |
 | `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止時間 |
-| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 5000 ms | 掌上後の最終成立期限 |
-| `GESTURE_SEQUENCE_TIMEOUT_MS` | 9000 ms | 全シーケンス期限 |
+| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 4000 ms | 掌上後の最終成立期限 |
+| `GESTURE_SEQUENCE_TIMEOUT_MS` | 6000 ms | 全シーケンス期限 |
 | `GESTURE_RETRIGGER_BLOCK_MS` | 1200 ms | 開始直後の停止抑制 / 停止後の再開始抑制 |
 
 実装変更時は `docs/flex_pronation_gesture.md` と
@@ -109,25 +109,29 @@ cd nordic-main
 掌上のまま上げる、持続横 G、歩行で no-match を確認する。車載振動は安全に
 実施できる場合だけ追加する。停止は手下ろしではなく掌上で確認する。
 
-2026-08-20 の確認結果（`0.0.47`、slot0 active+confirmed）:
+2026-08-21 の確認結果（`0.0.49`、slot0 active+confirmed）:
 
 - validator self-test: PASS
 - `xiao_ble/nrf52840/sense` + sysbuild: PASS
-- 正例（シェイク→掌上→挙上→掌下静止→掌上停止）: 3/3 PASS
-  - 開始 5.5–6.3 s。停止は開始姿勢からの緩い phi（9.7–15.2°）。手下ろしでは止めていない
+- 正例（1 回ずつ 3 試行）: 開始ジェスチャ 3/3、完全合格（掌上停止含む）2/3
+  - 開始 4.9–5.8 s。掌下静止は RMS ≤ 2.5 m/s²・掌上後 4 s 期限で成立
+  - 1 試行は開始のみ成功し掌上停止が判定窓内に届かず FAIL
+- `0.0.48` 時点では掌下静止が RMS 2.0 / 期限 3 s で詰まりやすいことがあり、
+  RMS 2.5 と最終期限 4 s に緩和して `0.0.49` とした
 
 ## 保守上の注意
 
 - ジャイロは省電力方針により無効。再有効化は要件確認後に行う。
 - 単一閾値を下げるだけで合格率を上げない。シェイクの平均比と掌下 hold（20°）を維持する。
-- シェイク後の掌上だけ 3D 傾きと緩い phi を使う。hold の反転ゲートは共有しない。
+- 運転誤検出対策として掌上窓 1.5 s・掌上ゲート（phi 12° / 3D 20° / Δz 0.35）を厳しめに保つ。
+- シェイク後の掌上だけ 3D 傾きと phi を使う。hold の反転ゲートは共有しない。
 - 掌上基準はシェイク窓開始時の重力 LP。成立瞬間の raw では武装しない。
 - 重力 LP はパルス開始まで追従し、hold の姿勢基準は静止進入時に固定する。
 - シェイク成立後に重力 LP をリセットしない。
 - 録音停止の基準は開始時の重力 LP。`reset_gesture_sequence()` では消さない。
-- 録音停止は開始姿勢からの緩い掌上反転。手下ろしと 3軸 `motion_active` では止めない。
+- 録音停止は開始姿勢からの掌上反転。手下ろしと 3軸 `motion_active` では止めない。
 - 掌上/掌下は装着 Z 符号に依存させず、シェイク基準と掌上基準からの相対変化で見る。
-- 最終静止の RMS 上限は運転中の振動を見込んで 2.0 m/s²。500 ms の継続は維持する。
+- 最終静止の RMS 上限は運転中の振動を見込んで 2.5 m/s²。500 ms の継続は維持する。
 - 減速パルス不足は `wait_reject` の再試行であり、`reset` ではない。
 - 実機ログではシェイク峰間/平均、掌上基準からの phi/Δz、正負インパルス、姿勢差、hold 時間、reset / wait_reject reasonを確認する。
 

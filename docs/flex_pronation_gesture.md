@@ -1,7 +1,7 @@
 # シェイク→掌上→挙上→掌下静止ジェスチャー仕様
 
 対象デバイス: Seeed Studio XIAO nRF52840 Sense  
-対象ファームウェア: HarnessNode `0.0.47` 以降
+対象ファームウェア: HarnessNode `0.0.49` 以降
 
 ## 発動条件
 
@@ -11,9 +11,9 @@
   - シェイクは重力に直交する線形加速度だけを見る
   - 500 ms 窓の峰間 ≥ 5.0 m/s²、かつ `|平均| < 0.4 × 峰間`
   - 持続する同じ符号の横 G（運転）では平均 ≈ ピークとなり不成立
-- シェイク後 2.5 秒以内に掌を上へ反転させる（掌上）
+- シェイク後 1.5 秒以内に掌を上へ反転させる（掌上）
   - 基準はシェイク窓の最初のサンプル時点の重力 LP（振った瞬間の raw ではない）
-  - 相対変化: 重力ベクトルの 3D 角 ≥ 15°、または phi ≥ 8°、または `|Δz比| ≥ 0.25`、または Z 符号反転
+  - 相対変化: 重力ベクトルの 3D 角 ≥ 20°、または phi ≥ 12°、または `|Δz比| ≥ 0.35`、または Z 符号反転
   - 口元への掌上は前腕ピッチになりやすく、XZ の phi だけでは拾えない
   - 装着ごとの raw Z 符号に依存する絶対掌上は使わない
   - 掌上成立時に基準 phi / az を取り直す
@@ -42,8 +42,8 @@
 
 ```text
 board_flat = abs(z / |a|) >= 0.80
-palm_up_after_shake = 3D tilt >= 15 deg or phi >= 8 deg
-  or |dz_ratio| >= 0.25 or Z sign flip
+palm_up_after_shake = 3D tilt >= 20 deg or phi >= 12 deg
+  or |dz_ratio| >= 0.35 or Z sign flip
   (reference = gravity LP at first shake-window sample)
 palm_down_after_lift = flip from palm-up reference
   (phi >= 20 deg or |dz_ratio| >= 0.50 or Z sign flip)
@@ -66,9 +66,9 @@ palm_down_after_lift = flip from palm-up reference
 
 録音開始時の重力 LP（掌下静止）を基準として保存する。`reset_gesture_sequence()` では消さない。録音中も重力LPは継続する。
 
-開始後 1200 ms を過ぎたあと、シェイク後掌上と同じ緩いゲートで反転したら即座に停止する（hold は待たない）:
+開始後 1200 ms を過ぎたあと、シェイク後掌上と同じゲートで反転したら即座に停止する（hold は待たない）:
 
-1. 重力ベクトルの 3D 角 ≥ 15°、または phi ≥ 8°、または `|Δz比| ≥ 0.25`、または Z 符号反転
+1. 重力ベクトルの 3D 角 ≥ 20°、または phi ≥ 12°、または `|Δz比| ≥ 0.35`、または Z 符号反転
 2. `|a|` が 7.5–12.5 m/s²
 
 手を重力方向へ下ろすだけでは停止しない。`motion_active` でも止めない。ホスト `0x00` とシリアル `'s'` は従来どおり。
@@ -91,18 +91,18 @@ WAIT_BRAKE で 1800 ms 経過し正インパルスがあれば WAIT_HOLD へ。�
 | シェイク峰間 | 重力直交成分 ≥ 5.0 m/s² |
 | シェイク平均比 | \|平均\| < 0.4 × 峰間 |
 | シェイク軸下限 | 直交成分 ≥ 2.0 m/s² で軸を固定 |
-| 掌上 | シェイク窓開始時の重力 LP から 3D ≥ 15°、phi ≥ 8°、\|Δz比\| ≥ 0.25、または Z 符号反転 |
-| 掌上窓 | シェイク後 2500 ms |
+| 掌上 | シェイク窓開始時の重力 LP から 3D ≥ 20°、phi ≥ 12°、\|Δz比\| ≥ 0.35、または Z 符号反転 |
+| 掌上窓 | シェイク後 1500 ms |
 | 上向き加速度 | `a_up` ≥ 0.40 m/s² を2サンプル、正インパルス ≥ 0.04 m/s |
 | 逆向き減速 | 任意。`a_up` ≤ -0.15 m/s² なら早期に hold へ |
 | パルス形状 | 150–1800 ms。1800 ms 時点で正インパルスがあれば hold へ |
 | hold の掌 | 掌上基準からの反転（phi ≥ 20° / \|Δz比\| ≥ 0.50 / Z 符号）。挙上中の掌向きは見ない |
 | 保持中の姿勢差 | 静止開始時の重力方向から ≤ 10° |
-| 静止進入 | 4サンプルの線形加速度 RMS ≤ 2.0 m/s² |
+| 静止進入 | 4サンプルの線形加速度 RMS ≤ 2.5 m/s² |
 | 最終静止 | 500 ms |
-| 最終到達期限 | 掌上後 5000 ms |
-| 全シーケンス | 9000 ms |
-| 録音停止 | 開始姿勢から 3D ≥ 15°、phi ≥ 8°、\|Δz比\| ≥ 0.25、または Z 符号反転。\|a\| 7.5–12.5 m/s² |
+| 最終到達期限 | 掌上後 4000 ms |
+| 全シーケンス | 6000 ms |
+| 録音停止 | 開始姿勢から 3D ≥ 20°、phi ≥ 12°、\|Δz比\| ≥ 0.35、または Z 符号反転。\|a\| 7.5–12.5 m/s² |
 | 録音停止 開始抑制 | 1200 ms |
 
 ## 診断イベント（抜粋）
@@ -122,9 +122,9 @@ WAIT_BRAKE で 1800 ms 経過し正インパルスがあれば WAIT_HOLD へ。�
 | `wait_reject` reason `final_brake_missing` | 逆向き減速が不足。パルス再試行 |
 | `wait_reject` reason `final_brake_ratio_low` | 減速/加速比不足。パルス再試行 |
 | `wait_reject` reason `final_pulse_duration_invalid` | パルスが150 ms未満。パルス再試行 |
-| `reset` reason `outbound_timeout` | シェイク後 2500 ms 以内に掌上不成。v1=phi、v2=3D角、v3=Δz |
-| `reset` reason `final_accel_missing` | 掌上後 5000 ms 以内に上向き加速が不足 |
-| `reset` reason `final_brake_missing` | 掌上後 5000 ms 以内に減速パルス不成 |
+| `reset` reason `outbound_timeout` | シェイク後 1500 ms 以内に掌上不成。v1=phi、v2=3D角、v3=Δz |
+| `reset` reason `final_accel_missing` | 掌上後 4000 ms 以内に上向き加速が不足 |
+| `reset` reason `final_brake_missing` | 掌上後 4000 ms 以内に減速パルス不成 |
 | `reset` reason `final_tilt_unstable` | 上昇後の姿勢差が過大 |
 
 ## 検証
@@ -153,4 +153,4 @@ cd mac_client && venv/bin/python ota_updater.py --device HarnessNode \
 ```
 
 `prj.conf` の `CONFIG_MCUBOOT_IMGTOOL_SIGN_VERSION` と `VERSION` を揃えてからビルドすること。  
-更新後 version `0.0.47` が slot0 active+confirmed であること。
+更新後 version `0.0.49` が slot0 active+confirmed であること。

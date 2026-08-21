@@ -116,7 +116,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_START_GRAVITY_MIN_MS2           8.5f
 #define GESTURE_START_GRAVITY_MAX_MS2          11.5f
 #define GESTURE_PHASE_MIN_DURATION_MS           120
-#define GESTURE_OUTBOUND_MAX_DURATION_MS       2500
+#define GESTURE_OUTBOUND_MAX_DURATION_MS       1500
 /* Hold flip: gravity rotation in XZ (phi) or a clear Z-axis direction change. */
 #define GESTURE_PRONATION_MIN_DEG               20.0f
 #define GESTURE_PRONATION_Z_RATIO_DONE           0.50f
@@ -124,9 +124,9 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_PRONATION_GRAVITY_MIN_MS2        7.5f
 #define GESTURE_PRONATION_GRAVITY_MAX_MS2       12.5f
 /* Outbound palm-up is looser than hold: pitch (3D) counts, not only XZ phi. */
-#define GESTURE_OUTBOUND_MIN_DEG                 8.0f
-#define GESTURE_OUTBOUND_Z_RATIO_DONE            0.25f
-#define GESTURE_OUTBOUND_TILT_MIN_DEG            15.0f
+#define GESTURE_OUTBOUND_MIN_DEG                 12.0f
+#define GESTURE_OUTBOUND_Z_RATIO_DONE            0.35f
+#define GESTURE_OUTBOUND_TILT_MIN_DEG            20.0f
 /* Final: upward acceleration pulse, braking pulse, then a quiet hold. */
 #define GESTURE_LIFT_ACCEL_MIN_MS2               0.40f
 #define GESTURE_LIFT_BRAKE_MIN_MS2               0.15f
@@ -138,10 +138,10 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_LIFT_CONSECUTIVE_SAMPLES             2
 #define GESTURE_LIFT_FINAL_TILT_MAX_DEG           10.0f
 #define GESTURE_FINAL_HOLD_MS                     500
-#define GESTURE_FINAL_HOLD_TIMEOUT_MS            5000
-#define GESTURE_FINAL_STILL_RMS_MS2              2.0f
+#define GESTURE_FINAL_HOLD_TIMEOUT_MS            4000
+#define GESTURE_FINAL_STILL_RMS_MS2              2.5f
 #define GESTURE_FINAL_RMS_WINDOW_SAMPLES             4
-#define GESTURE_SEQUENCE_TIMEOUT_MS              9000
+#define GESTURE_SEQUENCE_TIMEOUT_MS              6000
 #define GESTURE_RETRIGGER_BLOCK_MS           1200
 #define GESTURE_GRAVITY_LP_TAU_S                 0.30f
 #define GESTURE_QUIET_ACCEL_MS2                  3.0f

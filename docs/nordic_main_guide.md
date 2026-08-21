@@ -187,15 +187,15 @@ XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基�
 前腕に沿わせる。右手・左手とUSB端子方向の違いは、シェイク後の相対符号で吸収する。
 
 1. 甲側装着で手のひら下向き、Z絶対比0.80以上の水平姿勢で短く1回シェイクする。重力直交の線形加速度について、500 ms窓の峰間が5.0 m/s²以上かつ`|平均| < 0.4 × 峰間`なら成立。持続する同じ符号の横Gでは不成立。
-2. シェイク後2.5秒以内に掌上。基準はシェイク窓開始時の重力LP。3D角15°以上、phi 8°以上、Z比0.25以上の変化、またはZ符号反転で成立。成立時に基準を取り直す。
+2. シェイク後1.5秒以内に掌上。基準はシェイク窓開始時の重力LP。3D角20°以上、phi 12°以上、Z比0.35以上の変化、またはZ符号反転で成立。成立時に基準を取り直す。
 3. 重力LPで姿勢成分を除いた線形加速度を現在の重力方向へ投影し、上向き加速パルスを検出する（掌向きは見ない。物理動作の目安は約5 cm上昇）。
-4. holdは掌上基準からの反転（phi 20° / Δz 0.50 / Z符号）が取れてから開始する。短時間の線形加速度RMSが静止を示した時点の重力方向を固定し、そこからの角度差10°以内を500 ms維持すると録音を開始する。
+4. holdは掌上基準からの反転（phi 20° / Δz 0.50 / Z符号）が取れてから開始する。線形加速度RMS ≤ 2.5 m/s² が静止を示した時点の重力方向を固定し、そこからの角度差10°以内を500 ms維持すると録音を開始する（掌上後 4 s 以内）。
 
 回外・最終仰角帯・甲上条件は要求しない。詳細は`docs/flex_pronation_gesture.md`を参照する。
 
 ### 録音停止トリガー
 
-録音開始時点の重力 LP（掌下）を基準に保存する。開始後 1200 ms を過ぎたあと、シェイク後掌上と同じ緩い反転（3D 角 ≥ 15°、phi ≥ 8°、Z 比変化 ≥ 0.25、または Z 符号反転、かつ `|a|` が 7.5–12.5 m/s²）で `stop_requested = true` となり、DMIC を停止して `0x02` を送信する。手を下ろすだけでは停止しない。`motion_active` は睡眠タイマーとイベント通知用に残し、録音停止には使わない。ホスト `0x00` とシリアル `'s'` による停止は従来どおり。
+録音開始時点の重力 LP（掌下）を基準に保存する。開始後 1200 ms を過ぎたあと、シェイク後掌上と同じ反転（3D 角 ≥ 20°、phi ≥ 12°、Z 比変化 ≥ 0.35、または Z 符号反転、かつ `|a|` が 7.5–12.5 m/s²）で `stop_requested = true` となり、DMIC を停止して `0x02` を送信する。手を下ろすだけでは停止しない。`motion_active` は睡眠タイマーとイベント通知用に残し、録音停止には使わない。ホスト `0x00` とシリアル `'s'` による停止は従来どおり。
 
 ### ライトスリープ
 
@@ -249,11 +249,11 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 | `GESTURE_PRONATION_MIN_DEG` | 20° | hold 反転の重力phi |
 | `GESTURE_PRONATION_Z_RATIO_DONE` | 0.50 | hold 反転のZ比変化 |
 | `GESTURE_PRONATION_Z_SIGN_MIN_MS2` | 2.0 m/s² | Z符号反転と認める\|az\|下限 |
-| `GESTURE_OUTBOUND_MIN_DEG` | 8° | シェイク後掌上のXZ phi |
-| `GESTURE_OUTBOUND_TILT_MIN_DEG` | 15° | シェイク後掌上の重力3D角 |
-| `GESTURE_OUTBOUND_Z_RATIO_DONE` | 0.25 | シェイク後掌上のZ比変化 |
+| `GESTURE_OUTBOUND_MIN_DEG` | 12° | シェイク後掌上のXZ phi |
+| `GESTURE_OUTBOUND_TILT_MIN_DEG` | 20° | シェイク後掌上の重力3D角 |
+| `GESTURE_OUTBOUND_Z_RATIO_DONE` | 0.35 | シェイク後掌上のZ比変化 |
 | `GESTURE_PHASE_MIN_DURATION_MS` | 120 ms | 掌上フェーズ最短時間 |
-| `GESTURE_OUTBOUND_MAX_DURATION_MS` | 2500 ms | シェイク後の掌上期限 |
+| `GESTURE_OUTBOUND_MAX_DURATION_MS` | 1500 ms | シェイク後の掌上期限 |
 | `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.40 m/s² | 上向き加速パルス下限 |
 | `GESTURE_LIFT_BRAKE_MIN_MS2` | 0.15 m/s² | 逆向き減速パルス下限 |
 | `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.04 m/s | 正インパルス下限 |
@@ -261,11 +261,11 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 | `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
 | `GESTURE_LIFT_PULSE_MIN_MS` / `MAX_MS` | 150 / 1800 ms | 双極パルスの時間窓 |
 | `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 10° | 静止開始時の重力方向からの保持中姿勢差上限 |
-| `GESTURE_FINAL_STILL_RMS_MS2` | 2.0 m/s² | 4サンプル静止RMS上限 |
+| `GESTURE_FINAL_STILL_RMS_MS2` | 2.5 m/s² | 4サンプル静止RMS上限 |
 | `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止保持時間 |
 | `GESTURE_GRAVITY_LP_TAU_S` | 0.30 s | 重力推定の低通時定数 |
-| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 5000 ms | 掌上成立後の最終成立期限 |
-| `GESTURE_SEQUENCE_TIMEOUT_MS` | 9000 ms | 全シーケンス期限 |
+| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 4000 ms | 掌上成立後の最終成立期限 |
+| `GESTURE_SEQUENCE_TIMEOUT_MS` | 6000 ms | 全シーケンス期限 |
 | `GESTURE_RETRIGGER_BLOCK_MS` | 1200 ms | 開始直後の停止抑制 / 停止後の再開始抑制 |
 | `SLEEP_IDLE_TIMEOUT_MS` | 10000 ms | ライトスリープ移行までの無動作時間 |
 | `SLEEP_POLL_INTERVAL_MS` | 50 ms | スリープ中の IMU ポーリング間隔 |

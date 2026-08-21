@@ -102,11 +102,11 @@ START_QUIET_ACCEL_MAX_MS2 = 3.0
 SHAKE_PTP_MIN_MS2 = 5.0
 SHAKE_MEAN_RATIO_MAX = 0.4
 # Outbound palm-up (hold flip stays 20° / 0.50 in firmware).
-PRONATION_ANGLE_MIN_DEG = 8.0
-PRONATION_TILT_MIN_DEG = 15.0
-PRONATION_START_DEG = 8.0
-PRONATION_Z_RATIO_START = 0.25
-PRONATION_Z_RATIO_DONE = 0.25
+PRONATION_ANGLE_MIN_DEG = 12.0
+PRONATION_TILT_MIN_DEG = 20.0
+PRONATION_START_DEG = 12.0
+PRONATION_Z_RATIO_START = 0.35
+PRONATION_Z_RATIO_DONE = 0.35
 HOLD_PRONATION_ANGLE_MIN_DEG = 20.0
 HOLD_PRONATION_Z_RATIO_DONE = 0.50
 # Final: upward acceleration pulse, braking pulse, stable pose, then hold.
@@ -1411,22 +1411,22 @@ def run_self_test() -> int:
     assert gesture_gate_eligible(*eligible)
     assert gesture_gate_eligible(0.80, *eligible[1:])
     assert not gesture_gate_eligible(0.79, *eligible[1:])
-    assert not gesture_gate_eligible(0.90, 7.9, *eligible[2:])
-    assert gesture_gate_eligible(0.90, 8.0, *eligible[2:])
-    assert gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 10.0, 500, 0.25)
-    assert not gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 10.0, 500, 0.24)
+    assert not gesture_gate_eligible(0.90, 11.9, *eligible[2:])
+    assert gesture_gate_eligible(0.90, 12.0, *eligible[2:])
+    assert gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 10.0, 500, 0.35)
+    assert not gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 10.0, 500, 0.34)
     assert gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 10.0, 500, 0.0, True)
     assert gesture_gate_eligible(
-        0.90, 4.0, 0.04, 0.015, 10.0, 500, palm_up_tilt_deg=15.0
+        0.90, 4.0, 0.04, 0.015, 10.0, 500, palm_up_tilt_deg=20.0
     )
     assert not gesture_gate_eligible(
-        0.90, 4.0, 0.04, 0.015, 10.0, 500, palm_up_tilt_deg=14.9
+        0.90, 4.0, 0.04, 0.015, 10.0, 500, palm_up_tilt_deg=19.9
     )
-    assert recording_stop_palm_up_eligible(8.0)
-    assert recording_stop_palm_up_eligible(4.0, palm_up_tilt_deg=15.0)
-    assert recording_stop_palm_up_eligible(4.0, z_ratio_delta=0.25)
+    assert recording_stop_palm_up_eligible(12.0)
+    assert recording_stop_palm_up_eligible(4.0, palm_up_tilt_deg=20.0)
+    assert recording_stop_palm_up_eligible(4.0, z_ratio_delta=0.35)
     assert recording_stop_palm_up_eligible(4.0, z_sign_flip=True)
-    assert not recording_stop_palm_up_eligible(7.9)
+    assert not recording_stop_palm_up_eligible(11.9)
     assert not gesture_gate_eligible(0.90, 20.0, 0.039, *eligible[3:])
     assert not gesture_gate_eligible(0.90, 20.0, 0.04, 0.015, 10.1, 500)
     assert not gesture_gate_eligible(*eligible[:-1], 499)
