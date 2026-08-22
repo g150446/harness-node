@@ -127,8 +127,14 @@ FINAL_TILT_MAX_DEG = 15.0
 FINAL_HOLD_MIN_MS = 400
 FINAL_STILL_RMS_MS2 = 3.0
 FINAL_QUIET_RATE_DPS = 90.0
-OUTBOUND_GYRO_ANGLE_MIN_DEG = 25.0
-OUTBOUND_GYRO_PEAK_DPS = 35.0
+OUTBOUND_GYRO_INTEGRATE_RATE_DPS = 20.0
+OUTBOUND_GYRO_ANGLE_MIN_DEG = 45.0
+OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS = 30.0
+OUTBOUND_GYRO_PEAK_DPS = 50.0
+STOP_GYRO_INTEGRATE_RATE_DPS = 20.0
+STOP_GYRO_ANGLE_MIN_DEG = 45.0
+STOP_GYRO_ANGLE_PEAK_MIN_DPS = 30.0
+STOP_GYRO_PEAK_DPS = 50.0
 
 
 @dataclass(frozen=True)
@@ -225,10 +231,11 @@ def recording_stop_palm_up_eligible(
         or z_ratio_delta >= PRONATION_Z_RATIO_DONE
         or z_sign_flip
     )
-    gyro_ok = (
-        abs(gyro_roll_deg) >= OUTBOUND_GYRO_ANGLE_MIN_DEG
-        or gyro_peak_dps >= OUTBOUND_GYRO_PEAK_DPS
+    gyro_angle_ok = (
+        abs(gyro_roll_deg) >= STOP_GYRO_ANGLE_MIN_DEG
+        and gyro_peak_dps >= STOP_GYRO_ANGLE_PEAK_MIN_DPS
     )
+    gyro_ok = gyro_angle_ok or gyro_peak_dps >= STOP_GYRO_PEAK_DPS
     return gravity_ok or gyro_ok
 
 
@@ -395,7 +402,35 @@ def build_condition_results(
             )
         )
 
-    outbound_gyro = _latest_diagnostic(diagnostics, stage="outbound_gyro")
+    # Firmware uses the same outbound_gyro stage for the initial palm-up and
+    # for recording stop.  Pair the checklist's initial palm-up metrics with
+    # the outbound_ready event instead of accidentally showing the later stop
+    # metrics after a complete trial.
+    outbound_gyro = None
+    if outbound_ready is not None:
+        ready_idx = max(
+            i for i, record in enumerate(diagnostics) if record is outbound_ready
+        )
+        boundary_idx = next(
+            (
+                i
+                for i, record in enumerate(
+                    diagnostics[ready_idx + 1 :], ready_idx + 1
+                )
+                if record.get("stage") in ("match", "reset", "stop_palm_up")
+            ),
+            len(diagnostics),
+        )
+        outbound_gyro = next(
+            (
+                record
+                for record in diagnostics[ready_idx + 1 : boundary_idx]
+                if record.get("stage") == "outbound_gyro"
+            ),
+            None,
+        )
+    if outbound_gyro is None and not matched:
+        outbound_gyro = _latest_diagnostic(diagnostics, stage="outbound_gyro")
     if outbound_ready is not None:
         phi = float(outbound_ready["value1"])
         tilt = abs(float(outbound_ready["value2"]))
@@ -410,10 +445,11 @@ def build_condition_results(
             or tilt >= PRONATION_TILT_MIN_DEG
             or z_delta >= PRONATION_Z_RATIO_DONE
         )
-        gyro_ok = (
+        gyro_angle_ok = (
             abs(gyro_roll) >= OUTBOUND_GYRO_ANGLE_MIN_DEG
-            or gyro_peak >= OUTBOUND_GYRO_PEAK_DPS
+            and gyro_peak >= OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS
         )
+        gyro_ok = gyro_angle_ok or gyro_peak >= OUTBOUND_GYRO_PEAK_DPS
         phi_ok = gravity_ok or gyro_ok
         via = []
         if gravity_ok:
@@ -428,7 +464,10 @@ def build_condition_results(
                 f"∫ωy={gyro_roll:+.1f}° peak={gyro_peak:.1f}dps "
                 f"| 閾値 phi≥{PRONATION_ANGLE_MIN_DEG:.0f} 3D≥{PRONATION_TILT_MIN_DEG:.0f} "
                 f"Δz≥{PRONATION_Z_RATIO_DONE:.2f} または "
-                f"|∫ωy|≥{OUTBOUND_GYRO_ANGLE_MIN_DEG:.0f} peak≥{OUTBOUND_GYRO_PEAK_DPS:.0f}"
+                f"(|∫ωy|≥{OUTBOUND_GYRO_ANGLE_MIN_DEG:.0f} かつ "
+                f"peak≥{OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS:.0f}) または "
+                f"peak≥{OUTBOUND_GYRO_PEAK_DPS:.0f} "
+                f"(積分対象 |ωy|≥{OUTBOUND_GYRO_INTEGRATE_RATE_DPS:.0f})"
                 + (f" → {'+'.join(via)}" if via else ""),
             )
         )
@@ -1386,10 +1425,11 @@ class GestureValidator:
                 gyro_roll = float(g.get("value1") or 0.0)
                 gyro_peak = float(g.get("value2") or 0.0)
             gravity_ok = recording_stop_palm_up_eligible(phi, tilt, z_delta)
-            gyro_ok = (
-                abs(gyro_roll) >= OUTBOUND_GYRO_ANGLE_MIN_DEG
-                or gyro_peak >= OUTBOUND_GYRO_PEAK_DPS
+            gyro_angle_ok = (
+                abs(gyro_roll) >= STOP_GYRO_ANGLE_MIN_DEG
+                and gyro_peak >= STOP_GYRO_ANGLE_PEAK_MIN_DPS
             )
+            gyro_ok = gyro_angle_ok or gyro_peak >= STOP_GYRO_PEAK_DPS
             stop_ok = gravity_ok or gyro_ok
             via = []
             if gravity_ok:
@@ -1405,8 +1445,10 @@ class GestureValidator:
                     f"閾値 phi≥{PRONATION_ANGLE_MIN_DEG:.0f} "
                     f"3D≥{PRONATION_TILT_MIN_DEG:.0f} "
                     f"Δz≥{PRONATION_Z_RATIO_DONE:.2f} または "
-                    f"|∫ωy|≥{OUTBOUND_GYRO_ANGLE_MIN_DEG:.0f} "
-                    f"peak≥{OUTBOUND_GYRO_PEAK_DPS:.0f}"
+                    f"(|∫ωy|≥{STOP_GYRO_ANGLE_MIN_DEG:.0f} かつ "
+                    f"peak≥{STOP_GYRO_ANGLE_PEAK_MIN_DPS:.0f}) または "
+                    f"peak≥{STOP_GYRO_PEAK_DPS:.0f} "
+                    f"(積分対象 |ωy|≥{STOP_GYRO_INTEGRATE_RATE_DPS:.0f})"
                     + (f" → {'+'.join(via)}" if via else ""),
                 )
             )
@@ -1617,6 +1659,135 @@ def run_self_test() -> int:
     assert recording_stop_palm_up_eligible(4.0, z_ratio_delta=0.35)
     assert recording_stop_palm_up_eligible(4.0, z_sign_flip=True)
     assert not recording_stop_palm_up_eligible(11.9)
+    assert OUTBOUND_GYRO_PEAK_DPS == 50.0
+    assert STOP_GYRO_PEAK_DPS == 50.0
+    assert OUTBOUND_GYRO_INTEGRATE_RATE_DPS == 20.0
+    assert STOP_GYRO_INTEGRATE_RATE_DPS == 20.0
+    assert not recording_stop_palm_up_eligible(0.0, gyro_peak_dps=49.9)
+    assert recording_stop_palm_up_eligible(0.0, gyro_peak_dps=50.0)
+    assert not recording_stop_palm_up_eligible(
+        0.0, gyro_roll_deg=44.9, gyro_peak_dps=30.0
+    )
+    assert not recording_stop_palm_up_eligible(
+        0.0, gyro_roll_deg=45.0, gyro_peak_dps=29.9
+    )
+    assert recording_stop_palm_up_eligible(
+        0.0,
+        gyro_roll_deg=STOP_GYRO_ANGLE_MIN_DEG,
+        gyro_peak_dps=STOP_GYRO_ANGLE_PEAK_MIN_DPS,
+    )
+    quiet_rate_dps = 17.3
+    quiet_integral_deg = sum(
+        quiet_rate_dps * 0.025
+        for _ in range(round(4.0 / 0.025))
+        if abs(quiet_rate_dps) >= STOP_GYRO_INTEGRATE_RATE_DPS
+    )
+    assert quiet_integral_deg == 0.0
+    # 2026-08-22 hardware regression: a brief 42.6 dps spike with almost no
+    # integrated rotation or gravity change must not stop recording.
+    assert not recording_stop_palm_up_eligible(
+        9.4,
+        palm_up_tilt_deg=2.4,
+        z_ratio_delta=0.03,
+        gyro_roll_deg=1.6,
+        gyro_peak_dps=42.6,
+    )
+    # 2026-08-22 v0.0.53 regression: stationary bias accumulated to 25.1°
+    # with only a 17.3 dps peak; the stricter angle route must reject it.
+    assert not recording_stop_palm_up_eligible(
+        2.2,
+        palm_up_tilt_deg=1.6,
+        z_ratio_delta=0.01,
+        gyro_roll_deg=-25.1,
+        gyro_peak_dps=17.3,
+    )
+
+    def outbound_gyro_condition_status(roll_deg: float, peak_dps: float) -> str:
+        conditions = build_condition_results(
+            [
+                {
+                    "stage": "outbound_start",
+                    "reason": "none",
+                    "value1": 6.0,
+                    "value2": 0.90,
+                    "value3": 0.0,
+                },
+                {
+                    "stage": "outbound_ready",
+                    "reason": "none",
+                    "value1": 0.0,
+                    "value2": 0.0,
+                    "value3": 0.0,
+                },
+                {
+                    "stage": "outbound_gyro",
+                    "reason": "none",
+                    "value1": roll_deg,
+                    "value2": peak_dps,
+                    "value3": 1.0,
+                },
+            ],
+            matched=False,
+        )
+        return next(
+            condition.status
+            for condition in conditions
+            if condition.label == "掌上への反転"
+        )
+
+    assert outbound_gyro_condition_status(0.0, 49.9) == "FAIL"
+    assert outbound_gyro_condition_status(0.0, 50.0) == "PASS"
+    assert outbound_gyro_condition_status(44.9, 30.0) == "FAIL"
+    assert outbound_gyro_condition_status(45.0, 29.9) == "FAIL"
+    assert outbound_gyro_condition_status(45.0, 30.0) == "PASS"
+    start_and_stop_gyro_conditions = build_condition_results(
+        [
+            {
+                "stage": "outbound_start",
+                "reason": "none",
+                "value1": 6.0,
+                "value2": 0.90,
+                "value3": 0.0,
+            },
+            {
+                "stage": "outbound_ready",
+                "reason": "none",
+                "value1": 0.0,
+                "value2": 0.0,
+                "value3": 0.0,
+            },
+            {
+                "stage": "outbound_gyro",
+                "reason": "none",
+                "value1": 3.5,
+                "value2": 66.0,
+                "value3": 1.0,
+            },
+            {"stage": "match", "reason": "none"},
+            {
+                "stage": "stop_palm_up",
+                "reason": "none",
+                "value1": 12.5,
+                "value2": 4.0,
+                "value3": 0.04,
+            },
+            {
+                "stage": "outbound_gyro",
+                "reason": "none",
+                "value1": 0.6,
+                "value2": 21.8,
+                "value3": 0.0,
+            },
+        ],
+        matched=True,
+    )
+    start_condition = next(
+        condition
+        for condition in start_and_stop_gyro_conditions
+        if condition.label == "掌上への反転"
+    )
+    assert start_condition.status == "PASS"
+    assert "peak=66.0dps" in start_condition.detail
     assert not gesture_gate_eligible(0.90, 20.0, 0.039, *eligible[3:])
     assert not gesture_gate_eligible(0.90, 20.0, 0.04, 0.015, 15.1, 400)
     assert not gesture_gate_eligible(*eligible[:-1], 399)

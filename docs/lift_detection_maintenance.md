@@ -50,8 +50,14 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 | `GESTURE_SHAKE_AXIS_MIN_MS2` | 2.0 m/s² | シェイク軸を固定する直交成分下限 |
 | `GYRO_ODR_HZ` / `GYRO_FULL_SCALE_DPS` | 104 / 500 | オンデマンドジャイロ |
 | `GESTURE_GYRO_SETTLE_MS` | 100 ms | ジャイロ整定 |
-| `GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG` | 25° | 掌上/停止の ∫ω_y |
-| `GESTURE_OUTBOUND_GYRO_PEAK_DPS` | 35 dps | 掌上/停止の peak \|ω_y\| |
+| `GESTURE_OUTBOUND_GYRO_INTEGRATE_RATE_DPS` | 20 dps | 掌上の積分対象レート |
+| `GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG` | 45° | 掌上の ∫ω_y |
+| `GESTURE_OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS` | 30 dps | 掌上の積分角経路に必要なpeak |
+| `GESTURE_OUTBOUND_GYRO_PEAK_DPS` | 50 dps | 掌上の peak \|ω_y\| |
+| `GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS` | 20 dps | 録音停止の積分対象レート |
+| `GESTURE_STOP_GYRO_ANGLE_MIN_DEG` | 45° | 録音停止の ∫ω_y |
+| `GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS` | 30 dps | 録音停止の積分角経路に必要なpeak |
+| `GESTURE_STOP_GYRO_PEAK_DPS` | 50 dps | 録音停止の peak \|ω_y\| |
 | `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 20° | hold 反転の ∫ω_y |
 | `GESTURE_HOLD_GYRO_PEAK_DPS` | 30 dps | hold 反転の peak |
 | `GESTURE_FINAL_QUIET_RATE_DPS` | 90 dps | hold **進入時のみ** |
@@ -112,11 +118,16 @@ cd nordic-main
 掌上のまま上げる、持続横 G、歩行で no-match を確認する。車載振動は安全に
 実施できる場合だけ追加する。停止は手下ろしではなく掌上で確認する。
 
-2026-08-22 の確認結果（`0.0.52`、slot0 active+confirmed）:
+2026-08-22 の確認結果（`0.0.54`、BLE OTA、slot0 active+confirmed）:
 
 - validator self-test: PASS
 - `xiao_ble/nrf52840/sense` + sysbuild: PASS
-- 正例（1 回ずつ）: 開始〜掌上停止の完全合格を確認（例: 4.1 s / 9.3 s）
+- 掌下静止を挟む正例: 4/4 PASS。録音開始相当から掌上停止まで
+  6.045 / 5.895 / 4.905 / 7.875 s
+- 全4試行で静止中の早期停止なし。4.905 s の試行は最後の意図的な掌上が
+  5秒より95 ms早く、重力 phi 16.71°で停止した
+- `0.0.53` で再現した静止時の積分角 25.1° / peak 17.3 dps と、短い
+  peak 42.6 dps は `0.0.54` の停止条件では不成立
 - hold 期限 5 s、静止 400 ms / RMS 3.0 / tilt 15°、進入時 gyro quiet 90 dps
 - 掌上・停止は gyro_y peak で成立するケースあり（validator は重力 OR gyro を表示）
 

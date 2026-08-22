@@ -23,6 +23,13 @@
 - Run trials one at a time when the agent must interpret a result or give
   corrective guidance between trials. Ask for readiness again before resuming
   after an interruption or a materially changed test procedure.
+- Run countdown-based interactive tests in a macOS Terminal window with the
+  countdown, start cue (`GO` or equivalent), and final result visible to the
+  user. Do not redirect all test output exclusively to a log file.
+- When saving an interactive test log, use a display-preserving mechanism such
+  as `tee` so the Terminal still shows live connection status, countdown, start
+  cue, and results. The user should not need to request visible countdowns on
+  subsequent tests.
 
 ## nordic-main (XIAO nRF52840 Sense) build — required reading
 

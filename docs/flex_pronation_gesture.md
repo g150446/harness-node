@@ -1,7 +1,7 @@
 # シェイク→掌上→挙上→掌下静止ジェスチャー仕様
 
 対象デバイス: Seeed Studio XIAO nRF52840 Sense  
-対象ファームウェア: HarnessNode `0.0.52` 以降
+対象ファームウェア: HarnessNode `0.0.54` 以降
 
 ## 発動条件
 
@@ -15,7 +15,8 @@
 - シェイク後 1.5 秒以内に掌を上へ反転させる（掌上）
   - 基準はシェイク窓の最初のサンプル時点の重力 LP（振った瞬間の raw ではない）
   - 相対変化: 重力 3D 角 ≥ 20°、phi ≥ 12°、`|Δz比| ≥ 0.35`、Z 符号反転、
-    **または** `|∫gyro_y dt| ≥ 25°` / `peak|gyro_y| ≥ 35°/s`（重力 OR ジャイロ）
+    **または** `peak|gyro_y| ≥ 50°/s` /（`|∫gyro_y dt| ≥ 45°` かつ
+    `peak|gyro_y| ≥ 30°/s`）。積分対象は `|gyro_y| ≥ 20°/s`（重力 OR ジャイロ）
   - 口元への掌上は前腕ピッチになりやすく、XZ の phi だけでは拾えない
   - 装着ごとの raw Z 符号に依存する絶対掌上は使わない
   - 掌上成立時に基準 phi / az を取り直し、outbound の `gyro_y` 符号を記憶する
@@ -47,7 +48,7 @@
 
 ```text
 board_flat = abs(z / |a|) >= 0.80
-palm_up_after_shake = gravity gates OR |∫ω_y|>=25° OR peak|ω_y|>=35 dps
+palm_up_after_shake = gravity gates OR peak|ω_y|>=50 dps OR (|∫ω_y|>=45° AND peak|ω_y|>=30 dps)
 palm_down_after_lift = gravity flip OR opposite-sign gyro_y gates
 hold_entry = palm_down AND rms<=3.0 AND tilt<=15° AND (timer running OR |ω_y|<=90)
 ```
@@ -72,7 +73,8 @@ hold_entry = palm_down AND rms<=3.0 AND tilt<=15° AND (timer running OR |ω_y|<
 開始後 1200 ms を過ぎたあと、次のいずれかで即座に停止する（hold は待たない）:
 
 1. 重力: 3D 角 ≥ 20°、phi ≥ 12°、`|Δz比| ≥ 0.35`、または Z 符号反転
-2. ジャイロ: `|∫gyro_y dt| ≥ 25°` または `peak|gyro_y| ≥ 35°/s`
+2. ジャイロ: `peak|gyro_y| ≥ 50°/s`、または積分対象 `|gyro_y| ≥ 20°/s` で
+   `|∫gyro_y dt| ≥ 45°` かつ `peak|gyro_y| ≥ 30°/s`
 3. 共通: `|a|` が 7.5–12.5 m/s²
 
 手を重力方向へ下ろすだけでは停止しない。`motion_active` でも止めない。ホスト `0x00` とシリアル `'s'` は従来どおり。停止後にジャイロ OFF。
@@ -96,7 +98,8 @@ MATCH → recording (gyro stays ON) → stop palm-up → gyro OFF
 | シェイク峰間 | 重力直交成分 ≥ 5.0 m/s² |
 | シェイク平均比 | \|平均\| < 0.4 × 峰間 |
 | シェイク軸下限 | 直交成分 ≥ 2.0 m/s² で軸を固定 |
-| 掌上 | 重力ゲート **または** \|∫ω_y\|≥25° / peak≥35 dps |
+| 掌上 | 重力ゲート **または** peak≥50 dps /（\|∫ω_y\|≥45° かつ peak≥30 dps） |
+| 掌上/停止の積分対象 | \|ω_y\| ≥ 20 dps |
 | 掌上窓 | シェイク後 1500 ms |
 | ジャイロ | シェイク成立で ON、録音終了で OFF。ODR 104 Hz、FS ±500 dps、整定 100 ms |
 | 上向き加速度 | `a_up` ≥ 0.40 m/s² を2サンプル、正インパルス ≥ 0.04 m/s |
@@ -156,6 +159,26 @@ venv/bin/python gesture_validator.py --trials 1 --window 18 \
 `recording_start` のあとホスト `0x00` では止めず、掌上による `recording_stop` を待つ。
 判定時間内に停止がなければ後始末として `0x00` を送る。
 
+対話式の実機試験では、カウントダウン、開始合図、BLE 接続状態、判定結果を
+macOS Terminal に表示する。ログを保存するときは `tee` を使い、画面表示を維持する。
+物理操作が必要なため、試行内容と回数を事前に説明し、準備完了の確認後に1試行ずつ開始する。
+
+### 0.0.54 実機回帰（2026-08-22）
+
+`0.0.54` を BLE OTA で更新し、slot0 が active + confirmed であることを確認した。
+録音開始後、掌下のまま約5秒静止してから意図的に掌上へ返す試験を4回実施した。
+
+| 試行 | GO→`recording_start` | 録音開始相当→停止 | 停止経路 | 結果 |
+|---:|---:|---:|---|---|
+| 1 | 4.611 s | 6.045 s | gyro peak 65.96 dps | PASS |
+| 2 | 4.742 s | 5.895 s | 重力 phi 12.51° | PASS |
+| 3 | 4.430 s | 4.905 s | 重力 phi 16.71° | PASS |
+| 4 | 4.356 s | 7.875 s | 重力 phi 33.59° | PASS |
+
+全4試行で静止中の早期停止は発生せず、最後の意図的な掌上で停止した。試行3は
+操作による掌上が5秒より95 ms早かったため4.905 sだが、静止中の自動停止ではない。
+録音開始相当時刻は、`match` 後に受信した `gyro_enabled` の時刻を使用した。
+
 ## ビルド・OTA
 
 ```bash
@@ -169,4 +192,4 @@ cd mac_client && venv/bin/python ota_updater.py --device HarnessNode \
 ```
 
 `prj.conf` の `CONFIG_MCUBOOT_IMGTOOL_SIGN_VERSION` と `VERSION` を揃えてからビルドすること。  
-更新後 version `0.0.52` が slot0 active+confirmed であること。
+更新後 version `0.0.54` が slot0 active+confirmed であること。

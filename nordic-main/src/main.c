@@ -133,13 +133,18 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_OUTBOUND_TILT_MIN_DEG            20.0f
 /* gyro_y (forearm axis) gates — OR'd with gravity palm gates. */
 #define GESTURE_GYRO_SETTLE_MS                   100
-#define GESTURE_ROLL_INTEGRATE_RATE_DPS         15.0f
-#define GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG     25.0f
-#define GESTURE_OUTBOUND_GYRO_PEAK_DPS          35.0f
+#define GESTURE_GYRO_BIAS_CAPTURE_MAX_DPS        15.0f
+#define GESTURE_OUTBOUND_GYRO_INTEGRATE_RATE_DPS 20.0f
+#define GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG      45.0f
+#define GESTURE_OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS 30.0f
+#define GESTURE_OUTBOUND_GYRO_PEAK_DPS          50.0f
+#define GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS     15.0f
 #define GESTURE_HOLD_GYRO_ANGLE_MIN_DEG         20.0f
 #define GESTURE_HOLD_GYRO_PEAK_DPS              30.0f
-#define GESTURE_STOP_GYRO_ANGLE_MIN_DEG         25.0f
-#define GESTURE_STOP_GYRO_PEAK_DPS              35.0f
+#define GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS     20.0f
+#define GESTURE_STOP_GYRO_ANGLE_MIN_DEG          45.0f
+#define GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS     30.0f
+#define GESTURE_STOP_GYRO_PEAK_DPS              50.0f
 /* Gyro quiet only gates *entering* hold; residual wrist rate during hold is looser. */
 #define GESTURE_FINAL_QUIET_RATE_DPS            90.0f
 /* Final: upward acceleration pulse, braking pulse, then a quiet hold. */
@@ -1047,7 +1052,7 @@ static float gyro_y_corrected_dps(float gy_raw_dps)
     return gy_raw_dps - gyro_bias_y_dps;
 }
 
-static void accumulate_gyro_roll(float gy_dps, float dt_s,
+static void accumulate_gyro_roll(float gy_dps, float dt_s, float min_rate_dps,
                                  float *roll_deg, float *peak_abs_dps)
 {
     float abs_rate = fabsf(gy_dps);
@@ -1055,14 +1060,18 @@ static void accumulate_gyro_roll(float gy_dps, float dt_s,
     if (abs_rate > *peak_abs_dps) {
         *peak_abs_dps = abs_rate;
     }
-    if (abs_rate >= GESTURE_ROLL_INTEGRATE_RATE_DPS) {
+    if (abs_rate >= min_rate_dps) {
         *roll_deg += gy_dps * dt_s;
     }
 }
 
 static bool gesture_gyro_outbound_ok(void)
 {
-    return fabsf(gesture_gyro_roll_deg) >= GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG ||
+    bool angle_ok =
+        fabsf(gesture_gyro_roll_deg) >= GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG &&
+        gesture_gyro_peak_abs_dps >= GESTURE_OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS;
+
+    return angle_ok ||
            gesture_gyro_peak_abs_dps >= GESTURE_OUTBOUND_GYRO_PEAK_DPS;
 }
 
@@ -1080,7 +1089,11 @@ static bool gesture_gyro_hold_flip_ok(void)
 
 static bool gesture_gyro_stop_ok(void)
 {
-    return fabsf(recording_stop_gyro_roll_deg) >= GESTURE_STOP_GYRO_ANGLE_MIN_DEG ||
+    bool angle_ok =
+        fabsf(recording_stop_gyro_roll_deg) >= GESTURE_STOP_GYRO_ANGLE_MIN_DEG &&
+        recording_stop_gyro_peak_abs_dps >= GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS;
+
+    return angle_ok ||
            recording_stop_gyro_peak_abs_dps >= GESTURE_STOP_GYRO_PEAK_DPS;
 }
 
@@ -1419,7 +1432,9 @@ static void process_recording_stop_sample(float ax, float ay, float az,
         recording_stop_peak_tilt_deg = tilt_deg;
     }
     if (gyro_ok) {
-        accumulate_gyro_roll(gy_dps, dt_s, &recording_stop_gyro_roll_deg,
+        accumulate_gyro_roll(gy_dps, dt_s,
+                             GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS,
+                             &recording_stop_gyro_roll_deg,
                              &recording_stop_gyro_peak_abs_dps);
     }
 
@@ -1702,7 +1717,7 @@ static void process_gesture_sample(float ax, float ay, float az,
             }
             update_quiet_accel_reference(ax, ay, az);
             if (gyro_ok && !gyro_bias_valid &&
-                fabsf(gy_dps) < GESTURE_ROLL_INTEGRATE_RATE_DPS) {
+                fabsf(gy_dps) < GESTURE_GYRO_BIAS_CAPTURE_MAX_DPS) {
                 gyro_bias_y_dps = gy_dps;
                 gyro_bias_valid = true;
             }
@@ -1718,7 +1733,9 @@ static void process_gesture_sample(float ax, float ay, float az,
             capture_recording_stop_reference();
         }
         if (gyro_ok) {
-            accumulate_gyro_roll(gy_dps, dt_s, &recording_stop_gyro_roll_deg,
+            accumulate_gyro_roll(gy_dps, dt_s,
+                                 GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS,
+                                 &recording_stop_gyro_roll_deg,
                                  &recording_stop_gyro_peak_abs_dps);
         }
         return;
@@ -1838,7 +1855,9 @@ static void process_gesture_sample(float ax, float ay, float az,
         }
 
         if (gyro_ok) {
-            accumulate_gyro_roll(gy_dps, dt_s, &gesture_gyro_roll_deg,
+            accumulate_gyro_roll(gy_dps, dt_s,
+                                 GESTURE_OUTBOUND_GYRO_INTEGRATE_RATE_DPS,
+                                 &gesture_gyro_roll_deg,
                                  &gesture_gyro_peak_abs_dps);
         }
 
@@ -1863,7 +1882,7 @@ static void process_gesture_sample(float ax, float ay, float az,
                 gesture_outbound_gyro_sign =
                     (gesture_gyro_roll_deg >= 0.0f) ? 1.0f : -1.0f;
             } else if (gesture_gyro_peak_abs_dps >=
-                       GESTURE_OUTBOUND_GYRO_PEAK_DPS * 0.5f) {
+                       GESTURE_OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS) {
                 gesture_outbound_gyro_sign = (gy_dps >= 0.0f) ? 1.0f : -1.0f;
             } else {
                 gesture_outbound_gyro_sign = 0.0f;
@@ -1952,7 +1971,9 @@ static void process_gesture_sample(float ax, float ay, float az,
             gesture_z_window_max = az;
         }
         if (gyro_ok) {
-            accumulate_gyro_roll(gy_dps, dt_s, &gesture_gyro_roll_deg,
+            accumulate_gyro_roll(gy_dps, dt_s,
+                                 GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS,
+                                 &gesture_gyro_roll_deg,
                                  &gesture_gyro_peak_abs_dps);
         }
 
@@ -2304,7 +2325,7 @@ static void process_motion_sample(void)
             gyro_ok = gyro_is_settled(now);
             gyro_sample_valid = gyro_ok;
             if (gyro_ok && !gyro_bias_valid &&
-                fabsf(gy_raw) < GESTURE_ROLL_INTEGRATE_RATE_DPS &&
+                fabsf(gy_raw) < GESTURE_GYRO_BIAS_CAPTURE_MAX_DPS &&
                 gesture_linear_accel_norm_ms2 <= GESTURE_QUIET_ACCEL_MS2) {
                 gyro_bias_y_dps = gy_raw;
                 gyro_bias_valid = true;

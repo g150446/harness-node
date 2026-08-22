@@ -189,7 +189,7 @@ XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基�
 前腕に沿わせる。右手・左手とUSB端子方向の違いは、シェイク後の相対符号で吸収する。
 
 1. 甲側装着で手のひら下向き、Z絶対比0.80以上の水平姿勢で短く1回シェイクする。重力直交の線形加速度について、500 ms窓の峰間が5.0 m/s²以上かつ`|平均| < 0.4 × 峰間`なら成立。持続する同じ符号の横Gでは不成立。成立時にジャイロON。
-2. シェイク後1.5秒以内に掌上。基準はシェイク窓開始時の重力LP。重力ゲート（3D 20° / phi 12° / Δz 0.35 / Z符号）**または** gyro_y（∫≥25° / peak≥35 dps）。成立時に基準と outbound 符号を取り直す。
+2. シェイク後1.5秒以内に掌上。基準はシェイク窓開始時の重力LP。重力ゲート（3D 20° / phi 12° / Δz 0.35 / Z符号）**または** gyro_y（peak≥50 dps、または積分対象 `|ω_y|≥20 dps` で ∫≥45° かつ peak≥30 dps）。成立時に基準と outbound 符号を取り直す。
 3. 重力LPで姿勢成分を除いた線形加速度を現在の重力方向へ投影し、上向き加速パルスを検出する（掌向きは見ない。物理動作の目安は約5 cm上昇）。
 4. holdは掌上基準からの重力反転 **または** 逆符号 gyro_y が取れてから開始する。線形加速度RMS ≤ 3.0 m/s² と進入時 `|ω_y|≤90 dps` で静止を示したら重力方向を固定し、角度差15°以内を400 ms維持すると録音を開始する（掌上後 5 s 以内）。ジャイロは録音中もONのまま。
 
@@ -197,7 +197,7 @@ XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基�
 
 ### 録音停止トリガー
 
-録音開始時点の重力 LP（掌下）を基準に保存する。開始後 1200 ms を過ぎたあと、重力掌上ゲート **または** gyro_y ゲート（∫≥25° / peak≥35 dps）、かつ `|a|` が 7.5–12.5 m/s² で `stop_requested = true` となり、DMIC を停止して `0x02` を送りジャイロを OFF する。手を下ろすだけでは停止しない。`motion_active` は睡眠タイマーとイベント通知用に残し、録音停止には使わない。ホスト `0x00` とシリアル `'s'` による停止は従来どおり。
+録音開始時点の重力 LP（掌下）を基準に保存する。開始後 1200 ms を過ぎたあと、重力掌上ゲート **または** gyro_y ゲート（peak≥50 dps、または積分対象 `|ω_y|≥20 dps` で ∫≥45° かつ peak≥30 dps）、かつ `|a|` が 7.5–12.5 m/s² で `stop_requested = true` となり、DMIC を停止して `0x02` を送りジャイロを OFF する。手を下ろすだけでは停止しない。`motion_active` は睡眠タイマーとイベント通知用に残し、録音停止には使わない。ホスト `0x00` とシリアル `'s'` による停止は従来どおり。
 
 ### ライトスリープ
 
@@ -262,8 +262,14 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 | `GESTURE_LIFT_NEG_IMPULSE_MIN_MS` | 0.015 m/s | 負インパルス下限 |
 | `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
 | `GESTURE_LIFT_PULSE_MIN_MS` / `MAX_MS` | 150 / 1800 ms | 双極パルスの時間窓 |
-| `GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG` | 25° | 掌上/停止 ∫ω_y |
-| `GESTURE_OUTBOUND_GYRO_PEAK_DPS` | 35 dps | 掌上/停止 peak \|ω_y\| |
+| `GESTURE_OUTBOUND_GYRO_INTEGRATE_RATE_DPS` | 20 dps | 掌上の積分対象レート |
+| `GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG` | 45° | 掌上 ∫ω_y |
+| `GESTURE_OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS` | 30 dps | 掌上の積分角経路に必要なpeak |
+| `GESTURE_OUTBOUND_GYRO_PEAK_DPS` | 50 dps | 掌上 peak \|ω_y\| |
+| `GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS` | 20 dps | 録音停止の積分対象レート |
+| `GESTURE_STOP_GYRO_ANGLE_MIN_DEG` | 45° | 録音停止 ∫ω_y |
+| `GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS` | 30 dps | 録音停止の積分角経路に必要なpeak |
+| `GESTURE_STOP_GYRO_PEAK_DPS` | 50 dps | 録音停止 peak \|ω_y\| |
 | `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 20° | hold 反転 ∫ω_y |
 | `GESTURE_HOLD_GYRO_PEAK_DPS` | 30 dps | hold 反転 peak |
 | `GESTURE_FINAL_QUIET_RATE_DPS` | 90 dps | hold 進入時のみ |
@@ -368,6 +374,10 @@ python3 gesture_monitor.py
 続けて掌上で録音終了するかを対話検証する。条件ごとの `[OK]` / `[NG]` / `[--]` を表示し、
 生の診断ログは JSON へ保存する。GO後の判定時間は既定15秒。開始後はホスト `0x00` を送らず、
 掌上の `recording_stop` を待つ。
+
+物理操作を伴う試験は内容と回数を事前に説明し、準備完了を確認してから1試行ずつ開始する。
+カウントダウン、`GO`、接続状態、最終結果はmacOS Terminalへ表示する。ログも保存する場合は
+`tee` を使い、Terminalのライブ表示を消さない。
 
 ```bash
 cd mac_client
