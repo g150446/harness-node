@@ -13,7 +13,7 @@
 | ブートローダ | MCUboot（Adafruit UF2 ブートローダ経由で 0x27000 に配置） |
 | OTA | MCUboot + BLE SMP（MCUmgr） |
 | PDM マイク | DMIC（Zephyr DMIC API、RIGHT チャンネル、マイク電源制御あり） |
-| IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロは無効） |
+| IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 起動後は待機時消灯。録音ジェスチャー成立後の録音中のみ赤 |
 
@@ -176,26 +176,28 @@ Seeed Studio 公式の XIAO nRF52840 Sense KiCad 基板データと ST の LSM6D
 | 軸 | XIAO 基板上の向き | リストバンド装着時の用途 |
 |----|------------------|------------------------|
 | `+X` | 基板長手方向、USB 端子から離れる向き | 前腕を横切る方向 |
-| `+Y` | 基板短い辺に平行（5V/GND/3V 側） | 前腕に沿う＝回内・回外軸 |
+| `+Y` | 基板短い辺に平行（5V/GND/3V 側） | 前腕に沿う＝回内・回外軸（**gyro_y**） |
 | `+Z` | 部品面から外向き | 基板水平（\|Z 比\|）と掌向きの相対判定 |
 
 資料: [Seeed Studio XIAO nRF52840 Series](https://wiki.seeedstudio.com/XIAO_BLE/)、[LSM6DS3TR-C datasheet](https://www.st.com/resource/en/datasheet/lsm6ds3tr-c.pdf)
+
+ジャイロは待機時 power-down。シェイク成立で 104 Hz / ±500 dps を ONし、録音終了で OFFする。
 
 ### 録音開始トリガー（シェイク → 掌上 → 挙上 → 掌下静止）
 
 XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基板X軸を前腕と直交、Y軸を
 前腕に沿わせる。右手・左手とUSB端子方向の違いは、シェイク後の相対符号で吸収する。
 
-1. 甲側装着で手のひら下向き、Z絶対比0.80以上の水平姿勢で短く1回シェイクする。重力直交の線形加速度について、500 ms窓の峰間が5.0 m/s²以上かつ`|平均| < 0.4 × 峰間`なら成立。持続する同じ符号の横Gでは不成立。
-2. シェイク後1.5秒以内に掌上。基準はシェイク窓開始時の重力LP。3D角20°以上、phi 12°以上、Z比0.35以上の変化、またはZ符号反転で成立。成立時に基準を取り直す。
+1. 甲側装着で手のひら下向き、Z絶対比0.80以上の水平姿勢で短く1回シェイクする。重力直交の線形加速度について、500 ms窓の峰間が5.0 m/s²以上かつ`|平均| < 0.4 × 峰間`なら成立。持続する同じ符号の横Gでは不成立。成立時にジャイロON。
+2. シェイク後1.5秒以内に掌上。基準はシェイク窓開始時の重力LP。重力ゲート（3D 20° / phi 12° / Δz 0.35 / Z符号）**または** gyro_y（∫≥25° / peak≥35 dps）。成立時に基準と outbound 符号を取り直す。
 3. 重力LPで姿勢成分を除いた線形加速度を現在の重力方向へ投影し、上向き加速パルスを検出する（掌向きは見ない。物理動作の目安は約5 cm上昇）。
-4. holdは掌上基準からの反転（phi 20° / Δz 0.50 / Z符号）が取れてから開始する。線形加速度RMS ≤ 2.5 m/s² が静止を示した時点の重力方向を固定し、そこからの角度差10°以内を500 ms維持すると録音を開始する（掌上後 4 s 以内）。
+4. holdは掌上基準からの重力反転 **または** 逆符号 gyro_y が取れてから開始する。線形加速度RMS ≤ 3.0 m/s² と進入時 `|ω_y|≤90 dps` で静止を示したら重力方向を固定し、角度差15°以内を400 ms維持すると録音を開始する（掌上後 5 s 以内）。ジャイロは録音中もONのまま。
 
 回外・最終仰角帯・甲上条件は要求しない。詳細は`docs/flex_pronation_gesture.md`を参照する。
 
 ### 録音停止トリガー
 
-録音開始時点の重力 LP（掌下）を基準に保存する。開始後 1200 ms を過ぎたあと、シェイク後掌上と同じ反転（3D 角 ≥ 20°、phi ≥ 12°、Z 比変化 ≥ 0.35、または Z 符号反転、かつ `|a|` が 7.5–12.5 m/s²）で `stop_requested = true` となり、DMIC を停止して `0x02` を送信する。手を下ろすだけでは停止しない。`motion_active` は睡眠タイマーとイベント通知用に残し、録音停止には使わない。ホスト `0x00` とシリアル `'s'` による停止は従来どおり。
+録音開始時点の重力 LP（掌下）を基準に保存する。開始後 1200 ms を過ぎたあと、重力掌上ゲート **または** gyro_y ゲート（∫≥25° / peak≥35 dps）、かつ `|a|` が 7.5–12.5 m/s² で `stop_requested = true` となり、DMIC を停止して `0x02` を送りジャイロを OFF する。手を下ろすだけでは停止しない。`motion_active` は睡眠タイマーとイベント通知用に残し、録音停止には使わない。ホスト `0x00` とシリアル `'s'` による停止は従来どおり。
 
 ### ライトスリープ
 
@@ -260,13 +262,20 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 | `GESTURE_LIFT_NEG_IMPULSE_MIN_MS` | 0.015 m/s | 負インパルス下限 |
 | `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
 | `GESTURE_LIFT_PULSE_MIN_MS` / `MAX_MS` | 150 / 1800 ms | 双極パルスの時間窓 |
-| `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 10° | 静止開始時の重力方向からの保持中姿勢差上限 |
-| `GESTURE_FINAL_STILL_RMS_MS2` | 2.5 m/s² | 4サンプル静止RMS上限 |
-| `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止保持時間 |
+| `GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG` | 25° | 掌上/停止 ∫ω_y |
+| `GESTURE_OUTBOUND_GYRO_PEAK_DPS` | 35 dps | 掌上/停止 peak \|ω_y\| |
+| `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 20° | hold 反転 ∫ω_y |
+| `GESTURE_HOLD_GYRO_PEAK_DPS` | 30 dps | hold 反転 peak |
+| `GESTURE_FINAL_QUIET_RATE_DPS` | 90 dps | hold 進入時のみ |
+| `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 15° | 静止開始時の重力方向からの保持中姿勢差上限 |
+| `GESTURE_FINAL_STILL_RMS_MS2` | 3.0 m/s² | 4サンプル静止RMS上限 |
+| `GESTURE_FINAL_HOLD_MS` | 400 ms | 最終静止保持時間 |
 | `GESTURE_GRAVITY_LP_TAU_S` | 0.30 s | 重力推定の低通時定数 |
-| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 4000 ms | 掌上成立後の最終成立期限 |
+| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 5000 ms | 掌上成立後の最終成立期限 |
 | `GESTURE_SEQUENCE_TIMEOUT_MS` | 6000 ms | 全シーケンス期限 |
 | `GESTURE_RETRIGGER_BLOCK_MS` | 1200 ms | 開始直後の停止抑制 / 停止後の再開始抑制 |
+| `GYRO_ODR_HZ` | 104 | オンデマンドジャイロ ODR |
+| `GYRO_FULL_SCALE_DPS` | 500 | ジャイロ FS |
 | `SLEEP_IDLE_TIMEOUT_MS` | 10000 ms | ライトスリープ移行までの無動作時間 |
 | `SLEEP_POLL_INTERVAL_MS` | 50 ms | スリープ中の IMU ポーリング間隔 |
 
@@ -381,6 +390,17 @@ python3 gesture_classifier.py
 
 ---
 
+## ジェスチャ履歴デバッグビルド
+
+本番は `GESTURE_DEBUG_HISTORY=0`（既定）。履歴バッチ（0x33–0x35）を有効にするには:
+
+```bash
+# west / build に C フラグを足す例（スクリプト利用時は west 引数を追加）
+west build ... -- -DCMAKE_C_FLAGS="-DGESTURE_DEBUG_HISTORY=1"
+```
+
+または `nordic-main/src/main.c` の `#ifndef GESTURE_DEBUG_HISTORY` 既定を一時的に `1` にする。
+
 ## LED 状態
 
 | 状態 | LED 色 / パターン |
@@ -391,4 +411,4 @@ python3 gesture_classifier.py
 | 単純なモーション検出中 | 消灯 |
 | 録音中 | 赤（常時点灯） |
 
-省発光のため、BLE のみで待機している間や単純な `motion_active` 検出中は LED を点灯しません。LED が点灯するのは録音ジェスチャーが成立して `is_recording` に入ったときだけです。リモート未接続でも録音ジェスチャー成立後は赤点灯を維持し、停止ジェスチャーで消灯します。
+省発光のため、BLE のみで待機している間や単純な `motion_active` 検出中は LED を点灯しません。LED が点灯するのは録音ジェスチャーが成立して `is_recording` に入ったときだけです。リモート未接続でも録音ジェスチャー成立後は赤点灯を維持し、停止ジェスチャーで消灯します。赤消灯は `is_recording == false` と一致し、意図的に録音継続のまま LED だけ消す経路はない。

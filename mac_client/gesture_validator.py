@@ -45,6 +45,9 @@ EVT_MOTION_SETTLED = 0x11
 EVT_SLEEP_ENTER = 0x20
 EVT_SLEEP_WAKE = 0x21
 EVT_GESTURE_DIAG = 0x30
+EVT_GESTURE_HISTORY_BEGIN = 0x33
+EVT_GESTURE_HISTORY_ENTRY = 0x34
+EVT_GESTURE_HISTORY_END = 0x35
 EVT_DISCONNECTED = -1
 
 EVENT_NAMES = {
@@ -55,6 +58,9 @@ EVENT_NAMES = {
     EVT_SLEEP_ENTER: "sleep_enter",
     EVT_SLEEP_WAKE: "sleep_wake",
     EVT_GESTURE_DIAG: "gesture_diag",
+    EVT_GESTURE_HISTORY_BEGIN: "gesture_history_begin",
+    EVT_GESTURE_HISTORY_ENTRY: "gesture_history_entry",
+    EVT_GESTURE_HISTORY_END: "gesture_history_end",
     EVT_DISCONNECTED: "disconnected",
 }
 
@@ -70,8 +76,12 @@ DIAG_STAGE_NAMES = {
     0x09: "match",
     0x0A: "gyro_bias_ready",
     0x0C: "stop_palm_up",
+    0x0D: "gyro_enabled",
+    0x0E: "gyro_disabled",
+    0x0F: "outbound_gyro",
     0x20: "gyro_y_sample",
     0x21: "final_sample",
+    0x22: "hold_sample",
     0x10: "wait_reject",
     0x80: "reset",
 }
@@ -113,8 +123,12 @@ HOLD_PRONATION_Z_RATIO_DONE = 0.50
 FINAL_POS_IMPULSE_MIN_MS = 0.04
 FINAL_NEG_IMPULSE_MIN_MS = 0.015
 FINAL_BRAKE_RATIO_MIN = 0.05
-FINAL_TILT_MAX_DEG = 10.0
-FINAL_HOLD_MIN_MS = 500
+FINAL_TILT_MAX_DEG = 15.0
+FINAL_HOLD_MIN_MS = 400
+FINAL_STILL_RMS_MS2 = 3.0
+FINAL_QUIET_RATE_DPS = 90.0
+OUTBOUND_GYRO_ANGLE_MIN_DEG = 25.0
+OUTBOUND_GYRO_PEAK_DPS = 35.0
 
 
 @dataclass(frozen=True)
@@ -201,14 +215,21 @@ def recording_stop_palm_up_eligible(
     palm_up_tilt_deg: float = 0.0,
     z_ratio_delta: float = 0.0,
     z_sign_flip: bool = False,
+    gyro_roll_deg: float = 0.0,
+    gyro_peak_dps: float = 0.0,
 ) -> bool:
-    """Mirror the firmware's recording-stop palm-up gates (same as outbound)."""
-    return (
+    """Mirror firmware recording-stop palm-up (gravity OR gyro_y)."""
+    gravity_ok = (
         abs(palm_up_deg) >= PRONATION_ANGLE_MIN_DEG
         or palm_up_tilt_deg >= PRONATION_TILT_MIN_DEG
         or z_ratio_delta >= PRONATION_Z_RATIO_DONE
         or z_sign_flip
     )
+    gyro_ok = (
+        abs(gyro_roll_deg) >= OUTBOUND_GYRO_ANGLE_MIN_DEG
+        or gyro_peak_dps >= OUTBOUND_GYRO_PEAK_DPS
+    )
+    return gravity_ok or gyro_ok
 
 
 def sequence_reset_seen(diagnostics: list[dict[str, Any]]) -> bool:
@@ -341,8 +362,10 @@ def build_condition_results(
             ConditionResult(
                 "掌下の短いシェイク",
                 "PASS" if shake_ok else "FAIL",
-                f"峰間 {ptp:.2f} m/s²、平均 {mean:.2f} m/s²、"
-                f"Z絶対比 {z_ratio:.2f}",
+                f"実測 ptp={ptp:.2f} mean={mean:.2f} |mean|/ptp="
+                f"{(abs(mean) / max(ptp, 1e-6)):.2f} Z比={z_ratio:.2f} | "
+                f"閾値 ptp≥{SHAKE_PTP_MIN_MS2:.1f} "
+                f"|mean|<{SHAKE_MEAN_RATIO_MAX:.1f}×ptp Z≥{START_BOARD_FLAT_Z_MIN_RATIO:.2f}",
             )
         )
     elif wait_shake is not None or wait_quiet is not None or wait_pose is not None:
@@ -372,24 +395,41 @@ def build_condition_results(
             )
         )
 
+    outbound_gyro = _latest_diagnostic(diagnostics, stage="outbound_gyro")
     if outbound_ready is not None:
         phi = float(outbound_ready["value1"])
         tilt = abs(float(outbound_ready["value2"]))
         z_delta = abs(float(outbound_ready.get("value3") or 0.0))
-        phi_ok = (
+        gyro_roll = 0.0
+        gyro_peak = 0.0
+        if outbound_gyro is not None:
+            gyro_roll = float(outbound_gyro.get("value1") or 0.0)
+            gyro_peak = float(outbound_gyro.get("value2") or 0.0)
+        gravity_ok = (
             abs(phi) >= PRONATION_ANGLE_MIN_DEG
             or tilt >= PRONATION_TILT_MIN_DEG
             or z_delta >= PRONATION_Z_RATIO_DONE
         )
+        gyro_ok = (
+            abs(gyro_roll) >= OUTBOUND_GYRO_ANGLE_MIN_DEG
+            or gyro_peak >= OUTBOUND_GYRO_PEAK_DPS
+        )
+        phi_ok = gravity_ok or gyro_ok
+        via = []
+        if gravity_ok:
+            via.append("重力")
+        if gyro_ok:
+            via.append("gyro_y")
         conditions.append(
             ConditionResult(
                 "掌上への反転",
                 "PASS" if phi_ok else "FAIL",
-                f"phi {phi:.1f}°、3D {tilt:.1f}°、"
-                f"Δz比 {z_delta:.2f}"
-                f"（要 phi ≥ {PRONATION_ANGLE_MIN_DEG:.0f}° または "
-                f"3D ≥ {PRONATION_TILT_MIN_DEG:.0f}° または "
-                f"Δz ≥ {PRONATION_Z_RATIO_DONE:.2f}）",
+                f"実測 phi={phi:.1f}° 3D={tilt:.1f}° Δz={z_delta:.2f} "
+                f"∫ωy={gyro_roll:+.1f}° peak={gyro_peak:.1f}dps "
+                f"| 閾値 phi≥{PRONATION_ANGLE_MIN_DEG:.0f} 3D≥{PRONATION_TILT_MIN_DEG:.0f} "
+                f"Δz≥{PRONATION_Z_RATIO_DONE:.2f} または "
+                f"|∫ωy|≥{OUTBOUND_GYRO_ANGLE_MIN_DEG:.0f} peak≥{OUTBOUND_GYRO_PEAK_DPS:.0f}"
+                + (f" → {'+'.join(via)}" if via else ""),
             )
         )
     elif outbound_reset is not None:
@@ -428,13 +468,8 @@ def build_condition_results(
             ConditionResult(
                 "挙上",
                 "PASS" if pulse_ok else "FAIL",
-                f"加速 {pos_impulse:.3f} m/s ≥ {FINAL_POS_IMPULSE_MIN_MS:.2f}、"
-                f"減速 {neg_impulse:.3f} m/s"
-                + (
-                    f"、比率 {brake_ratio:.2f}"
-                    if pos_impulse > 0.0
-                    else ""
-                ),
+                f"実測 +imp={pos_impulse:.3f} m/s -imp={neg_impulse:.3f} m/s"
+                f" 比={brake_ratio:.2f} | 閾値 +imp≥{FINAL_POS_IMPULSE_MIN_MS:.2f}",
             )
         )
     elif final_reset is not None and final_reset["reason"] in (
@@ -520,6 +555,24 @@ def build_condition_results(
             )
         )
 
+    hold_samples = [r for r in diagnostics if r.get("stage") == "hold_sample"]
+    hold_interrupt = _latest_diagnostic(
+        diagnostics,
+        stage="wait_reject",
+        reasons=("final_hold_interrupted",),
+    )
+    best_hold_rms = None
+    best_hold_tilt = None
+    best_hold_gy = None
+    for rec in hold_samples:
+        rms = float(rec.get("value1") or 0.0)
+        tilt_h = float(rec.get("value2") or 0.0)
+        gy_h = float(rec.get("value3") or 0.0)
+        if best_hold_rms is None or rms < best_hold_rms:
+            best_hold_rms = rms
+            best_hold_tilt = tilt_h
+            best_hold_gy = gy_h
+
     tilt_src = final_ready or final_start
     if final_reset is not None and final_reset["reason"] == "final_tilt_unstable":
         tilt_deg = float(final_reset.get("value3") or 0.0)
@@ -527,16 +580,16 @@ def build_condition_results(
             ConditionResult(
                 "上昇後の姿勢安定",
                 "FAIL",
-                f"静止開始姿勢から {tilt_deg:.1f}° > {FINAL_TILT_MAX_DEG:.1f}°",
+                f"実測 tilt={tilt_deg:.1f}° | 閾値 ≤{FINAL_TILT_MAX_DEG:.1f}°",
             )
         )
     elif tilt_src is not None:
-        tilt_deg = float(tilt_src["value3"])
+        tilt_deg = abs(float(tilt_src["value3"]))
         conditions.append(
             ConditionResult(
                 "上昇後の姿勢安定",
                 "PASS" if tilt_deg <= FINAL_TILT_MAX_DEG else "FAIL",
-                f"静止開始姿勢から {tilt_deg:.1f}° ≤ {FINAL_TILT_MAX_DEG:.1f}°",
+                f"実測 tilt={tilt_deg:.1f}° | 閾値 ≤{FINAL_TILT_MAX_DEG:.1f}°",
             )
         )
     elif final_reset is not None and final_reset["reason"] == "final_hold_timeout":
@@ -544,8 +597,9 @@ def build_condition_results(
         conditions.append(
             ConditionResult(
                 "上昇後の姿勢安定",
-                "PASS",
-                f"静止開始姿勢から {tilt_deg:.1f}° ≤ {FINAL_TILT_MAX_DEG:.1f}°",
+                "PASS" if abs(tilt_deg) <= FINAL_TILT_MAX_DEG else "FAIL",
+                f"実測 max_tilt={tilt_deg:.1f}° | 閾値 ≤{FINAL_TILT_MAX_DEG:.1f}° "
+                f"(hold timeout)",
             )
         )
     else:
@@ -555,11 +609,23 @@ def build_condition_results(
 
     if final_ready is not None:
         hold_ms = float(final_ready["value2"])
+        rms_s = (
+            f" 最良RMS={best_hold_rms:.2f}(≤{FINAL_STILL_RMS_MS2})"
+            if best_hold_rms is not None
+            else ""
+        )
+        gy_s = (
+            f" |gy|={best_hold_gy:.1f}dps"
+            if best_hold_gy is not None
+            else ""
+        )
         conditions.append(
             ConditionResult(
                 "掌下で静止",
                 "PASS",
-                f"{hold_ms:.0f} ms ≥ {FINAL_HOLD_MIN_MS} ms",
+                f"実測 hold={hold_ms:.0f} ms{rms_s}{gy_s} | "
+                f"閾値 ≥{FINAL_HOLD_MIN_MS} ms / RMS≤{FINAL_STILL_RMS_MS2} / "
+                f"進入時|ωy|≤{FINAL_QUIET_RATE_DPS:.0f}",
             )
         )
     elif final_reset is not None and final_reset["reason"] == "lift_palm_still_up":
@@ -570,12 +636,26 @@ def build_condition_results(
                 "掌上基準から掌下へ回せなかった",
             )
         )
-    elif final_start is not None:
+    elif final_start is not None or hold_interrupt is not None:
+        detail_parts = [f"hold {FINAL_HOLD_MIN_MS} ms 未完了"]
+        if hold_interrupt is not None:
+            detail_parts.append(
+                f"中断時 RMS={float(hold_interrupt.get('value1') or 0):.2f} "
+                f"tilt={float(hold_interrupt.get('value2') or 0):.1f}° "
+                f"|gy|={float(hold_interrupt.get('value3') or 0):.1f}dps "
+                f"(閾値 RMS≤{FINAL_STILL_RMS_MS2} tilt≤{FINAL_TILT_MAX_DEG} "
+                f"進入|ωy|≤{FINAL_QUIET_RATE_DPS:.0f})"
+            )
+        if best_hold_rms is not None:
+            detail_parts.append(
+                f"hold中最良 RMS={best_hold_rms:.2f} tilt={best_hold_tilt:.1f} "
+                f"|gy|={best_hold_gy:.1f}"
+            )
         conditions.append(
             ConditionResult(
                 "掌下で静止",
                 "FAIL",
-                f"{FINAL_HOLD_MIN_MS} msの連続静止を確認できず",
+                " / ".join(detail_parts),
             )
         )
     elif final_reset is not None and final_reset["reason"] == "final_hold_timeout":
@@ -583,7 +663,8 @@ def build_condition_results(
             ConditionResult(
                 "掌下で静止",
                 "FAIL",
-                f"{FINAL_HOLD_MIN_MS} msの静止を開始できずタイムアウト",
+                f"{FINAL_HOLD_MIN_MS} ms静止を開始できずタイムアウト "
+                f"max_tilt={float(final_reset.get('value3') or 0):.1f}°",
             )
         )
     else:
@@ -697,11 +778,70 @@ def parse_event_packet(data: bytes, now: Optional[float] = None) -> Optional[Ges
             value2=value2,
             value3=value3,
         )
+    elif code == EVT_GESTURE_HISTORY_BEGIN and len(data) >= 5:
+        event = GestureEvent(
+            code=code,
+            name=event.name,
+            monotonic_s=event.monotonic_s,
+            wall_time=event.wall_time,
+            value1=float(data[3]),
+            value2=float(data[4]),
+        )
+    elif code == EVT_GESTURE_HISTORY_ENTRY and len(data) >= 19:
+        t_ms = struct.unpack_from("<H", data, 3)[0]
+        stage = data[5]
+        reason = data[6]
+        value1, value2, value3 = struct.unpack_from("<fff", data, 7)
+        event = GestureEvent(
+            code=code,
+            name=event.name,
+            monotonic_s=event.monotonic_s,
+            wall_time=event.wall_time,
+            elapsed_ms=t_ms,
+            diag_stage=stage,
+            diag_reason=reason,
+            value1=value1,
+            value2=value2,
+            value3=value3,
+        )
+    elif code == EVT_GESTURE_HISTORY_END and len(data) >= 5:
+        event = GestureEvent(
+            code=code,
+            name=event.name,
+            monotonic_s=event.monotonic_s,
+            wall_time=event.wall_time,
+            value1=float(data[3]),
+            value2=float(data[4]),
+        )
     return event
 
 
 def format_event(event: GestureEvent) -> str:
     ts = event.wall_time[11:23]
+    if event.code == EVT_GESTURE_HISTORY_BEGIN:
+        return (
+            f"[{ts}] history_begin count={int(event.value1 or 0)} "
+            f"session={int(event.value2 or 0)}"
+        )
+    if event.code == EVT_GESTURE_HISTORY_END:
+        return (
+            f"[{ts}] history_end count={int(event.value1 or 0)} "
+            f"session={int(event.value2 or 0)}"
+        )
+    if event.code == EVT_GESTURE_HISTORY_ENTRY:
+        stage = DIAG_STAGE_NAMES.get(
+            event.diag_stage or 0, f"stage_0x{(event.diag_stage or 0):02x}"
+        )
+        reason = DIAG_REASON_NAMES.get(
+            event.diag_reason or 0, f"reason_0x{(event.diag_reason or 0):02x}"
+        )
+        return (
+            f"[{ts}] history_entry +{event.elapsed_ms or 0}ms "
+            f"{stage}/{reason} "
+            f"v1={event.value1 or 0.0:+.2f} "
+            f"v2={event.value2 or 0.0:+.2f} "
+            f"v3={event.value3 or 0.0:+.2f}"
+        )
     if event.code == EVT_GESTURE_DIAG:
         stage = DIAG_STAGE_NAMES.get(
             event.diag_stage or 0, f"stage_0x{(event.diag_stage or 0):02x}"
@@ -720,12 +860,19 @@ def format_event(event: GestureEvent) -> str:
         elif stage == "outbound_ready":
             suffix = (
                 f" pronation={v1:+.1f}deg tilt_3d={v2:.1f}deg "
-                f"z_delta={v3:.2f}"
+                f"gyro_roll={v3:+.1f}deg"
             )
         elif stage == "stop_palm_up":
             suffix = (
                 f" pronation={v1:+.1f}deg tilt_3d={v2:.1f}deg "
-                f"z_delta={v3:.2f}"
+                f"gyro_roll={v3:+.1f}deg"
+            )
+        elif stage == "gyro_enabled":
+            suffix = f" odr={v1:.0f}Hz bias_y={v2:+.2f} valid={v3:.0f}"
+        elif stage == "gyro_disabled":
+            suffix = (
+                f" last_roll={v1:+.1f}deg peak={v2:.1f}dps "
+                f"stop_roll={v3:+.1f}deg"
             )
         elif stage == "turnaround_ready":
             suffix = (
@@ -1214,12 +1361,53 @@ class GestureValidator:
             phi = float(stop_diag.get("value1") or 0.0)
             tilt = float(stop_diag.get("value2") or 0.0)
             z_delta = abs(float(stop_diag.get("value3") or 0.0))
-            stop_ok = recording_stop_palm_up_eligible(phi, tilt, z_delta)
+            # FW emits outbound_gyro immediately after stop_palm_up with stop metrics.
+            match_idx = max(
+                (
+                    i
+                    for i, r in enumerate(diagnostics)
+                    if r.get("stage") == "match"
+                ),
+                default=-1,
+            )
+            stop_gyros = [
+                r
+                for i, r in enumerate(diagnostics)
+                if r.get("stage") == "outbound_gyro" and i > match_idx
+            ]
+            if not stop_gyros:
+                stop_gyros = [
+                    r for r in diagnostics if r.get("stage") == "outbound_gyro"
+                ]
+            gyro_roll = 0.0
+            gyro_peak = 0.0
+            if stop_gyros:
+                g = stop_gyros[-1]
+                gyro_roll = float(g.get("value1") or 0.0)
+                gyro_peak = float(g.get("value2") or 0.0)
+            gravity_ok = recording_stop_palm_up_eligible(phi, tilt, z_delta)
+            gyro_ok = (
+                abs(gyro_roll) >= OUTBOUND_GYRO_ANGLE_MIN_DEG
+                or gyro_peak >= OUTBOUND_GYRO_PEAK_DPS
+            )
+            stop_ok = gravity_ok or gyro_ok
+            via = []
+            if gravity_ok:
+                via.append("重力")
+            if gyro_ok:
+                via.append("gyro_y")
             conditions.append(
                 ConditionResult(
                     "掌上で録音終了",
                     "PASS" if stop_ok and gesture_stopped else "FAIL",
-                    f"phi {phi:.1f}°、3D {tilt:.1f}°、Δz比 {z_delta:.2f}",
+                    f"実測 phi={phi:.1f}° 3D={tilt:.1f}° Δz={z_delta:.2f} "
+                    f"∫ωy={gyro_roll:+.1f}° peak={gyro_peak:.1f}dps | "
+                    f"閾値 phi≥{PRONATION_ANGLE_MIN_DEG:.0f} "
+                    f"3D≥{PRONATION_TILT_MIN_DEG:.0f} "
+                    f"Δz≥{PRONATION_Z_RATIO_DONE:.2f} または "
+                    f"|∫ωy|≥{OUTBOUND_GYRO_ANGLE_MIN_DEG:.0f} "
+                    f"peak≥{OUTBOUND_GYRO_PEAK_DPS:.0f}"
+                    + (f" → {'+'.join(via)}" if via else ""),
                 )
             )
         elif gesture_stopped:
@@ -1227,7 +1415,7 @@ class GestureValidator:
                 ConditionResult(
                     "掌上で録音終了",
                     "PASS",
-                    "recording_stopを受信",
+                    "recording_stopを受信（stop_palm_up diag なし）",
                 )
             )
         elif matched:
@@ -1283,7 +1471,7 @@ class GestureValidator:
         await self.connect()
         print("", flush=True)
         print("=" * 64, flush=True)
-        print("HarnessNode 回内→上昇パルス→0.5秒静止 BLE検証", flush=True)
+        print("HarnessNode シェイク→掌上→挙上→掌下静止 BLE検証", flush=True)
         print(f"期待結果: {self.args.expect}", flush=True)
         print(f"試行回数: {self.args.trials} / 判定時間: {self.args.window:g}秒", flush=True)
         print("=" * 64, flush=True)
@@ -1407,20 +1595,22 @@ def run_self_test() -> int:
     # Firmware boundary: board-flat shake, palm-up flip, lift pulse, pose, hold.
     assert HOLD_PRONATION_ANGLE_MIN_DEG == 20.0
     assert HOLD_PRONATION_Z_RATIO_DONE == 0.50
-    eligible = (0.90, 20.0, 0.04, 0.015, 10.0, 500)
+    assert FINAL_TILT_MAX_DEG == 15.0
+    assert FINAL_HOLD_MIN_MS == 400
+    eligible = (0.90, 20.0, 0.04, 0.015, 15.0, 400)
     assert gesture_gate_eligible(*eligible)
     assert gesture_gate_eligible(0.80, *eligible[1:])
     assert not gesture_gate_eligible(0.79, *eligible[1:])
     assert not gesture_gate_eligible(0.90, 11.9, *eligible[2:])
     assert gesture_gate_eligible(0.90, 12.0, *eligible[2:])
-    assert gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 10.0, 500, 0.35)
-    assert not gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 10.0, 500, 0.34)
-    assert gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 10.0, 500, 0.0, True)
+    assert gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 15.0, 400, 0.35)
+    assert not gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 15.0, 400, 0.34)
+    assert gesture_gate_eligible(0.90, 4.0, 0.04, 0.015, 15.0, 400, 0.0, True)
     assert gesture_gate_eligible(
-        0.90, 4.0, 0.04, 0.015, 10.0, 500, palm_up_tilt_deg=20.0
+        0.90, 4.0, 0.04, 0.015, 15.0, 400, palm_up_tilt_deg=20.0
     )
     assert not gesture_gate_eligible(
-        0.90, 4.0, 0.04, 0.015, 10.0, 500, palm_up_tilt_deg=19.9
+        0.90, 4.0, 0.04, 0.015, 15.0, 400, palm_up_tilt_deg=19.9
     )
     assert recording_stop_palm_up_eligible(12.0)
     assert recording_stop_palm_up_eligible(4.0, palm_up_tilt_deg=20.0)
@@ -1428,8 +1618,8 @@ def run_self_test() -> int:
     assert recording_stop_palm_up_eligible(4.0, z_sign_flip=True)
     assert not recording_stop_palm_up_eligible(11.9)
     assert not gesture_gate_eligible(0.90, 20.0, 0.039, *eligible[3:])
-    assert not gesture_gate_eligible(0.90, 20.0, 0.04, 0.015, 10.1, 500)
-    assert not gesture_gate_eligible(*eligible[:-1], 499)
+    assert not gesture_gate_eligible(0.90, 20.0, 0.04, 0.015, 15.1, 400)
+    assert not gesture_gate_eligible(*eligible[:-1], 399)
     assert not gesture_gate_eligible(*eligible, shake_ptp_ms2=4.9)
     assert not gesture_gate_eligible(*eligible, shake_ptp_ms2=6.0, shake_mean_ms2=3.0)
     assert gesture_gate_eligible(*eligible, shake_ptp_ms2=6.0, shake_mean_ms2=2.0)
@@ -1740,7 +1930,7 @@ def main() -> int:
     if args.instruction is None:
         args.instruction = (
             "手の甲側装着で短く1回振り、手のひらを上へ向け、手を上げてから、"
-            "掌を下にして0.5秒静止してください。"
+            "掌を下にして約0.4秒静止してください。"
             "録音開始後、手のひらを上へ向けると録音が終了します"
             if args.expect == "match"
             else "指定された非対象動作を行ってください"
