@@ -30,6 +30,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/watchdog.h>
@@ -98,6 +99,33 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define BASELINE_ALPHA              0.03
 #define REPORT_COOLDOWN_MS          700
 #define MOTION_DURATION_SAMPLES     2
+
+/*
+ * LSM6DS3TR-C hardware double-tap detection.  Zephyr's NCS 2.9.2 LSM6DSL
+ * driver only exposes DATA_READY triggers, so the application configures the
+ * embedded-function registers directly and reuses the driver's INT1 plumbing.
+ * At +/-2 g, TAP_THS=8 is 0.5 g.  At 416 Hz, INT_DUR2=0x4a gives about
+ * 38 ms shock, 19 ms quiet, and 308 ms between taps.
+ */
+#define EVT_DOUBLE_TAP                 0x12
+#define DOUBLE_TAP_COOLDOWN_MS          700
+#define LSM6DS3TR_C_REG_INT1_CTRL      0x0D
+#define LSM6DS3TR_C_REG_TAP_SRC        0x1C
+#define LSM6DS3TR_C_REG_TAP_CFG        0x58
+#define LSM6DS3TR_C_REG_TAP_THS_6D     0x59
+#define LSM6DS3TR_C_REG_INT_DUR2       0x5A
+#define LSM6DS3TR_C_REG_WAKE_UP_THS    0x5B
+#define LSM6DS3TR_C_REG_MD1_CFG        0x5E
+#define LSM6DS3TR_C_INT1_DRDY_MASK     (BIT(1) | BIT(0))
+#define LSM6DS3TR_C_TAP_CFG_MASK       (BIT(7) | BIT(3) | BIT(2) | BIT(1) | BIT(0))
+#define LSM6DS3TR_C_TAP_CFG_Z_LATCHED  (BIT(7) | BIT(1) | BIT(0))
+#define LSM6DS3TR_C_TAP_THS_MASK       0x1F
+#define LSM6DS3TR_C_TAP_THS_BALANCED   0x08
+#define LSM6DS3TR_C_INT_DUR_BALANCED   0x4A
+#define LSM6DS3TR_C_DOUBLE_TAP_ENABLE  BIT(7)
+#define LSM6DS3TR_C_MD1_TAP_MASK       (BIT(6) | BIT(3))
+#define LSM6DS3TR_C_MD1_DOUBLE_TAP     BIT(3)
+#define LSM6DS3TR_C_TAP_SRC_MATCH      (BIT(6) | BIT(4) | BIT(0))
 
 /*
  * Dorsal-side gesture classifier (accel + on-demand gyro_y).
@@ -368,6 +396,13 @@ static void conn_param_work_handler(struct k_work *work)
 
 /* IMU device */
 static const struct device *const imu     = DEVICE_DT_GET(IMU_NODE);
+static const struct i2c_dt_spec imu_i2c = I2C_DT_SPEC_GET(IMU_NODE);
+static const struct sensor_trigger double_tap_trigger = {
+    .type = SENSOR_TRIG_DATA_READY,
+    .chan = SENSOR_CHAN_ACCEL_XYZ,
+};
+static atomic_t double_tap_irq_pending;
+static int64_t double_tap_last_event_ms;
 
 /* Gesture state */
 typedef enum {
@@ -830,6 +865,7 @@ static float deg_diff(float a, float b);
 static void gyro_set_enabled(bool enable);
 static void gyro_reset_phase_metrics(void);
 static void flush_gesture_history(void);
+static void process_double_tap_event(int64_t now);
 
 /* ============================================================================
  * Motion Detection
@@ -985,6 +1021,77 @@ static int configure_motion_detection(void)
     LOG_INF("Calibrating for %.1f s; keep the board still",
             (double)(CALIBRATION_SAMPLES * MOTION_SAMPLE_INTERVAL_MS) / 1000.0);
     return 0;
+}
+
+static void double_tap_irq_handler(const struct device *dev,
+                                   const struct sensor_trigger *trig)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(trig);
+    atomic_set(&double_tap_irq_pending, 1);
+}
+
+static int configure_double_tap_detection(void)
+{
+    uint8_t tap_src;
+    int ret;
+
+    if (!i2c_is_ready_dt(&imu_i2c)) {
+        LOG_ERR("IMU I2C bus not ready for double tap");
+        return -ENODEV;
+    }
+
+    /* Stop the driver's default DRDY routing before repurposing INT1. */
+    ret = sensor_trigger_set(imu, &double_tap_trigger, NULL);
+    if (ret < 0) {
+        LOG_ERR("Disabling IMU DRDY trigger failed: %d", ret);
+        return ret;
+    }
+    ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_INT1_CTRL,
+                                 LSM6DS3TR_C_INT1_DRDY_MASK, 0);
+    if (ret < 0) {
+        LOG_ERR("Clearing IMU DRDY routing failed: %d", ret);
+        return ret;
+    }
+
+    ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_CFG,
+                                 LSM6DS3TR_C_TAP_CFG_MASK,
+                                 LSM6DS3TR_C_TAP_CFG_Z_LATCHED);
+    if (ret < 0) goto register_error;
+    ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_THS_6D,
+                                 LSM6DS3TR_C_TAP_THS_MASK,
+                                 LSM6DS3TR_C_TAP_THS_BALANCED);
+    if (ret < 0) goto register_error;
+    ret = i2c_reg_write_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_INT_DUR2,
+                                LSM6DS3TR_C_INT_DUR_BALANCED);
+    if (ret < 0) goto register_error;
+    ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_WAKE_UP_THS,
+                                 LSM6DS3TR_C_DOUBLE_TAP_ENABLE,
+                                 LSM6DS3TR_C_DOUBLE_TAP_ENABLE);
+    if (ret < 0) goto register_error;
+    ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_MD1_CFG,
+                                 LSM6DS3TR_C_MD1_TAP_MASK,
+                                 LSM6DS3TR_C_MD1_DOUBLE_TAP);
+    if (ret < 0) goto register_error;
+
+    /* Clear a stale latched source before enabling GPIO delivery. */
+    ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
+    if (ret < 0) goto register_error;
+
+    atomic_clear(&double_tap_irq_pending);
+    ret = sensor_trigger_set(imu, &double_tap_trigger,
+                             double_tap_irq_handler);
+    if (ret < 0) {
+        LOG_ERR("Double-tap INT1 trigger setup failed: %d", ret);
+        return ret;
+    }
+
+    LOG_INF("Double tap ready: Z axis, threshold=0.5g, gap<=308ms");
+    return 0;
+
+register_error:
+    LOG_ERR("Double-tap register setup failed: %d", ret);
+    return ret;
 }
 
 static void gyro_reset_phase_metrics(void)
@@ -1567,6 +1674,47 @@ static void reset_gesture_sequence(void)
         }
 #endif
     }
+}
+
+static void process_double_tap_event(int64_t now)
+{
+    uint8_t tap_src;
+    int ret;
+
+    if (!atomic_cas(&double_tap_irq_pending, 1, 0)) {
+        return;
+    }
+
+    ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
+    if (ret < 0) {
+        LOG_ERR("Double-tap source read failed: %d", ret);
+        atomic_set(&double_tap_irq_pending, 1);
+        return;
+    }
+    if ((tap_src & LSM6DS3TR_C_TAP_SRC_MATCH) !=
+        LSM6DS3TR_C_TAP_SRC_MATCH) {
+        LOG_DBG("Ignoring IMU INT1 source 0x%02x", tap_src);
+        return;
+    }
+    if ((now - double_tap_last_event_ms) < DOUBLE_TAP_COOLDOWN_MS) {
+        return;
+    }
+    double_tap_last_event_ms = now;
+
+    /* A BLE-only tap must not become the shake that starts recording. */
+    if (!is_recording && !recording_requested) {
+        reset_gesture_sequence();
+        gesture_block_until_ms = now + GESTURE_RETRIGGER_BLOCK_MS;
+    }
+
+    if (light_sleep_active) {
+        light_sleep_active = false;
+        send_event_packet(0x21);
+        printk(">>> Light sleep wake (double tap)\n");
+    }
+    last_activity_ms = now;
+    printk(">>> Double tap detected (TAP_SRC=0x%02x)\n", tap_src);
+    send_event_packet(EVT_DOUBLE_TAP);
 }
 
 static void update_quiet_accel_reference(float x, float y, float z)
@@ -3269,6 +3417,10 @@ int main(void)
     } else {
         ret = configure_motion_detection();
         if (ret < 0) LOG_WRN("Motion detection setup failed: %d", ret);
+        else {
+            ret = configure_double_tap_detection();
+            if (ret < 0) LOG_WRN("Double-tap detection disabled: %d", ret);
+        }
     }
 
     ret = bt_enable(NULL);
@@ -3350,6 +3502,7 @@ int main(void)
             last_motion_sample_ms = now_ms;
             process_motion_sample();
         }
+        process_double_tap_event(now_ms);
 
         led_tick();
 

@@ -157,6 +157,7 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 | `0x02` | `recording_stop` | なし | 録音停止 |
 | `0x10` | `motion_active` | x, y, z f32 LE（各 4 byte） | モーション検出開始、xyz 加速度値 |
 | `0x11` | `motion_settled` | x, y, z f32 LE + elapsed_ms u32 + avg/peak_speed/distance f32 LE（計 28 bytes） | モーション静定、詳細メトリクス |
+| `0x12` | `double_tap` | なし | リストバンド表側から基板面へ垂直に行ったダブルタップ |
 | `0x20` | `sleep_enter` | なし | ライトスリープ移行（10 秒無動作） |
 | `0x21` | `sleep_wake` | なし | ライトスリープ復帰（モーション検出） |
 | `0x30` | `gesture_diag` | stage/reason u8 + value1/2/3 f32 LE | USBなしのジェスチャー内部診断 |
@@ -211,6 +212,55 @@ XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基�
 | ライトスリープ復帰時 | → 25 ms | `0x21 sleep_wake` |
 
 BLE 接続はスリープ中も維持されます。録音停止後もタイマーはリセットされ、即座にスリープに入ることはありません。
+
+### ダブルタップ
+
+LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側にした装着状態で
+リストバンド表側から基板面へ垂直に行うダブルタップを Z 軸で検出する。
+閾値は約 0.5 g、2 回の最大間隔は約 308 ms、認識後のクールダウンは 700 ms。
+成立時は `0x12 double_tap` を BLE 通知するだけで、録音状態は変更しない。
+ライトスリープ中は復帰し、ダブルタップが既存のシェイク開始ジェスチャーとして
+扱われないよう、待機中の開始候補を破棄する。
+
+#### ハードウェア割り込み構成
+
+この機能は、25 / 50 ms ごとに取得する加速度値からCPUがタップ波形を分類する
+ソフトウェア検出ではない。LSM6DS3TR-C 内蔵のtap/double-tapエンジンと
+**INT1ハードウェア割り込み**を使用する。
+
+```
+リストバンド表側への衝撃
+  → LSM6DS3TR-C内蔵判定（Z軸、閾値・Shock・Quiet・Duration）
+  → TAP_SRCにdouble-tap/Zを記録
+  → IMU INT1をassert
+  → XIAO P0.11のGPIO割り込み
+  → メインループでTAP_SRCを確認
+  → BLE [0x00, 0x55, 0x12]
+```
+
+- 基板DTSの `irq-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>` により、IMU INT1は
+  nRF52840のP0.11へ接続される。
+- `INT1_CTRL` の加速度・ジャイロdata-ready割り込みを無効化し、`MD1_CFG` の
+  double-tapだけをINT1へ割り当てる。割り込み処理はフラグを立てるだけで、
+  I2C読み出しとBLE通知はメインループ側で行う。
+- NCS v2.9.2のLSM6DSLドライバはこのセンサーの`SENSOR_TRIG_DOUBLE_TAP`を
+  実装していない。そのためtap関連レジスタをI2Cで直接設定し、ドライバの
+  `SENSOR_TRIG_DATA_READY`用INT1配送経路をGPIO通知手段として再利用する。
+  実際の割り込み源はdata-readyではなく、IMUが判定したdouble-tapである。
+- 初期化に失敗した場合はdouble-tapだけを無効化してログへ理由を出し、既存の
+  IMUポーリング、録音ジェスチャー、BLE接続は継続する。
+
+#### 実機確認結果
+
+2026-08-24、ファームウェア`0.0.55`をXIAO nRF52840 SenseへOTA適用し、
+部品面を皮膚側にして装着した状態で確認した。
+
+| 試験 | 結果 |
+|------|------|
+| リストバンド表側をダブルタップ | 3 / 3 検出 |
+| 表側を1回だけタップ | 2 / 2 誤検出なし |
+| タップせず腕を自然に上げ下げ | 2 / 2 誤検出なし |
+| 合計 | **7 / 7 PASS** |
 
 ---
 
@@ -346,7 +396,7 @@ OTA verified: uploaded image is active and confirmed in slot 0 (version=...).
 
 ### xiao_voice_client.py — BLE 録音クライアント
 
-HarnessNode に接続し、`0x01` 受信で WAV 録音を自動開始、`0x02` 受信で自動停止します。motion_active / motion_settled / sleep_enter / sleep_wake イベントも画面表示します。
+HarnessNode に接続し、`0x01` 受信で WAV 録音を自動開始、`0x02` 受信で自動停止します。motion_active / motion_settled / double_tap / sleep_enter / sleep_wake イベントも画面表示します。
 
 ```bash
 cd mac_client
@@ -366,7 +416,7 @@ source venv/bin/activate
 python3 gesture_monitor.py
 ```
 
-表示イベント: `motion_active`（x/y/z）、`motion_settled`（x/y/z + elapsed/peak/dist）、`recording_start`、`recording_stop`、`sleep_enter`、`sleep_wake`
+表示イベント: `motion_active`（x/y/z）、`motion_settled`（x/y/z + elapsed/peak/dist）、`double_tap`、`recording_start`、`recording_stop`、`sleep_enter`、`sleep_wake`
 
 ### gesture_validator.py — シェイク→掌上→挙上→掌下静止ジェスチャー検証
 
