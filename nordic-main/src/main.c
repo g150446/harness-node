@@ -132,10 +132,11 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
  *
  * Board on the back of the wrist, component-side against skin.  Axes: X across
  * the forearm, Y along the forearm (pronation axis = gyro_y), Z normal to the
- * board (component-out).  Sequence: palm-down shake → palm-up (gravity and/or
- * gyro_y) → lift → rotate from the palm-up pose and hold still 0.5 s.
- * Gyro enables when the shake is accepted (outbound start; ~100 ms settle fits
- * in the palm-up window), stays on through recording, and powers down when
+ * board (component-out). Sequence: palm-up horizontal dwell → lift →
+ * rotate from the palm-up pose and hold still 0.4 s.
+ * A horizontal, still pose held for 0.5 seconds is treated as the palm-up
+ * candidate. Gyro enables when that dwell is accepted, stays on through
+ * recording, and powers down when
  * recording ends (or the sequence resets without a match).
  * Recording stops on a palm-up flip from the pose frozen at start
  * (gravity and/or gyro_y). Dropping the hand does not stop.
@@ -144,35 +145,34 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_RAD_TO_DEG                   57.29577951308232
 #define GESTURE_START_ARM_MS                2500
 /* Board-flat gate: |z / |a||. Hold palm-down is a flip from the palm-up pose. */
-#define GESTURE_START_PALM_UP_Z_MIN_RATIO       0.80f
+#define GESTURE_START_PALM_UP_Z_MIN_RATIO       0.75f
 #define GESTURE_START_GRAVITY_MIN_MS2           8.5f
 #define GESTURE_START_GRAVITY_MAX_MS2          11.5f
-#define GESTURE_PHASE_MIN_DURATION_MS           120
-#define GESTURE_OUTBOUND_MAX_DURATION_MS       1500
-/* Hold flip: gravity rotation in XZ (phi) or a clear Z-axis direction change. */
-#define GESTURE_PRONATION_MIN_DEG               20.0f
-#define GESTURE_PRONATION_Z_RATIO_DONE           0.50f
+#define GESTURE_PALM_UP_DWELL_MS                 500
+#define GESTURE_PALM_UP_DWELL_TILT_MAX_DEG      20.0f
+#define GESTURE_START_QUIET_ACCEL_MS2             4.0f
+/* Hold flip: gravity rotation plus a coupled lift/pronation motion. */
+#define GESTURE_PRONATION_MIN_DEG               15.0f
+#define GESTURE_PRONATION_Z_RATIO_DONE           0.40f
 #define GESTURE_PRONATION_Z_SIGN_MIN_MS2         2.0f
 #define GESTURE_PRONATION_GRAVITY_MIN_MS2        7.5f
 #define GESTURE_PRONATION_GRAVITY_MAX_MS2       12.5f
-/* Outbound palm-up is looser than hold: pitch (3D) counts, not only XZ phi. */
-#define GESTURE_OUTBOUND_MIN_DEG                 12.0f
-#define GESTURE_OUTBOUND_Z_RATIO_DONE            0.35f
-#define GESTURE_OUTBOUND_TILT_MIN_DEG            20.0f
-/* gyro_y (forearm axis) gates — OR'd with gravity palm gates. */
-#define GESTURE_GYRO_SETTLE_MS                   100
+/* Recording-stop palm-up (0.0.66): LP phi + strong Z change; no tilt-alone. */
+#define GESTURE_OUTBOUND_MIN_DEG                 20.0f
+#define GESTURE_OUTBOUND_Z_RATIO_DONE            0.50f
+#define GESTURE_OUTBOUND_TILT_MIN_DEG            30.0f
+/* gyro_y is forearm pronation; gyro_x supplies the arm-lift coupling. */
+#define GESTURE_GYRO_SETTLE_MS                    50
 #define GESTURE_GYRO_BIAS_CAPTURE_MAX_DPS        15.0f
-#define GESTURE_OUTBOUND_GYRO_INTEGRATE_RATE_DPS 20.0f
-#define GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG      45.0f
-#define GESTURE_OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS 30.0f
-#define GESTURE_OUTBOUND_GYRO_PEAK_DPS          50.0f
-#define GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS     15.0f
-#define GESTURE_HOLD_GYRO_ANGLE_MIN_DEG         20.0f
-#define GESTURE_HOLD_GYRO_PEAK_DPS              30.0f
+#define GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS     10.0f
+#define GESTURE_HOLD_GYRO_ANGLE_MIN_DEG         50.0f
+#define GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN      0.42f
 #define GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS     20.0f
 #define GESTURE_STOP_GYRO_ANGLE_MIN_DEG          45.0f
 #define GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS     30.0f
+/* Peak-only gyro stop removed (0.0.64); keep constant for diag compatibility. */
 #define GESTURE_STOP_GYRO_PEAK_DPS              50.0f
+#define GESTURE_STOP_HOLD_MS                     500
 /* Gyro quiet only gates *entering* hold; residual wrist rate during hold is looser. */
 #define GESTURE_FINAL_QUIET_RATE_DPS            90.0f
 /* Final: upward acceleration pulse, braking pulse, then a quiet hold. */
@@ -182,29 +182,28 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_LIFT_NEG_IMPULSE_MIN_MS           0.015f
 #define GESTURE_LIFT_BRAKE_RATIO_MIN              0.05f
 #define GESTURE_LIFT_PULSE_MIN_MS                  150
-#define GESTURE_LIFT_PULSE_MAX_MS                 1800
 #define GESTURE_LIFT_CONSECUTIVE_SAMPLES             2
 #define GESTURE_LIFT_FINAL_TILT_MAX_DEG           15.0f
 #define GESTURE_FINAL_HOLD_MS                     400
-#define GESTURE_FINAL_HOLD_TIMEOUT_MS            5000
+#define GESTURE_LIFT_START_TIMEOUT_MS            5000
+#define GESTURE_MOTION_COMPLETE_MAX_MS           4500
 #define GESTURE_FINAL_STILL_RMS_MS2              3.0f
+#define GESTURE_FINAL_HOLD_RMS_EXIT_MS2          3.5f
+#define GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES         2
 #define GESTURE_FINAL_RMS_WINDOW_SAMPLES             4
-#define GESTURE_SEQUENCE_TIMEOUT_MS              6000
-#define GESTURE_RETRIGGER_BLOCK_MS           1200
+#define GESTURE_RETRIGGER_BLOCK_MS               3000
 #define GESTURE_GRAVITY_LP_TAU_S                 0.30f
 #define GESTURE_QUIET_ACCEL_MS2                  3.0f
-/* Palm-down shake: gravity-orthogonal linear accel, 500 ms window. */
-#define GESTURE_SHAKE_WINDOW_SAMPLES                20
-#define GESTURE_SHAKE_PTP_MIN_MS2                 5.0f
-#define GESTURE_SHAKE_MEAN_RATIO_MAX              0.4f
-#define GESTURE_SHAKE_AXIS_MIN_MS2                2.0f
-
 /* Compile-time gesture history dump (0=off production, 1=debug OTA). */
 #ifndef GESTURE_DEBUG_HISTORY
 #define GESTURE_DEBUG_HISTORY                     0
 #endif
 #define GESTURE_HISTORY_CAP                         96
 #define GESTURE_HISTORY_FLUSH_GAP_MS                 5
+#define GESTURE_TRAJECTORY_CAP                      384
+#define GESTURE_TRAJECTORY_CHUNK_SAMPLES              8
+#define GESTURE_TRAJECTORY_VERSION                    1
+#define GESTURE_HOST_COLLECTION_MS                  6000
 
 /* BLE gesture diagnostics: event 0x30, stage/reason + three float values. */
 #define GESTURE_DIAG_OUTBOUND_START           0x01
@@ -217,6 +216,8 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_DIAG_GYRO_DISABLED            0x0E
 #define GESTURE_DIAG_OUTBOUND_GYRO            0x0F  /* roll_deg, peak_dps, sign */
 #define GESTURE_DIAG_HOLD_SAMPLE              0x22  /* rms, tilt_deg, |gy|_dps */
+#define GESTURE_DIAG_MOTION_COMPLETE           0x23  /* elapsed_ms, peak_y, roll */
+#define GESTURE_DIAG_PALM_DOWN_GATE            0x24  /* gate-specific metrics */
 #define GESTURE_DIAG_FINAL_SAMPLE             0x21
 #define GESTURE_DIAG_WAIT_REJECT               0x10
 #define GESTURE_DIAG_RESET                     0x80
@@ -226,6 +227,9 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define EVT_GESTURE_HISTORY_BEGIN             0x33
 #define EVT_GESTURE_HISTORY_ENTRY             0x34
 #define EVT_GESTURE_HISTORY_END               0x35
+#define EVT_GESTURE_TRAJECTORY_BEGIN          0x36
+#define EVT_GESTURE_TRAJECTORY_CHUNK          0x37
+#define EVT_GESTURE_TRAJECTORY_END            0x38
 
 #define GESTURE_DIAG_REASON_NONE               0x00
 #define GESTURE_DIAG_REASON_QUIET_NOT_READY    0x01
@@ -243,6 +247,11 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_DIAG_REASON_FINAL_PULSE_DURATION_INVALID 0x21
 #define GESTURE_DIAG_REASON_SHAKE_NOT_OSCILLATORY 0x22
 #define GESTURE_DIAG_REASON_LIFT_PALM_STILL_UP     0x23
+#define GESTURE_DIAG_REASON_MOTION_TOO_SLOW         0x24
+#define GESTURE_DIAG_REASON_PALM_DOWN_GRAVITY_LOW   0x25
+#define GESTURE_DIAG_REASON_PALM_DOWN_GYRO_ANGLE_LOW 0x26
+#define GESTURE_DIAG_REASON_PALM_DOWN_XY_RATIO_LOW  0x27
+#define GESTURE_DIAG_REASON_PALM_DOWN_GATE_FAILED   0x28
 
 /* ============================================================================
  * BLE UUIDs (Handy-compatible)
@@ -407,7 +416,6 @@ static int64_t double_tap_last_event_ms;
 /* Gesture state */
 typedef enum {
     GESTURE_WAITING,
-    GESTURE_OUTBOUND,
     GESTURE_HOLDING_FINAL,
 } gesture_phase_t;
 
@@ -427,6 +435,11 @@ static int64_t gesture_quiet_since_ms;
 static int64_t gesture_armed_until_ms;
 static int64_t gesture_block_until_ms;
 static int64_t gesture_diag_last_report_ms;
+static int64_t gesture_palm_candidate_since_ms;
+static float gesture_palm_candidate_gx;
+static float gesture_palm_candidate_gy;
+static float gesture_palm_candidate_gz;
+static bool gesture_rearm_required;
 static float gesture_quiet_accel_x, gesture_quiet_accel_y, gesture_quiet_accel_z;
 static bool gesture_quiet_accel_valid;
 static float gesture_start_accel_x, gesture_start_accel_y, gesture_start_accel_z;
@@ -439,11 +452,6 @@ static float gesture_pronation_ref_phi_deg;
 static float gesture_armed_az;
 static float gesture_armed_z_ratio;
 static float gesture_armed_gx, gesture_armed_gy, gesture_armed_gz;
-static bool gesture_outbound_qualified;
-static bool gesture_shake_lp_ref_valid;
-static float gesture_shake_lp_ref_x, gesture_shake_lp_ref_y, gesture_shake_lp_ref_z;
-static float gesture_shake_lp_ref_phi;
-static float gesture_shake_lp_ref_z_ratio;
 static float gesture_gravity_lp_x, gesture_gravity_lp_y, gesture_gravity_lp_z;
 static float gesture_linear_world_x, gesture_linear_world_y;
 static float gesture_linear_world_z;
@@ -459,9 +467,11 @@ static float gesture_lift_final_tilt_deg;
 static float gesture_lift_max_hold_tilt_deg;
 static bool gesture_lift_hold_axis_valid;
 static bool gesture_lift_pose_failed;
+static bool gesture_palm_down_latched;
 static int64_t gesture_lift_event_start_ms;
 static uint8_t gesture_lift_accel_samples;
 static uint8_t gesture_lift_brake_samples;
+static uint8_t gesture_hold_rms_exit_samples;
 static int64_t gesture_debug_final_last_ms;
 static float gesture_accel_history_ms2[GESTURE_FINAL_RMS_WINDOW_SAMPLES];
 static uint8_t gesture_accel_history_index;
@@ -474,12 +484,8 @@ static float recording_stop_ref_z_ratio;
 static float recording_stop_ref_gx, recording_stop_ref_gy, recording_stop_ref_gz;
 static float recording_stop_peak_phi_deg;
 static float recording_stop_peak_tilt_deg;
-static float gesture_shake_axis_x, gesture_shake_axis_y, gesture_shake_axis_z;
-static bool gesture_shake_axis_valid;
-static float gesture_shake_signed[GESTURE_SHAKE_WINDOW_SAMPLES];
-static uint8_t gesture_shake_index, gesture_shake_count;
-static float gesture_shake_last_ptp_ms2;
-static float gesture_shake_last_mean_ms2;
+static int64_t recording_stop_hold_since_ms;
+static bool recording_stop_ref_locked;
 
 /* On-demand gyro (powered while gesture sequence or recording is active). */
 static bool gyro_enabled;
@@ -489,6 +495,7 @@ static float gyro_bias_y_dps;
 static bool gyro_bias_valid;
 static float gesture_gyro_roll_deg;
 static float gesture_gyro_peak_abs_dps;
+static float gesture_gyro_x_peak_abs_dps;
 static float gesture_outbound_gyro_sign;
 static float recording_stop_gyro_roll_deg;
 static float recording_stop_gyro_peak_abs_dps;
@@ -508,6 +515,36 @@ static uint8_t gesture_history_count;
 static uint8_t gesture_history_session;
 static int64_t gesture_history_t0_ms;
 static bool gesture_history_flush_pending;
+
+typedef struct {
+    uint16_t t_ms;
+    uint8_t flags;
+    float ax;
+    float ay;
+    float az;
+    float gx;
+    float gy;
+    float gz;
+} gesture_trajectory_sample_t;
+
+static gesture_trajectory_sample_t gesture_trajectory[GESTURE_TRAJECTORY_CAP];
+static uint16_t gesture_trajectory_count;
+static uint8_t gesture_trajectory_session;
+static int64_t gesture_trajectory_t0_ms;
+static uint8_t gesture_trajectory_result;
+static uint8_t gesture_trajectory_reason;
+static bool gesture_trajectory_active;
+static bool gesture_trajectory_committed;
+static bool gesture_trajectory_overflow;
+static bool gesture_trajectory_flush_pending;
+
+/* Host-triggered collection is independent of classifier-owned history. */
+static gesture_trajectory_sample_t gesture_host_collection[GESTURE_TRAJECTORY_CAP];
+static uint16_t gesture_host_collection_count;
+static int64_t gesture_host_collection_t0_ms;
+static bool gesture_host_collection_active;
+static bool gesture_host_collection_overflow;
+static bool gesture_host_collection_flush_pending;
 #endif
 
 /* Motion detection state */
@@ -865,6 +902,8 @@ static float deg_diff(float a, float b);
 static void gyro_set_enabled(bool enable);
 static void gyro_reset_phase_metrics(void);
 static void flush_gesture_history(void);
+static void flush_gesture_trajectory(void);
+static void flush_host_collection(void);
 static void process_double_tap_event(int64_t now);
 
 /* ============================================================================
@@ -999,7 +1038,7 @@ static int configure_motion_detection(void)
                           SENSOR_ATTR_SAMPLING_FREQUENCY, &accel_odr);
     if (ret < 0) { LOG_ERR("ODR set failed: %d", ret); return ret; }
 
-    /* Power-down gyro until a shake window or recording needs it. */
+    /* Power-down gyro until a palm-up dwell or recording needs it. */
     ret = sensor_attr_set(imu, SENSOR_CHAN_GYRO_XYZ,
                           SENSOR_ATTR_SAMPLING_FREQUENCY, &gyro_odr);
     if (ret < 0) {
@@ -1098,6 +1137,7 @@ static void gyro_reset_phase_metrics(void)
 {
     gesture_gyro_roll_deg = 0.0f;
     gesture_gyro_peak_abs_dps = 0.0f;
+    gesture_gyro_x_peak_abs_dps = 0.0f;
 }
 
 static void gyro_set_enabled(bool enable)
@@ -1106,6 +1146,11 @@ static void gyro_set_enabled(bool enable)
     struct sensor_value full_scale;
     int ret;
 
+#if GESTURE_DEBUG_HISTORY
+    if (!enable && gesture_host_collection_active) {
+        return;
+    }
+#endif
     if (enable == gyro_enabled) {
         return;
     }
@@ -1172,36 +1217,49 @@ static void accumulate_gyro_roll(float gy_dps, float dt_s, float min_rate_dps,
     }
 }
 
-static bool gesture_gyro_outbound_ok(void)
-{
-    bool angle_ok =
-        fabsf(gesture_gyro_roll_deg) >= GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG &&
-        gesture_gyro_peak_abs_dps >= GESTURE_OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS;
-
-    return angle_ok ||
-           gesture_gyro_peak_abs_dps >= GESTURE_OUTBOUND_GYRO_PEAK_DPS;
-}
-
 static bool gesture_gyro_hold_flip_ok(void)
 {
+    float signed_roll = fabsf(gesture_gyro_roll_deg);
+
     if (gesture_outbound_gyro_sign == 0.0f) {
-        return fabsf(gesture_gyro_roll_deg) >= GESTURE_HOLD_GYRO_ANGLE_MIN_DEG ||
-               gesture_gyro_peak_abs_dps >= GESTURE_HOLD_GYRO_PEAK_DPS;
+        signed_roll = fabsf(gesture_gyro_roll_deg);
+    } else {
+        /* Opposite sign from the outbound palm-up rotation. */
+        signed_roll = gesture_gyro_roll_deg * (-gesture_outbound_gyro_sign);
     }
-    /* Opposite sign from the outbound palm-up rotation. */
-    float signed_roll = gesture_gyro_roll_deg * (-gesture_outbound_gyro_sign);
-    return signed_roll >= GESTURE_HOLD_GYRO_ANGLE_MIN_DEG ||
-           gesture_gyro_peak_abs_dps >= GESTURE_HOLD_GYRO_PEAK_DPS;
+
+    bool angle_ok = signed_roll >= GESTURE_HOLD_GYRO_ANGLE_MIN_DEG;
+    bool lift_coupled =
+        gesture_gyro_x_peak_abs_dps >=
+            gesture_gyro_peak_abs_dps *
+                GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN;
+    /* Accel lift pulse already proves arm motion; require xy coupling only
+     * while still waiting for that pulse (rejects pure wrist roll alone). */
+    bool lift_stage_ok = gesture_lift_stage != GESTURE_LIFT_WAIT_ACCEL;
+
+    return angle_ok && (lift_coupled || lift_stage_ok);
+}
+
+static float gesture_gyro_hold_signed_roll_deg(void)
+{
+    if (gesture_outbound_gyro_sign == 0.0f) {
+        return fabsf(gesture_gyro_roll_deg);
+    }
+    return gesture_gyro_roll_deg * (-gesture_outbound_gyro_sign);
+}
+
+static float gesture_gyro_hold_xy_peak_ratio(void)
+{
+    return gesture_gyro_peak_abs_dps > 0.1f
+        ? gesture_gyro_x_peak_abs_dps / gesture_gyro_peak_abs_dps
+        : 0.0f;
 }
 
 static bool gesture_gyro_stop_ok(void)
 {
-    bool angle_ok =
-        fabsf(recording_stop_gyro_roll_deg) >= GESTURE_STOP_GYRO_ANGLE_MIN_DEG &&
-        recording_stop_gyro_peak_abs_dps >= GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS;
-
-    return angle_ok ||
-           recording_stop_gyro_peak_abs_dps >= GESTURE_STOP_GYRO_PEAK_DPS;
+    /* Peak-only path removed: brief wrist flicks must not stop recording. */
+    return fabsf(recording_stop_gyro_roll_deg) >= GESTURE_STOP_GYRO_ANGLE_MIN_DEG &&
+           recording_stop_gyro_peak_abs_dps >= GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS;
 }
 
 #if GESTURE_DEBUG_HISTORY
@@ -1243,6 +1301,115 @@ static void gesture_history_push(uint8_t stage, uint8_t reason,
     e->v2 = v2;
     e->v3 = v3;
 }
+
+static void gesture_trajectory_clear(void)
+{
+    gesture_trajectory_count = 0;
+    gesture_trajectory_t0_ms = k_uptime_get();
+    gesture_trajectory_result = 0;
+    gesture_trajectory_reason = GESTURE_DIAG_REASON_NONE;
+    gesture_trajectory_active = true;
+    gesture_trajectory_committed = false;
+    gesture_trajectory_overflow = false;
+    gesture_trajectory_flush_pending = false;
+}
+
+static void gesture_trajectory_discard(void)
+{
+    gesture_trajectory_count = 0;
+    gesture_trajectory_active = false;
+    gesture_trajectory_committed = false;
+    gesture_trajectory_overflow = false;
+    gesture_trajectory_flush_pending = false;
+}
+
+static void gesture_trajectory_push(int64_t now, uint8_t flags,
+                                    float ax, float ay, float az,
+                                    float gx, float gy, float gz)
+{
+    gesture_trajectory_sample_t *sample;
+    int64_t dt;
+
+    if (!gesture_trajectory_active) {
+        return;
+    }
+    if (gesture_trajectory_count >= GESTURE_TRAJECTORY_CAP) {
+        gesture_trajectory_overflow = true;
+        return;
+    }
+    sample = &gesture_trajectory[gesture_trajectory_count++];
+    dt = now - gesture_trajectory_t0_ms;
+    sample->t_ms = (uint16_t)CLAMP(dt, 0, UINT16_MAX);
+    sample->flags = flags;
+    sample->ax = ax;
+    sample->ay = ay;
+    sample->az = az;
+    sample->gx = gx;
+    sample->gy = gy;
+    sample->gz = gz;
+}
+
+static void gesture_trajectory_finish(uint8_t result, uint8_t reason)
+{
+    if (!gesture_trajectory_active || !gesture_trajectory_committed) {
+        return;
+    }
+    gesture_trajectory_active = false;
+    gesture_trajectory_result = result;
+    gesture_trajectory_reason = reason;
+    gesture_trajectory_flush_pending = true;
+}
+
+static bool gesture_host_collection_start(void)
+{
+    if (gesture_host_collection_active ||
+        gesture_host_collection_flush_pending || is_recording ||
+        recording_requested) {
+        return false;
+    }
+    gesture_host_collection_count = 0;
+    gesture_host_collection_t0_ms = k_uptime_get();
+    gesture_host_collection_overflow = false;
+    gesture_host_collection_active = true;
+    gyro_set_enabled(true);
+    printk(">>> Host IMU collection started: %d ms\n",
+           GESTURE_HOST_COLLECTION_MS);
+    return true;
+}
+
+static void gesture_host_collection_push(int64_t now, uint8_t flags,
+                                         float ax, float ay, float az,
+                                         float gx, float gy, float gz)
+{
+    gesture_trajectory_sample_t *sample;
+    int64_t dt;
+
+    if (!gesture_host_collection_active) {
+        return;
+    }
+    if (gesture_host_collection_count >= GESTURE_TRAJECTORY_CAP) {
+        gesture_host_collection_overflow = true;
+        gesture_host_collection_active = false;
+        gesture_host_collection_flush_pending = true;
+        return;
+    }
+    sample = &gesture_host_collection[gesture_host_collection_count++];
+    dt = now - gesture_host_collection_t0_ms;
+    sample->t_ms = (uint16_t)CLAMP(dt, 0, UINT16_MAX);
+    sample->flags = flags;
+    sample->ax = ax;
+    sample->ay = ay;
+    sample->az = az;
+    sample->gx = gx;
+    sample->gy = gy;
+    sample->gz = gz;
+    if (dt >= GESTURE_HOST_COLLECTION_MS) {
+        gesture_host_collection_active = false;
+        gesture_host_collection_flush_pending = true;
+        printk(">>> Host IMU collection complete: %u samples\n",
+               gesture_host_collection_count);
+    }
+}
 #endif
 
 /* ============================================================================
@@ -1274,9 +1441,11 @@ static void reset_gesture_motion(void)
     gesture_lift_max_hold_tilt_deg = 0.0f;
     gesture_lift_hold_axis_valid = false;
     gesture_lift_pose_failed = false;
+    gesture_palm_down_latched = false;
     gesture_lift_event_start_ms = 0;
     gesture_lift_accel_samples = 0;
     gesture_lift_brake_samples = 0;
+    gesture_hold_rms_exit_samples = 0;
     gesture_debug_final_last_ms = 0;
     memset(gesture_accel_history_ms2, 0, sizeof(gesture_accel_history_ms2));
     gesture_accel_history_index = 0;
@@ -1302,122 +1471,15 @@ static void update_gravity_lp(float ax, float ay, float az, float dt_s)
     gesture_linear_accel_norm_ms2 = vector_norm3(linear_x, linear_y, linear_z);
 }
 
-static void reset_shake_window(void)
-{
-    memset(gesture_shake_signed, 0, sizeof(gesture_shake_signed));
-    gesture_shake_index = 0;
-    gesture_shake_count = 0;
-    gesture_shake_axis_valid = false;
-    gesture_shake_axis_x = 0.0f;
-    gesture_shake_axis_y = 0.0f;
-    gesture_shake_axis_z = 0.0f;
-    gesture_shake_last_ptp_ms2 = 0.0f;
-    gesture_shake_last_mean_ms2 = 0.0f;
-    gesture_shake_lp_ref_valid = false;
-    gesture_shake_lp_ref_x = 0.0f;
-    gesture_shake_lp_ref_y = 0.0f;
-    gesture_shake_lp_ref_z = 0.0f;
-    gesture_shake_lp_ref_phi = 0.0f;
-    gesture_shake_lp_ref_z_ratio = 0.0f;
-}
-
-static void snapshot_shake_gravity_reference(void)
-{
-    float gx = gesture_gravity_lp_x;
-    float gy = gesture_gravity_lp_y;
-    float gz = gesture_gravity_lp_z;
-    float n = vector_norm3(gx, gy, gz);
-
-    if (n <= 0.1f) {
-        gesture_shake_lp_ref_valid = false;
-        return;
-    }
-    gesture_shake_lp_ref_x = gx;
-    gesture_shake_lp_ref_y = gy;
-    gesture_shake_lp_ref_z = gz;
-    gesture_shake_lp_ref_phi = atan2f(-gx, gz) * (float)GESTURE_RAD_TO_DEG;
-    gesture_shake_lp_ref_z_ratio = gz / n;
-    gesture_shake_lp_ref_valid = true;
-}
-
 static bool gesture_board_flat(float z_gravity_ratio)
 {
     return fabsf(z_gravity_ratio) >= GESTURE_START_PALM_UP_Z_MIN_RATIO;
 }
 
-static bool push_shake_sample(float dt_s)
-{
-    float g_norm = vector_norm3(gesture_gravity_lp_x,
-                                gesture_gravity_lp_y,
-                                gesture_gravity_lp_z);
-    if (g_norm <= 0.1f) {
-        reset_shake_window();
-        return false;
-    }
-
-    float g_hat_x = gesture_gravity_lp_x / g_norm;
-    float g_hat_y = gesture_gravity_lp_y / g_norm;
-    float g_hat_z = gesture_gravity_lp_z / g_norm;
-    float a_vert = gesture_linear_world_x * g_hat_x +
-                   gesture_linear_world_y * g_hat_y +
-                   gesture_linear_world_z * g_hat_z;
-    float a_hx = gesture_linear_world_x - a_vert * g_hat_x;
-    float a_hy = gesture_linear_world_y - a_vert * g_hat_y;
-    float a_hz = gesture_linear_world_z - a_vert * g_hat_z;
-    float a_h_norm = vector_norm3(a_hx, a_hy, a_hz);
-
-    if (!gesture_shake_axis_valid && a_h_norm >= GESTURE_SHAKE_AXIS_MIN_MS2) {
-        gesture_shake_axis_x = a_hx / a_h_norm;
-        gesture_shake_axis_y = a_hy / a_h_norm;
-        gesture_shake_axis_z = a_hz / a_h_norm;
-        gesture_shake_axis_valid = true;
-    }
-    if (!gesture_shake_axis_valid) {
-        return false;
-    }
-
-    float signed_h = a_hx * gesture_shake_axis_x +
-                     a_hy * gesture_shake_axis_y +
-                     a_hz * gesture_shake_axis_z;
-    gesture_shake_signed[gesture_shake_index] = signed_h;
-    gesture_shake_index =
-        (uint8_t)((gesture_shake_index + 1U) % GESTURE_SHAKE_WINDOW_SAMPLES);
-    if (gesture_shake_count < GESTURE_SHAKE_WINDOW_SAMPLES) {
-        gesture_shake_count++;
-        if (gesture_shake_count == 1U) {
-            snapshot_shake_gravity_reference();
-        }
-    }
-    if (gesture_shake_count < GESTURE_SHAKE_WINDOW_SAMPLES) {
-        return false;
-    }
-
-    float min_s = gesture_shake_signed[0];
-    float max_s = gesture_shake_signed[0];
-    float sum_s = 0.0f;
-    for (uint8_t i = 0; i < GESTURE_SHAKE_WINDOW_SAMPLES; i++) {
-        float s = gesture_shake_signed[i];
-        if (s < min_s) {
-            min_s = s;
-        }
-        if (s > max_s) {
-            max_s = s;
-        }
-        sum_s += s;
-    }
-
-    float ptp = max_s - min_s;
-    float mean = sum_s / (float)GESTURE_SHAKE_WINDOW_SAMPLES;
-    gesture_shake_last_ptp_ms2 = ptp;
-    gesture_shake_last_mean_ms2 = mean;
-    ARG_UNUSED(dt_s);
-    return ptp >= GESTURE_SHAKE_PTP_MIN_MS2 &&
-           fabsf(mean) < GESTURE_SHAKE_MEAN_RATIO_MAX * ptp;
-}
-
 static void reset_recording_stop_state(void)
 {
     recording_stop_ref_valid = false;
+    recording_stop_ref_locked = false;
     recording_stop_ref_phi_deg = 0.0f;
     recording_stop_ref_az = 0.0f;
     recording_stop_ref_z_ratio = 0.0f;
@@ -1426,6 +1488,7 @@ static void reset_recording_stop_state(void)
     recording_stop_ref_gz = 0.0f;
     recording_stop_peak_phi_deg = 0.0f;
     recording_stop_peak_tilt_deg = 0.0f;
+    recording_stop_hold_since_ms = 0;
     recording_stop_gyro_roll_deg = 0.0f;
     recording_stop_gyro_peak_abs_dps = 0.0f;
 }
@@ -1449,6 +1512,7 @@ static void capture_recording_stop_reference(void)
     recording_stop_ref_gz = gz / n;
     recording_stop_peak_phi_deg = 0.0f;
     recording_stop_peak_tilt_deg = 0.0f;
+    recording_stop_hold_since_ms = 0;
     recording_stop_gyro_roll_deg = 0.0f;
     recording_stop_gyro_peak_abs_dps = 0.0f;
     recording_stop_ref_valid = true;
@@ -1471,17 +1535,23 @@ static float recording_stop_tilt_deg(float ax, float ay, float az)
     return acosf(c) * (float)GESTURE_RAD_TO_DEG;
 }
 
+static bool recording_stop_z_sign_flipped(float az)
+{
+    return (az * recording_stop_ref_az < 0.0f) &&
+           fabsf(az) >= GESTURE_PRONATION_Z_SIGN_MIN_MS2 &&
+           fabsf(recording_stop_ref_az) >= GESTURE_PRONATION_Z_SIGN_MIN_MS2;
+}
+
 static bool recording_stop_palm_up_detected(float phi_deg, float tilt_deg,
                                            float z_gravity_ratio, float az)
 {
-    bool gravity_ok =
-        phi_deg >= GESTURE_OUTBOUND_MIN_DEG ||
-        tilt_deg >= GESTURE_OUTBOUND_TILT_MIN_DEG ||
+    bool z_ok =
         fabsf(z_gravity_ratio - recording_stop_ref_z_ratio) >=
             GESTURE_OUTBOUND_Z_RATIO_DONE ||
-        ((az * recording_stop_ref_az < 0.0f) &&
-         fabsf(az) >= GESTURE_PRONATION_Z_SIGN_MIN_MS2 &&
-         fabsf(recording_stop_ref_az) >= GESTURE_PRONATION_Z_SIGN_MIN_MS2);
+        recording_stop_z_sign_flipped(az);
+    /* phi + strong Z change required; tilt alone must not stop recording. */
+    bool gravity_ok = phi_deg >= GESTURE_OUTBOUND_MIN_DEG && z_ok;
+    (void)tilt_deg;
 
     return gravity_ok || gesture_gyro_stop_ok();
 }
@@ -1510,28 +1580,67 @@ static void process_recording_stop_sample(float ax, float ay, float az,
                                          float dt_s, int64_t now)
 {
     float accel_norm = vector_norm3(ax, ay, az);
-    float z_gravity_ratio = accel_norm > 0.1f ? az / accel_norm : 0.0f;
-    float phi = atan2f(-ax, az) * (float)GESTURE_RAD_TO_DEG;
-    float phi_change = fabsf(deg_diff(phi, recording_stop_ref_phi_deg));
-    float tilt_deg = recording_stop_tilt_deg(gesture_gravity_lp_x,
-                                            gesture_gravity_lp_y,
-                                            gesture_gravity_lp_z);
+    float g_norm = vector_norm3(gesture_gravity_lp_x,
+                                gesture_gravity_lp_y,
+                                gesture_gravity_lp_z);
+    float z_gravity_ratio = 0.0f;
+    float phi = 0.0f;
+    float phi_change = 0.0f;
+    float tilt_deg = 0.0f;
+    float az_lp = gesture_gravity_lp_z;
+    bool quiet;
+    bool candidate;
 
     if (stop_requested) {
         return;
     }
+
+    quiet = accel_norm >= GESTURE_PRONATION_GRAVITY_MIN_MS2 &&
+            accel_norm <= GESTURE_PRONATION_GRAVITY_MAX_MS2 &&
+            gesture_linear_accel_norm_ms2 <= GESTURE_QUIET_ACCEL_MS2;
+
+    /* During post-start inhibit, keep refreshing the palm-down reference. */
     if (now < gesture_block_until_ms) {
+        if (quiet) {
+            capture_recording_stop_reference();
+            recording_stop_ref_locked = false;
+        }
+        if (gyro_ok) {
+            /* Discard roll accumulated before the settled reference is locked. */
+            recording_stop_gyro_roll_deg = 0.0f;
+            recording_stop_gyro_peak_abs_dps = 0.0f;
+        }
+        recording_stop_hold_since_ms = 0;
         return;
     }
-    if (!recording_stop_ref_valid) {
-        capture_recording_stop_reference();
+
+    if (!recording_stop_ref_valid || !recording_stop_ref_locked) {
+        if (quiet) {
+            capture_recording_stop_reference();
+        } else if (!recording_stop_ref_valid) {
+            capture_recording_stop_reference();
+        }
         if (!recording_stop_ref_valid) {
             return;
         }
-        phi_change = 0.0f;
-        tilt_deg = 0.0f;
+        recording_stop_ref_locked = true;
+        recording_stop_gyro_roll_deg = 0.0f;
+        recording_stop_gyro_peak_abs_dps = 0.0f;
+        recording_stop_hold_since_ms = 0;
+        return;
     }
 
+    if (g_norm > 0.1f) {
+        z_gravity_ratio = gesture_gravity_lp_z / g_norm;
+        phi = atan2f(-gesture_gravity_lp_x, gesture_gravity_lp_z) *
+              (float)GESTURE_RAD_TO_DEG;
+    }
+    phi_change = fabsf(deg_diff(phi, recording_stop_ref_phi_deg));
+    tilt_deg = recording_stop_tilt_deg(gesture_gravity_lp_x,
+                                       gesture_gravity_lp_y,
+                                       gesture_gravity_lp_z);
+
+    /* Peaks are diagnostics only; stop decision uses current LP pose. */
     if (phi_change > recording_stop_peak_phi_deg) {
         recording_stop_peak_phi_deg = phi_change;
     }
@@ -1547,16 +1656,26 @@ static void process_recording_stop_sample(float ax, float ay, float az,
 
     if (accel_norm < GESTURE_PRONATION_GRAVITY_MIN_MS2 ||
         accel_norm > GESTURE_PRONATION_GRAVITY_MAX_MS2) {
+        recording_stop_hold_since_ms = 0;
         return;
     }
-    if (!recording_stop_palm_up_detected(recording_stop_peak_phi_deg,
-                                         recording_stop_peak_tilt_deg,
-                                         z_gravity_ratio, az)) {
+
+    candidate = recording_stop_palm_up_detected(phi_change, tilt_deg,
+                                               z_gravity_ratio, az_lp);
+    if (!candidate) {
+        recording_stop_hold_since_ms = 0;
+        return;
+    }
+    if (recording_stop_hold_since_ms == 0) {
+        recording_stop_hold_since_ms = now;
+        return;
+    }
+    if ((now - recording_stop_hold_since_ms) < GESTURE_STOP_HOLD_MS) {
         return;
     }
 
     request_recording_stop_palm_up(
-        now, recording_stop_peak_phi_deg, recording_stop_peak_tilt_deg,
+        now, phi_change, tilt_deg,
         fabsf(z_gravity_ratio - recording_stop_ref_z_ratio));
 }
 
@@ -1617,7 +1736,17 @@ static void retry_lift_pulse(void)
     gesture_lift_event_start_ms = 0;
     gesture_lift_accel_samples = 0;
     gesture_lift_brake_samples = 0;
+    gesture_hold_rms_exit_samples = 0;
     gesture_final_since_ms = 0;
+    clear_accel_history();
+}
+
+static void begin_gesture_final_hold(void)
+{
+    gesture_lift_stage = GESTURE_LIFT_WAIT_HOLD;
+    gesture_lift_hold_axis_valid = false;
+    gesture_lift_pose_failed = false;
+    gesture_hold_rms_exit_samples = 0;
     clear_accel_history();
 }
 
@@ -1645,6 +1774,10 @@ static float gesture_tilt_from_hold_axis_deg(void)
 static void reset_gesture_sequence(void)
 {
     gesture_phase = GESTURE_WAITING;
+    gesture_palm_candidate_since_ms = 0;
+    gesture_palm_candidate_gx = 0.0f;
+    gesture_palm_candidate_gy = 0.0f;
+    gesture_palm_candidate_gz = 0.0f;
     gesture_sequence_start_ms = 0;
     gesture_phase_start_ms = 0;
     gesture_final_since_ms = 0;
@@ -1660,11 +1793,9 @@ static void reset_gesture_sequence(void)
     gesture_armed_gx = 0.0f;
     gesture_armed_gy = 0.0f;
     gesture_armed_gz = 0.0f;
-    gesture_outbound_qualified = false;
     gesture_outbound_gyro_sign = 0.0f;
     gyro_reset_phase_metrics();
     reset_gesture_motion();
-    reset_shake_window();
     gesture_armed_until_ms = 0;
     if (!is_recording && !recording_requested) {
         gyro_set_enabled(false);
@@ -1701,9 +1832,17 @@ static void process_double_tap_event(int64_t now)
     }
     double_tap_last_event_ms = now;
 
-    /* A BLE-only tap must not become the shake that starts recording. */
+    /* A BLE-only tap must not become the dwell that starts recording. */
     if (!is_recording && !recording_requested) {
+#if GESTURE_DEBUG_HISTORY
+        if (gesture_trajectory_committed) {
+            gesture_trajectory_finish(2, GESTURE_DIAG_REASON_SEQUENCE_TIMEOUT);
+        } else if (gesture_trajectory_active) {
+            gesture_trajectory_discard();
+        }
+#endif
         reset_gesture_sequence();
+        gesture_rearm_required = true;
         gesture_block_until_ms = now + GESTURE_RETRIGGER_BLOCK_MS;
     }
 
@@ -1756,28 +1895,6 @@ static void arm_pronation_reference(float phi, float ax, float ay, float az,
     gesture_z_window_start_ms = now;
 }
 
-static void arm_from_shake_gravity_reference(int64_t now)
-{
-    if (gesture_shake_lp_ref_valid) {
-        arm_pronation_reference(gesture_shake_lp_ref_phi,
-                                gesture_shake_lp_ref_x,
-                                gesture_shake_lp_ref_y,
-                                gesture_shake_lp_ref_z,
-                                gesture_shake_lp_ref_z_ratio,
-                                now);
-        return;
-    }
-
-    float gx = gesture_gravity_lp_x;
-    float gy = gesture_gravity_lp_y;
-    float gz = gesture_gravity_lp_z;
-    float n = vector_norm3(gx, gy, gz);
-    float zr = n > 0.1f ? gz / n : 0.0f;
-    float phi = atan2f(-gx, gz) * (float)GESTURE_RAD_TO_DEG;
-
-    arm_pronation_reference(phi, gx, gy, gz, zr, now);
-}
-
 static float gesture_z_ratio_delta(float z_gravity_ratio)
 {
     return fabsf(z_gravity_ratio - gesture_armed_z_ratio);
@@ -1790,34 +1907,20 @@ static bool gesture_z_sign_flipped(float az)
            fabsf(gesture_armed_az) >= GESTURE_PRONATION_Z_SIGN_MIN_MS2;
 }
 
-static float gesture_gravity_tilt_deg(float ax, float ay, float az)
+static float gesture_palm_candidate_tilt_deg(void)
 {
-    float n = vector_norm3(ax, ay, az);
-    float rn = vector_norm3(gesture_armed_gx, gesture_armed_gy, gesture_armed_gz);
+    float n = vector_norm3(gesture_gravity_lp_x,
+                           gesture_gravity_lp_y,
+                           gesture_gravity_lp_z);
+    float c;
 
-    if (n <= 0.1f || rn <= 0.1f) {
-        return 0.0f;
+    if (n <= 0.1f) {
+        return 180.0f;
     }
-    float c = (ax * gesture_armed_gx +
-               ay * gesture_armed_gy +
-               az * gesture_armed_gz) / (n * rn);
-    c = CLAMP(c, -1.0f, 1.0f);
-    return acosf(c) * (float)GESTURE_RAD_TO_DEG;
-}
-
-static bool gesture_outbound_palm_up_detected(float phi_deg,
-                                             float tilt_deg,
-                                             float z_gravity_ratio,
-                                             float az)
-{
-    bool gravity_ok =
-        phi_deg >= GESTURE_OUTBOUND_MIN_DEG ||
-        tilt_deg >= GESTURE_OUTBOUND_TILT_MIN_DEG ||
-        gesture_z_ratio_delta(z_gravity_ratio) >=
-            GESTURE_OUTBOUND_Z_RATIO_DONE ||
-        gesture_z_sign_flipped(az);
-
-    return gravity_ok || gesture_gyro_outbound_ok();
+    c = (gesture_gravity_lp_x * gesture_palm_candidate_gx +
+         gesture_gravity_lp_y * gesture_palm_candidate_gy +
+         gesture_gravity_lp_z * gesture_palm_candidate_gz) / n;
+    return acosf(CLAMP(c, -1.0f, 1.0f)) * (float)GESTURE_RAD_TO_DEG;
 }
 
 static bool gesture_pronation_complete_detected(float phi_deg,
@@ -1830,10 +1933,42 @@ static bool gesture_pronation_complete_detected(float phi_deg,
             GESTURE_PRONATION_Z_RATIO_DONE ||
         gesture_z_sign_flipped(az);
 
-    return gravity_ok || gesture_gyro_hold_flip_ok();
+    return gravity_ok && gesture_gyro_hold_flip_ok();
+}
+
+static void report_palm_down_gate(float phi_deg, float z_gravity_ratio,
+                                  float az)
+{
+    float z_delta = gesture_z_ratio_delta(z_gravity_ratio);
+    bool gravity_ok =
+        phi_deg >= GESTURE_PRONATION_MIN_DEG ||
+        z_delta >= GESTURE_PRONATION_Z_RATIO_DONE ||
+        gesture_z_sign_flipped(az);
+    float signed_roll = gesture_gyro_hold_signed_roll_deg();
+    float xy_ratio = gesture_gyro_hold_xy_peak_ratio();
+
+    if (!gravity_ok) {
+        send_gesture_diag(GESTURE_DIAG_PALM_DOWN_GATE,
+                          GESTURE_DIAG_REASON_PALM_DOWN_GRAVITY_LOW,
+                          phi_deg, z_delta,
+                          gesture_z_sign_flipped(az) ? 1.0f : 0.0f);
+    } else if (signed_roll < GESTURE_HOLD_GYRO_ANGLE_MIN_DEG) {
+        send_gesture_diag(GESTURE_DIAG_PALM_DOWN_GATE,
+                          GESTURE_DIAG_REASON_PALM_DOWN_GYRO_ANGLE_LOW,
+                          signed_roll, GESTURE_HOLD_GYRO_ANGLE_MIN_DEG,
+                          gesture_gyro_peak_abs_dps);
+    } else if (xy_ratio < GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN &&
+               gesture_lift_stage == GESTURE_LIFT_WAIT_ACCEL) {
+        send_gesture_diag(GESTURE_DIAG_PALM_DOWN_GATE,
+                          GESTURE_DIAG_REASON_PALM_DOWN_XY_RATIO_LOW,
+                          xy_ratio, GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN,
+                          gesture_gyro_x_peak_abs_dps);
+    }
 }
 
 static void process_gesture_sample(float ax, float ay, float az,
+                                   float gx_raw_dps, float gy_raw_dps,
+                                   float gz_raw_dps, bool gyro_read_ok,
                                    float gy_dps, bool gyro_ok,
                                    int64_t now)
 {
@@ -1877,15 +2012,18 @@ static void process_gesture_sample(float ax, float ay, float az,
 
     if (recording_requested) {
         update_gravity_lp(ax, ay, az, dt_s);
-        if (!recording_stop_ref_valid) {
+        /* Keep refining palm-down stop reference until recording is active. */
+        if (accel_norm >= GESTURE_PRONATION_GRAVITY_MIN_MS2 &&
+            accel_norm <= GESTURE_PRONATION_GRAVITY_MAX_MS2 &&
+            gesture_linear_accel_norm_ms2 <= GESTURE_QUIET_ACCEL_MS2) {
             capture_recording_stop_reference();
+            recording_stop_ref_locked = false;
+        } else if (!recording_stop_ref_valid) {
+            capture_recording_stop_reference();
+            recording_stop_ref_locked = false;
         }
-        if (gyro_ok) {
-            accumulate_gyro_roll(gy_dps, dt_s,
-                                 GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS,
-                                 &recording_stop_gyro_roll_deg,
-                                 &recording_stop_gyro_peak_abs_dps);
-        }
+        recording_stop_gyro_roll_deg = 0.0f;
+        recording_stop_gyro_peak_abs_dps = 0.0f;
         return;
     }
 
@@ -1902,27 +2040,32 @@ static void process_gesture_sample(float ax, float ay, float az,
         return;
     }
 
-    if (gesture_phase != GESTURE_WAITING &&
-        (now - gesture_sequence_start_ms) > GESTURE_SEQUENCE_TIMEOUT_MS) {
-        send_gesture_diag(GESTURE_DIAG_RESET,
-                          GESTURE_DIAG_REASON_SEQUENCE_TIMEOUT,
-                          (float)(now - gesture_sequence_start_ms),
-                          palm_up_z_ratio, accel_norm);
-        reset_gesture_sequence();
-        gesture_quiet_since_ms = 0;
-        return;
-    }
-
     update_gravity_lp(ax, ay, az, dt_s);
 
     if (gesture_phase == GESTURE_WAITING) {
         bool board_flat = gesture_board_flat(z_gravity_ratio);
+        bool gravity_ok =
+            accel_norm >= GESTURE_START_GRAVITY_MIN_MS2 &&
+            accel_norm <= GESTURE_START_GRAVITY_MAX_MS2;
+        bool accel_quiet =
+            gesture_linear_accel_norm_ms2 <= GESTURE_START_QUIET_ACCEL_MS2;
 
-        if (!board_flat) {
-            reset_shake_window();
+        if (!board_flat || !gravity_ok || !accel_quiet) {
+            gesture_palm_candidate_since_ms = 0;
+            clear_accel_history();
+#if GESTURE_DEBUG_HISTORY
+            if (gesture_trajectory_active && !gesture_trajectory_committed) {
+                gesture_trajectory_discard();
+            }
+#endif
+            if (!board_flat || !gravity_ok || !accel_quiet) {
+                gesture_rearm_required = false;
+            }
             if ((now - gesture_diag_last_report_ms) >= 250) {
                 send_gesture_diag(GESTURE_DIAG_WAIT_REJECT,
-                                  GESTURE_DIAG_REASON_START_NOT_PALM_UP,
+                                  board_flat
+                                      ? GESTURE_DIAG_REASON_QUIET_NOT_READY
+                                      : GESTURE_DIAG_REASON_START_NOT_PALM_UP,
                                   palm_up_z_ratio,
                                   GESTURE_START_PALM_UP_Z_MIN_RATIO,
                                   gesture_linear_accel_norm_ms2);
@@ -1931,170 +2074,107 @@ static void process_gesture_sample(float ax, float ay, float az,
             return;
         }
 
-        bool shake_ready = push_shake_sample(dt_s);
-        if (shake_ready) {
+        if (gesture_rearm_required) {
+            return;
+        }
+
+        if (gesture_palm_candidate_since_ms == 0) {
+            float g_norm = vector_norm3(gesture_gravity_lp_x,
+                                        gesture_gravity_lp_y,
+                                        gesture_gravity_lp_z);
+            if (g_norm <= 0.1f) {
+                return;
+            }
+            gesture_palm_candidate_since_ms = now;
+            gesture_palm_candidate_gx = gesture_gravity_lp_x / g_norm;
+            gesture_palm_candidate_gy = gesture_gravity_lp_y / g_norm;
+            gesture_palm_candidate_gz = gesture_gravity_lp_z / g_norm;
+            clear_accel_history();
 #if GESTURE_DEBUG_HISTORY
             gesture_history_clear();
+            gesture_trajectory_clear();
 #endif
-            /* Warm gyro during outbound; settle (~100 ms) fits in 1.5 s window. */
+            light_sleep_active = false;
+            last_activity_ms = now;
+            send_gesture_diag(GESTURE_DIAG_OUTBOUND_START,
+                              GESTURE_DIAG_REASON_NONE,
+                              palm_up_z_ratio, 0.0f,
+                              gesture_linear_accel_norm_ms2);
+        }
+
+        push_accel_history(gesture_linear_accel_norm_ms2);
+#if GESTURE_DEBUG_HISTORY
+        gesture_trajectory_push(now, 0, ax, ay, az, 0.0f, 0.0f, 0.0f);
+#endif
+        if ((gesture_accel_history_count >= GESTURE_FINAL_RMS_WINDOW_SAMPLES &&
+             gesture_accel_rms() > GESTURE_START_QUIET_ACCEL_MS2) ||
+            gesture_palm_candidate_tilt_deg() >
+                GESTURE_PALM_UP_DWELL_TILT_MAX_DEG) {
+            gesture_palm_candidate_since_ms = 0;
+            clear_accel_history();
+#if GESTURE_DEBUG_HISTORY
+            gesture_trajectory_discard();
+#endif
+            return;
+        }
+
+        if ((now - gesture_palm_candidate_since_ms) >=
+            GESTURE_PALM_UP_DWELL_MS) {
+            float phi = atan2f(-gesture_gravity_lp_x,
+                               gesture_gravity_lp_z) *
+                        (float)GESTURE_RAD_TO_DEG;
+            float g_norm = vector_norm3(gesture_gravity_lp_x,
+                                        gesture_gravity_lp_y,
+                                        gesture_gravity_lp_z);
+            float zr = gesture_gravity_lp_z / g_norm;
+
+#if GESTURE_DEBUG_HISTORY
+            gesture_trajectory_committed = true;
+#endif
             gyro_set_enabled(true);
-            arm_from_shake_gravity_reference(now);
-            gesture_phase = GESTURE_OUTBOUND;
-            gesture_sequence_start_ms = now;
+            arm_pronation_reference(phi, gesture_gravity_lp_x,
+                                     gesture_gravity_lp_y,
+                                     gesture_gravity_lp_z, zr, now);
+            gesture_phase = GESTURE_HOLDING_FINAL;
+            gesture_sequence_start_ms = gesture_palm_candidate_since_ms;
             gesture_phase_start_ms = now;
             gesture_pronation_phi_deg = 0.0f;
             gesture_pronation_peak_deg = 0.0f;
             gesture_pronation_peak_tilt_deg = 0.0f;
-            gesture_outbound_qualified = false;
             gesture_outbound_gyro_sign = 0.0f;
             gyro_reset_phase_metrics();
             gesture_quiet_since_ms = 0;
-            printk(">>> Gesture shake: ptp=%.2f mean=%.2f z=%.2f\n",
-                   (double)gesture_shake_last_ptp_ms2,
-                   (double)gesture_shake_last_mean_ms2,
-                   (double)palm_up_z_ratio);
-            send_gesture_diag(GESTURE_DIAG_OUTBOUND_START,
-                              GESTURE_DIAG_REASON_NONE,
-                              gesture_shake_last_ptp_ms2,
-                              palm_up_z_ratio,
-                              gesture_shake_last_mean_ms2);
-            return;
-        }
-
-        if ((now - gesture_diag_last_report_ms) >= 250) {
-            uint8_t reason = GESTURE_DIAG_REASON_SHAKE_NOT_OSCILLATORY;
-            float v1 = gesture_shake_last_ptp_ms2;
-            float v2 = gesture_shake_last_mean_ms2;
-            float v3 = gesture_shake_last_ptp_ms2 > 0.0f
-                ? fabsf(gesture_shake_last_mean_ms2) /
-                  gesture_shake_last_ptp_ms2
-                : 0.0f;
-            if (gesture_shake_count < GESTURE_SHAKE_WINDOW_SAMPLES) {
-                reason = GESTURE_DIAG_REASON_QUIET_NOT_READY;
-                v1 = palm_up_z_ratio;
-                v2 = (float)gesture_shake_count;
-                v3 = (float)GESTURE_SHAKE_WINDOW_SAMPLES;
-            }
-            send_gesture_diag(GESTURE_DIAG_WAIT_REJECT, reason, v1, v2, v3);
-            gesture_diag_last_report_ms = now;
-        }
-        return;
-    }
-
-    if (gesture_phase == GESTURE_OUTBOUND) {
-        int64_t elapsed_ms = now - gesture_phase_start_ms;
-
-        float phi = atan2f(-ax, az) * (float)GESTURE_RAD_TO_DEG;
-        float phi_change =
-            fabsf(deg_diff(phi, gesture_pronation_ref_phi_deg));
-
-        if (phi_change > gesture_pronation_phi_deg) {
-            gesture_pronation_phi_deg = phi_change;
-        }
-        if (phi_change > gesture_pronation_peak_deg) {
-            gesture_pronation_peak_deg = phi_change;
-        }
-
-        float tilt_deg = gesture_gravity_tilt_deg(gesture_gravity_lp_x,
-                                                  gesture_gravity_lp_y,
-                                                  gesture_gravity_lp_z);
-        if (tilt_deg > gesture_pronation_peak_tilt_deg) {
-            gesture_pronation_peak_tilt_deg = tilt_deg;
-        }
-
-        if (gyro_ok) {
-            accumulate_gyro_roll(gy_dps, dt_s,
-                                 GESTURE_OUTBOUND_GYRO_INTEGRATE_RATE_DPS,
-                                 &gesture_gyro_roll_deg,
-                                 &gesture_gyro_peak_abs_dps);
-        }
-
-        /* Maintain a running peak-to-peak Z deflection during pronation. */
-        if (az < gesture_z_window_min) {
-            gesture_z_window_min = az;
-        }
-        if (az > gesture_z_window_max) {
-            gesture_z_window_max = az;
-        }
-
-        gesture_outbound_qualified =
-            elapsed_ms >= GESTURE_PHASE_MIN_DURATION_MS &&
-            gesture_outbound_palm_up_detected(
-                gesture_pronation_phi_deg, gesture_pronation_peak_tilt_deg,
-                z_gravity_ratio, az) &&
-            accel_norm >= GESTURE_PRONATION_GRAVITY_MIN_MS2 &&
-            accel_norm <= GESTURE_PRONATION_GRAVITY_MAX_MS2;
-
-        if (gesture_outbound_qualified) {
-            if (fabsf(gesture_gyro_roll_deg) >= 1.0f) {
-                gesture_outbound_gyro_sign =
-                    (gesture_gyro_roll_deg >= 0.0f) ? 1.0f : -1.0f;
-            } else if (gesture_gyro_peak_abs_dps >=
-                       GESTURE_OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS) {
-                gesture_outbound_gyro_sign = (gy_dps >= 0.0f) ? 1.0f : -1.0f;
-            } else {
-                gesture_outbound_gyro_sign = 0.0f;
-            }
-            gesture_phase = GESTURE_HOLDING_FINAL;
-            gesture_phase_start_ms = now;
-            gesture_final_since_ms = 0;
-            gesture_quiet_since_ms = 0;
-            gesture_lift_stage = GESTURE_LIFT_WAIT_ACCEL;
-            gesture_lift_pos_impulse_ms = 0.0f;
-            gesture_lift_neg_impulse_ms = 0.0f;
-            gesture_lift_net_impulse_ms = 0.0f;
-            gesture_lift_final_tilt_deg = 0.0f;
-            gesture_lift_max_hold_tilt_deg = 0.0f;
-            gesture_lift_hold_axis_valid = false;
-            gesture_lift_pose_failed = false;
-            gesture_lift_event_start_ms = 0;
-            gesture_lift_accel_samples = 0;
-            gesture_lift_brake_samples = 0;
-            gesture_debug_final_last_ms = 0;
+            gesture_start_accel_x = gesture_gravity_lp_x;
+            gesture_start_accel_y = gesture_gravity_lp_y;
+            gesture_start_accel_z = gesture_gravity_lp_z;
+            reset_gesture_motion();
             clear_accel_history();
-            printk(">>> Gesture palm-up: phi=%.1f tilt=%.1f z_d=%.2f "
-                   "gyro_roll=%.1f peak=%.1f\n",
-                   (double)gesture_pronation_phi_deg,
-                   (double)gesture_pronation_peak_tilt_deg,
-                   (double)gesture_z_ratio_delta(z_gravity_ratio),
-                   (double)gesture_gyro_roll_deg,
-                   (double)gesture_gyro_peak_abs_dps);
+            printk(">>> Gesture palm-up dwell ready: %lld ms z=%.2f\n",
+                   now - gesture_palm_candidate_since_ms,
+                   (double)palm_up_z_ratio);
             send_gesture_diag(GESTURE_DIAG_OUTBOUND_READY,
                               GESTURE_DIAG_REASON_NONE,
-                              gesture_pronation_phi_deg,
-                              gesture_pronation_peak_tilt_deg,
-                              gesture_z_ratio_delta(z_gravity_ratio));
-            send_gesture_diag(GESTURE_DIAG_OUTBOUND_GYRO,
-                              GESTURE_DIAG_REASON_NONE,
-                              gesture_gyro_roll_deg,
-                              gesture_gyro_peak_abs_dps,
-                              gesture_outbound_gyro_sign);
-            /* Re-arm so the later hold flip is measured from this palm-up pose. */
-            arm_pronation_reference(phi, ax, ay, az, z_gravity_ratio, now);
-            gesture_pronation_phi_deg = 0.0f;
-            gesture_pronation_peak_deg = 0.0f;
-            gesture_pronation_peak_tilt_deg = 0.0f;
-            gyro_reset_phase_metrics();
+                              (float)(now - gesture_palm_candidate_since_ms),
+                              palm_up_z_ratio,
+                              gesture_linear_accel_norm_ms2);
             return;
         }
-
-        if (elapsed_ms > GESTURE_OUTBOUND_MAX_DURATION_MS) {
-            send_gesture_diag(GESTURE_DIAG_RESET,
-                              GESTURE_DIAG_REASON_OUTBOUND_TIMEOUT,
-                              gesture_pronation_phi_deg,
-                              gesture_gyro_roll_deg,
-                              gesture_gyro_peak_abs_dps);
-            reset_gesture_sequence();
-            gesture_quiet_since_ms = 0;
-            return;
-        }
-
         return;
     }
+
+#if GESTURE_DEBUG_HISTORY
+    if (gesture_trajectory_active) {
+        uint8_t flags = (gyro_enabled ? BIT(0) : 0) |
+                        (gyro_read_ok ? BIT(1) : 0) |
+                        (gyro_ok ? BIT(2) : 0);
+        gesture_trajectory_push(now, flags, ax, ay, az,
+                                gx_raw_dps, gy_raw_dps, gz_raw_dps);
+    }
+#endif
 
     /*
      * HOLDING_FINAL: lift pulse (any palm), then rotate away from the
-     * palm-up reference and hold still for 500 ms.
+     * palm-up reference and hold still for 400 ms.
      *
      * Linear acceleration is projected onto the current low-pass gravity
      * direction so wrist rotation is not accumulated as translation.  The
@@ -2123,6 +2203,9 @@ static void process_gesture_sample(float ax, float ay, float az,
                                  GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS,
                                  &gesture_gyro_roll_deg,
                                  &gesture_gyro_peak_abs_dps);
+            if (fabsf(gx_raw_dps) > gesture_gyro_x_peak_abs_dps) {
+                gesture_gyro_x_peak_abs_dps = fabsf(gx_raw_dps);
+            }
         }
 
         float g_norm = vector_norm3(gesture_gravity_lp_x,
@@ -2135,8 +2218,20 @@ static void process_gesture_sample(float ax, float ay, float az,
                     gesture_linear_world_z * gesture_gravity_lp_z) /
                    g_norm;
         }
-        bool palm_down_ok = gesture_pronation_complete_detected(
+        bool palm_down_now = gesture_pronation_complete_detected(
             gesture_pronation_phi_deg, z_gravity_ratio, az);
+        if (!gesture_palm_down_latched && palm_down_now) {
+            gesture_palm_down_latched = true;
+            printk(">>> Gesture palm-down latched: phi=%.1f roll=%.1f "
+                   "xy_ratio=%.2f\n",
+                   (double)gesture_pronation_phi_deg,
+                   (double)gesture_gyro_roll_deg,
+                   gesture_gyro_peak_abs_dps > 0.1f
+                       ? (double)(gesture_gyro_x_peak_abs_dps /
+                                  gesture_gyro_peak_abs_dps)
+                       : 0.0);
+        }
+        bool palm_down_ok = gesture_palm_down_latched;
         float gy_abs = fabsf(gy_dps);
         bool gyro_quiet = !gyro_ok || (gy_abs <= GESTURE_FINAL_QUIET_RATE_DPS);
 
@@ -2197,6 +2292,19 @@ static void process_gesture_sample(float ax, float ay, float az,
                     ? gesture_lift_neg_impulse_ms /
                         gesture_lift_pos_impulse_ms
                     : 0.0f;
+            bool settled_without_brake = false;
+
+            if (pulse_ms >= GESTURE_LIFT_PULSE_MIN_MS &&
+                palm_down_ok && gyro_quiet) {
+                push_accel_history(gesture_linear_accel_norm_ms2);
+                settled_without_brake =
+                    gesture_accel_history_count >=
+                        GESTURE_FINAL_RMS_WINDOW_SAMPLES &&
+                    gesture_accel_rms() <= GESTURE_FINAL_STILL_RMS_MS2;
+            } else {
+                clear_accel_history();
+            }
+
             if (brake_ready && pulse_ms < GESTURE_LIFT_PULSE_MIN_MS) {
                 send_gesture_diag(
                     GESTURE_DIAG_WAIT_REJECT,
@@ -2206,33 +2314,38 @@ static void process_gesture_sample(float ax, float ay, float az,
                     gesture_lift_neg_impulse_ms);
                 retry_lift_pulse();
                 return;
-            } else if (pulse_ms > GESTURE_LIFT_PULSE_MAX_MS) {
-                if (gesture_lift_pos_impulse_ms >=
-                    GESTURE_LIFT_POS_IMPULSE_MIN_MS) {
-                    /*
-                     * Slow lifts often lack a sharp braking spike.
-                     * Enough upward impulse plus the later hold is the stop.
-                     */
-                    gesture_lift_stage = GESTURE_LIFT_WAIT_HOLD;
-                    gesture_lift_hold_axis_valid = false;
-                    gesture_lift_pose_failed = false;
-                    clear_accel_history();
-                } else {
-                    send_gesture_diag(GESTURE_DIAG_WAIT_REJECT,
-                                      GESTURE_DIAG_REASON_FINAL_BRAKE_MISSING,
-                                      gesture_lift_pos_impulse_ms,
-                                      gesture_lift_neg_impulse_ms,
-                                      0.0f);
-                    retry_lift_pulse();
-                    return;
-                }
             } else if (brake_ready &&
                        brake_ratio >= GESTURE_LIFT_BRAKE_RATIO_MIN) {
-                gesture_lift_stage = GESTURE_LIFT_WAIT_HOLD;
-                gesture_lift_hold_axis_valid = false;
-                gesture_lift_pose_failed = false;
-                clear_accel_history();
+                begin_gesture_final_hold();
+            } else if (settled_without_brake) {
+                begin_gesture_final_hold();
             }
+        }
+
+        if (gesture_lift_stage != GESTURE_LIFT_WAIT_ACCEL &&
+            gesture_lift_event_start_ms > 0 &&
+            (now - gesture_lift_event_start_ms) >=
+                GESTURE_MOTION_COMPLETE_MAX_MS) {
+            int64_t motion_ms = now - gesture_lift_event_start_ms;
+            uint8_t timeout_reason = gesture_palm_down_latched
+                ? GESTURE_DIAG_REASON_MOTION_TOO_SLOW
+                : GESTURE_DIAG_REASON_PALM_DOWN_GATE_FAILED;
+            send_gesture_diag(GESTURE_DIAG_RESET,
+                              timeout_reason,
+                              (float)motion_ms,
+                              gesture_palm_down_latched
+                                  ? gesture_gyro_peak_abs_dps
+                                  : gesture_gyro_hold_signed_roll_deg(),
+                              gesture_palm_down_latched
+                                  ? fabsf(gesture_gyro_roll_deg)
+                                  : gesture_gyro_hold_xy_peak_ratio());
+#if GESTURE_DEBUG_HISTORY
+            gesture_trajectory_finish(2, timeout_reason);
+#endif
+            gesture_rearm_required = true;
+            reset_gesture_sequence();
+            gesture_quiet_since_ms = 0;
+            return;
         }
 
         gesture_lift_final_tilt_deg = gesture_tilt_from_hold_axis_deg();
@@ -2274,17 +2387,41 @@ static void process_gesture_sample(float ax, float ay, float az,
             gesture_lift_hold_axis_valid &&
             gesture_lift_final_tilt_deg <=
                 GESTURE_LIFT_FINAL_TILT_MAX_DEG;
+        bool hold_rms_ok = final_still;
+
+        if (gesture_final_since_ms > 0) {
+            if (final_rms <= GESTURE_FINAL_HOLD_RMS_EXIT_MS2) {
+                gesture_hold_rms_exit_samples = 0;
+            } else if (gesture_hold_rms_exit_samples <
+                       GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES) {
+                gesture_hold_rms_exit_samples++;
+            }
+            hold_rms_ok =
+                gesture_hold_rms_exit_samples <
+                    GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES;
+        } else {
+            gesture_hold_rms_exit_samples = 0;
+        }
 
         if (gesture_debug_final_last_ms == 0 ||
             (now - gesture_debug_final_last_ms) >=
                 GESTURE_DEBUG_FINAL_PERIOD_MS) {
             gesture_debug_final_last_ms = now;
             if (gesture_lift_stage == GESTURE_LIFT_WAIT_HOLD) {
+                float reported_rms =
+                    gesture_accel_history_count >=
+                        GESTURE_FINAL_RMS_WINDOW_SAMPLES
+                        ? final_rms
+                        : gesture_linear_accel_norm_ms2;
                 send_gesture_diag(GESTURE_DIAG_HOLD_SAMPLE,
                                   GESTURE_DIAG_REASON_NONE,
-                                  final_still ? final_rms : gesture_linear_accel_norm_ms2,
+                                  reported_rms,
                                   gesture_lift_final_tilt_deg,
                                   gy_abs);
+                if (!gesture_palm_down_latched) {
+                    report_palm_down_gate(gesture_pronation_phi_deg,
+                                          z_gravity_ratio, az);
+                }
             } else {
                 send_gesture_diag(GESTURE_DIAG_FINAL_SAMPLE,
                                   GESTURE_DIAG_REASON_NONE,
@@ -2294,16 +2431,18 @@ static void process_gesture_sample(float ax, float ay, float az,
         }
 
         /*
-         * Hold entry needs gyro quiet once; once the timer is running only
-         * palm-down + accel still + pose matter (wrist micro-motion OK).
+         * Hold entry needs gyro quiet and RMS <= 3.0 once. Palm-down remains
+         * latched for this sequence. While the timer is running, tolerate
+         * minor RMS excursions; interrupt only after two samples > 3.5.
          */
-        bool hold_body_ok = palm_down_ok && final_still && final_pose_stable;
+        bool hold_body_ok = palm_down_ok && hold_rms_ok && final_pose_stable;
         bool hold_entry_ok = hold_body_ok &&
             (gesture_final_since_ms > 0 || gyro_quiet);
 
         if (gesture_lift_stage == GESTURE_LIFT_WAIT_HOLD && hold_entry_ok) {
             if (gesture_final_since_ms == 0) {
                 gesture_final_since_ms = now;
+                gesture_hold_rms_exit_samples = 0;
                 send_gesture_diag(GESTURE_DIAG_FINAL_HOLD_START,
                                   GESTURE_DIAG_REASON_NONE,
                                   gesture_lift_pos_impulse_ms,
@@ -2313,7 +2452,13 @@ static void process_gesture_sample(float ax, float ay, float az,
 
             int64_t hold_ms = now - gesture_final_since_ms;
             if (hold_ms >= GESTURE_FINAL_HOLD_MS) {
-                printk(">>> Gesture MATCH: shake + palm-up + lift + palm-down hold\n");
+                int64_t motion_ms = now - gesture_lift_event_start_ms;
+                printk(">>> Gesture MATCH: palm-up dwell + lift + palm-down hold\n");
+                send_gesture_diag(GESTURE_DIAG_MOTION_COMPLETE,
+                                  GESTURE_DIAG_REASON_NONE,
+                                  (float)motion_ms,
+                                  gesture_gyro_peak_abs_dps,
+                                  fabsf(gesture_gyro_roll_deg));
                 send_gesture_diag(GESTURE_DIAG_FINAL_READY,
                                   GESTURE_DIAG_REASON_NONE,
                                   gesture_lift_pos_impulse_ms,
@@ -2324,6 +2469,10 @@ static void process_gesture_sample(float ax, float ay, float az,
                                   gesture_pronation_phi_deg,
                                   gesture_lift_pos_impulse_ms,
                                   (float)hold_ms);
+#if GESTURE_DEBUG_HISTORY
+                gesture_trajectory_finish(1, GESTURE_DIAG_REASON_NONE);
+#endif
+                gesture_rearm_required = true;
                 capture_recording_stop_reference();
                 {
                     float gx = gesture_gravity_lp_x;
@@ -2363,29 +2512,25 @@ static void process_gesture_sample(float ax, float ay, float az,
             }
             if (hold_interrupted) {
                 gesture_final_since_ms = 0;
+                gesture_hold_rms_exit_samples = 0;
                 gesture_lift_hold_axis_valid = false;
                 clear_accel_history();
             }
         }
 
-        if ((now - gesture_phase_start_ms) >= GESTURE_FINAL_HOLD_TIMEOUT_MS) {
-            uint8_t reason;
-            if (gesture_lift_stage == GESTURE_LIFT_WAIT_ACCEL) {
-                reason = GESTURE_DIAG_REASON_FINAL_ACCEL_MISSING;
-            } else if (gesture_lift_stage == GESTURE_LIFT_WAIT_BRAKE) {
-                reason = GESTURE_DIAG_REASON_FINAL_BRAKE_MISSING;
-            } else if (gesture_lift_pose_failed) {
-                reason = GESTURE_DIAG_REASON_FINAL_TILT_UNSTABLE;
-            } else if (gesture_lift_stage == GESTURE_LIFT_WAIT_HOLD &&
-                       !palm_down_ok) {
-                reason = GESTURE_DIAG_REASON_LIFT_PALM_STILL_UP;
-            } else {
-                reason = GESTURE_DIAG_REASON_FINAL_HOLD_TIMEOUT;
-            }
-            send_gesture_diag(GESTURE_DIAG_RESET, reason,
+        if (gesture_lift_stage == GESTURE_LIFT_WAIT_ACCEL &&
+            (now - gesture_phase_start_ms) >=
+                GESTURE_LIFT_START_TIMEOUT_MS) {
+            send_gesture_diag(GESTURE_DIAG_RESET,
+                              GESTURE_DIAG_REASON_FINAL_ACCEL_MISSING,
                               gesture_lift_pos_impulse_ms,
                               gesture_lift_neg_impulse_ms,
                               gesture_lift_max_hold_tilt_deg);
+#if GESTURE_DEBUG_HISTORY
+            gesture_trajectory_finish(
+                2, GESTURE_DIAG_REASON_FINAL_ACCEL_MISSING);
+#endif
+            gesture_rearm_required = true;
             reset_gesture_sequence();
             gesture_quiet_since_ms = 0;
         }
@@ -2447,7 +2592,11 @@ static void process_motion_sample(void)
 {
     struct sensor_value accel[3];
     struct sensor_value gyro[3];
+    float gx_raw_dps = 0.0f;
+    float gy_raw_dps = 0.0f;
+    float gz_raw_dps = 0.0f;
     float gy_dps = 0.0f;
+    bool gyro_read_ok = false;
     bool gyro_ok = false;
     int ret = sensor_sample_fetch(imu);
     if (ret < 0) { LOG_ERR("fetch failed: %d", ret); return; }
@@ -2467,25 +2616,43 @@ static void process_motion_sample(void)
     if (gyro_enabled) {
         if (sensor_channel_get(imu, SENSOR_CHAN_GYRO_XYZ, gyro) == 0) {
             /* sensor_value gyro is rad/s; convert to dps. */
-            double gy_rads = sensor_value_to_double(&gyro[1]);
-            float gy_raw = (float)(gy_rads * GESTURE_RAD_TO_DEG);
-            gy_dps = gyro_y_corrected_dps(gy_raw);
+            gx_raw_dps = (float)(sensor_value_to_double(&gyro[0]) *
+                                 GESTURE_RAD_TO_DEG);
+            gy_raw_dps = (float)(sensor_value_to_double(&gyro[1]) *
+                                 GESTURE_RAD_TO_DEG);
+            gz_raw_dps = (float)(sensor_value_to_double(&gyro[2]) *
+                                 GESTURE_RAD_TO_DEG);
+            gyro_read_ok = true;
+            gy_dps = gyro_y_corrected_dps(gy_raw_dps);
             gyro_ok = gyro_is_settled(now);
             gyro_sample_valid = gyro_ok;
             if (gyro_ok && !gyro_bias_valid &&
-                fabsf(gy_raw) < GESTURE_GYRO_BIAS_CAPTURE_MAX_DPS &&
+                fabsf(gy_raw_dps) < GESTURE_GYRO_BIAS_CAPTURE_MAX_DPS &&
                 gesture_linear_accel_norm_ms2 <= GESTURE_QUIET_ACCEL_MS2) {
-                gyro_bias_y_dps = gy_raw;
+                gyro_bias_y_dps = gy_raw_dps;
                 gyro_bias_valid = true;
                 gy_dps = 0.0f;
             }
         }
     }
 
-    process_gesture_sample((float)x, (float)y, (float)z, gy_dps, gyro_ok, now);
+    process_gesture_sample((float)x, (float)y, (float)z,
+                           gx_raw_dps, gy_raw_dps, gz_raw_dps,
+                           gyro_read_ok, gy_dps, gyro_ok, now);
 
 #if GESTURE_DEBUG_HISTORY
-    if (gesture_history_flush_pending && !is_recording && !recording_requested) {
+    if (gesture_host_collection_active) {
+        uint8_t flags = (gyro_enabled ? BIT(0) : 0) |
+                        (gyro_read_ok ? BIT(1) : 0) |
+                        (gyro_ok ? BIT(2) : 0);
+        gesture_host_collection_push(now, flags, (float)x, (float)y, (float)z,
+                                     gx_raw_dps, gy_raw_dps, gz_raw_dps);
+    }
+    if ((gesture_history_flush_pending || gesture_trajectory_flush_pending ||
+         gesture_host_collection_flush_pending) &&
+        !is_recording && !recording_requested) {
+        flush_host_collection();
+        flush_gesture_trajectory();
         flush_gesture_history();
     }
 #endif
@@ -2618,6 +2785,12 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
             }
             /* Update connection params after yield */
             k_work_schedule(&conn_param_work, K_MSEC(200));
+#if GESTURE_DEBUG_HISTORY
+        } else if (data[0] == 0x04) {
+            if (!gesture_host_collection_start()) {
+                printk(">>> Host IMU collection rejected: busy\n");
+            }
+#endif
         }
     }
 
@@ -2700,7 +2873,12 @@ static void flush_gesture_history(void)
     }
 
     count = gesture_history_count;
-    session = ++gesture_history_session;
+    if (gesture_trajectory_session > gesture_history_session) {
+        gesture_history_session = gesture_trajectory_session;
+    } else {
+        gesture_history_session++;
+    }
+    session = gesture_history_session;
     pkt[0] = 0x00;
     pkt[1] = 0x55;
     pkt[2] = EVT_GESTURE_HISTORY_BEGIN;
@@ -2739,6 +2917,133 @@ static void flush_gesture_history(void)
 }
 #else
 static void flush_gesture_history(void)
+{
+}
+#endif
+
+#if GESTURE_DEBUG_HISTORY
+static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
+                                   uint16_t sample_count, uint8_t result,
+                                   uint8_t reason, bool overflow,
+                                   const char *label)
+{
+    struct bt_conn *conn = get_primary_conn();
+    uint8_t pkt[223];
+    uint16_t start = 0;
+    uint16_t sent = 0;
+    uint8_t session;
+    bool notify_error = false;
+
+    if (sample_count == 0) {
+        return true;
+    }
+    if (!conn) {
+        printk(">>> %s discarded: no primary connection\n", label);
+        return false;
+    }
+
+    session = ++gesture_trajectory_session;
+    pkt[0] = 0x00;
+    pkt[1] = 0x55;
+    pkt[2] = EVT_GESTURE_TRAJECTORY_BEGIN;
+    pkt[3] = GESTURE_TRAJECTORY_VERSION;
+    pkt[4] = session;
+    pkt[5] = result;
+    pkt[6] = reason;
+    memcpy(&pkt[7], &sample_count, 2);
+    {
+        uint16_t period_ms = MOTION_SAMPLE_INTERVAL_MS;
+        memcpy(&pkt[9], &period_ms, 2);
+    }
+    memcpy(&pkt[11], &gyro_bias_y_dps, 4);
+    if (bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, 15) < 0) {
+        notify_error = true;
+    }
+    k_msleep(GESTURE_HISTORY_FLUSH_GAP_MS);
+
+    while (start < sample_count) {
+        uint8_t count = (uint8_t)MIN(
+            GESTURE_TRAJECTORY_CHUNK_SAMPLES,
+            sample_count - start);
+        size_t offset = 7;
+
+        pkt[0] = 0x00;
+        pkt[1] = 0x55;
+        pkt[2] = EVT_GESTURE_TRAJECTORY_CHUNK;
+        pkt[3] = session;
+        memcpy(&pkt[4], &start, 2);
+        pkt[6] = count;
+        for (uint8_t i = 0; i < count; i++) {
+            const gesture_trajectory_sample_t *sample = &samples[start + i];
+            memcpy(&pkt[offset], &sample->t_ms, 2);
+            pkt[offset + 2] = sample->flags;
+            memcpy(&pkt[offset + 3], &sample->ax, 4);
+            memcpy(&pkt[offset + 7], &sample->ay, 4);
+            memcpy(&pkt[offset + 11], &sample->az, 4);
+            memcpy(&pkt[offset + 15], &sample->gx, 4);
+            memcpy(&pkt[offset + 19], &sample->gy, 4);
+            memcpy(&pkt[offset + 23], &sample->gz, 4);
+            offset += 27;
+        }
+        if (bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, offset) < 0) {
+            notify_error = true;
+        } else {
+            sent += count;
+        }
+        start += count;
+        k_msleep(GESTURE_HISTORY_FLUSH_GAP_MS);
+    }
+
+    pkt[0] = 0x00;
+    pkt[1] = 0x55;
+    pkt[2] = EVT_GESTURE_TRAJECTORY_END;
+    pkt[3] = session;
+    memcpy(&pkt[4], &sent, 2);
+    pkt[6] = (overflow ? BIT(0) : 0) |
+             (notify_error ? BIT(1) : 0);
+    (void)bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, 7);
+    printk(">>> %s flushed session=%u count=%u sent=%u flags=0x%02x\n",
+           label, session, sample_count, sent, pkt[6]);
+    return true;
+}
+
+static void flush_gesture_trajectory(void)
+{
+    if (!gesture_trajectory_flush_pending || gesture_trajectory_count == 0) {
+        return;
+    }
+    (void)flush_trajectory_batch(gesture_trajectory, gesture_trajectory_count,
+                                 gesture_trajectory_result,
+                                 gesture_trajectory_reason,
+                                 gesture_trajectory_overflow,
+                                 "Gesture trajectory");
+    gesture_trajectory_discard();
+}
+
+static void flush_host_collection(void)
+{
+    if (!gesture_host_collection_flush_pending ||
+        gesture_host_collection_count == 0) {
+        return;
+    }
+    (void)flush_trajectory_batch(gesture_host_collection,
+                                 gesture_host_collection_count,
+                                 3, GESTURE_DIAG_REASON_NONE,
+                                 gesture_host_collection_overflow,
+                                 "Host IMU collection");
+    gesture_host_collection_count = 0;
+    gesture_host_collection_flush_pending = false;
+    gesture_host_collection_overflow = false;
+    if (gesture_phase == GESTURE_WAITING && !is_recording &&
+        !recording_requested) {
+        gyro_set_enabled(false);
+    }
+}
+#else
+static void flush_gesture_trajectory(void)
+{
+}
+static void flush_host_collection(void)
 {
 }
 #endif
@@ -3175,6 +3480,8 @@ static void audio_thread(void *p1, void *p2, void *p3)
             printk("Recording stopped%s\n", was_fatal ? " (capture fault)" : "");
             audio_stats_print(was_fatal ? "fault" : "stop");
             send_event_packet(0x02);
+            flush_host_collection();
+            flush_gesture_trajectory();
             flush_gesture_history();
             battery_update();
             last_activity_ms = k_uptime_get();   /* reset idle timer after recording */
@@ -3203,6 +3510,8 @@ static void audio_thread(void *p1, void *p2, void *p3)
                 printk("Recording stopped (disconnected)\n");
                 audio_stats_print("disconnect");
                 send_event_packet(0x02);
+                flush_host_collection();
+                flush_gesture_trajectory();
                 flush_gesture_history();
             }
         }

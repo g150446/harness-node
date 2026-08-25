@@ -167,7 +167,7 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 ## ジェスチャー検出アルゴリズム
 
 この章は運用時の概要です。軸調査の根拠、判定式、状態遷移、全閾値、既知の
-制約、実機テスト項目は [シェイク→掌上→挙上→掌下静止仕様](flex_pronation_gesture.md)
+制約、実機テスト項目は [掌上0.5秒静止→挙上→掌下静止仕様](flex_pronation_gesture.md)
 を参照してください。
 
 ### IMU 軸と取り付け方向
@@ -182,23 +182,28 @@ Seeed Studio 公式の XIAO nRF52840 Sense KiCad 基板データと ST の LSM6D
 
 資料: [Seeed Studio XIAO nRF52840 Series](https://wiki.seeedstudio.com/XIAO_BLE/)、[LSM6DS3TR-C datasheet](https://www.st.com/resource/en/datasheet/lsm6ds3tr-c.pdf)
 
-ジャイロは待機時 power-down。シェイク成立で 104 Hz / ±500 dps を ONし、録音終了で OFFする。
+ジャイロは待機時 power-down。掌上候補の0.5秒静止成立で 104 Hz / ±500 dps を ONし、50 ms整定後に使用する。録音終了で OFFする。
 
-### 録音開始トリガー（シェイク → 掌上 → 挙上 → 掌下静止）
+### 録音開始トリガー（掌上0.5秒静止 → 挙上 → 掌下静止）
 
 XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基板X軸を前腕と直交、Y軸を
-前腕に沿わせる。右手・左手とUSB端子方向の違いは、シェイク後の相対符号で吸収する。
+前腕に沿わせる。右手・左手とUSB端子方向の違いは、掌上候補から掌下への相対姿勢変化で吸収する。
 
-1. 甲側装着で手のひら下向き、Z絶対比0.80以上の水平姿勢で短く1回シェイクする。重力直交の線形加速度について、500 ms窓の峰間が5.0 m/s²以上かつ`|平均| < 0.4 × 峰間`なら成立。持続する同じ符号の横Gでは不成立。成立時にジャイロON。
-2. シェイク後1.5秒以内に掌上。基準はシェイク窓開始時の重力LP。重力ゲート（3D 20° / phi 12° / Δz 0.35 / Z符号）**または** gyro_y（peak≥50 dps、または積分対象 `|ω_y|≥20 dps` で ∫≥45° かつ peak≥30 dps）。成立時に基準と outbound 符号を取り直す。
-3. 重力LPで姿勢成分を除いた線形加速度を現在の重力方向へ投影し、上向き加速パルスを検出する（掌向きは見ない。物理動作の目安は約5 cm上昇）。
-4. holdは掌上基準からの重力反転 **または** 逆符号 gyro_y が取れてから開始する。線形加速度RMS ≤ 3.0 m/s² と進入時 `|ω_y|≤90 dps` で静止を示したら重力方向を固定し、角度差15°以内を400 ms維持すると録音を開始する（掌上後 5 s 以内）。ジャイロは録音中もONのまま。
+1. 甲側装着で掌を上にし、`|Z|/|a| ≥ 0.75`、`|a|` 8.5–11.5 m/s²、線形加速度RMS ≤ 4.0 m/s²、姿勢差20°以内を0.5秒維持する。成立時にジャイロON、50 ms整定後に使用する。
+2. 成立時の重力方向を掌上基準とし、重力LPで姿勢成分を除いた線形加速度から上向き加速パルスを検出する（物理動作の目安は約5 cm上昇）。
+3. holdは掌上基準からの重力反転とgyro連動条件が成立してから開始し、成立した掌下は試行中ラッチする。線形加速度RMS ≤ 3.0 m/s²で進入し、hold中はRMS > 3.5 m/s²が2サンプル連続した場合だけ中断する。姿勢差15°以内を400 ms維持すると録音を開始する。挙上はgyro起動後5秒以内に開始し、挙上開始から最終静止完了までは3秒未満とする。
 
 回外・最終仰角帯・甲上条件は要求しない。詳細は`docs/flex_pronation_gesture.md`を参照する。
 
 ### 録音停止トリガー
 
-録音開始時点の重力 LP（掌下）を基準に保存する。開始後 1200 ms を過ぎたあと、重力掌上ゲート **または** gyro_y ゲート（peak≥50 dps、または積分対象 `|ω_y|≥20 dps` で ∫≥45° かつ peak≥30 dps）、かつ `|a|` が 7.5–12.5 m/s² で `stop_requested = true` となり、DMIC を停止して `0x02` を送りジャイロを OFF する。手を下ろすだけでは停止しない。`motion_active` は睡眠タイマーとイベント通知用に残し、録音停止には使わない。ホスト `0x00` とシリアル `'s'` による停止は従来どおり。
+録音開始時点の重力 LP（掌下）を仮基準とし、開始後 **3000 ms** は停止判定しない。
+その間静かなら基準を更新し、抑制終了時の掌下姿勢を固定する。その後、重力掌上
+ゲート（LP の phi≥20° かつ Δz≥0.50 または Z 符号反転）**または** gyro_y ゲート
+（∫≥45° かつ peak≥30 dps）が **500 ms 連続**し、かつ `|a|` が 7.5–12.5 m/s² のとき
+`stop_requested = true` となり、DMIC を停止して `0x02` を送りジャイロを OFF する。
+tilt 単独では止めない。手を重力方向へ下ろすだけでは停止しない。ホスト `0x00` と
+シリアル `'s'` による停止は従来どおり。
 
 ### ライトスリープ
 
@@ -219,7 +224,7 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 リストバンド表側から基板面へ垂直に行うダブルタップを Z 軸で検出する。
 閾値は約 0.5 g、2 回の最大間隔は約 308 ms、認識後のクールダウンは 700 ms。
 成立時は `0x12 double_tap` を BLE 通知するだけで、録音状態は変更しない。
-ライトスリープ中は復帰し、ダブルタップが既存のシェイク開始ジェスチャーとして
+ライトスリープ中は復帰し、ダブルタップが掌上静止開始ジェスチャーとして
 扱われないよう、待機中の開始候補を破棄する。
 
 #### ハードウェア割り込み構成
@@ -292,44 +297,40 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 
 | パラメータ | 値 | 説明 |
 |-----------|---|------|
-| `GESTURE_START_PALM_UP_Z_MIN_RATIO` | 0.80 | 開始時の基板水平（\|Z比\|） |
-| `GESTURE_SHAKE_WINDOW_SAMPLES` | 20 | シェイク窓（約500 ms） |
-| `GESTURE_SHAKE_PTP_MIN_MS2` | 5.0 m/s² | 重力直交成分の峰間 |
-| `GESTURE_SHAKE_MEAN_RATIO_MAX` | 0.4 | \|平均\| / 峰間 の上限 |
-| `GESTURE_SHAKE_AXIS_MIN_MS2` | 2.0 m/s² | シェイク軸固定の直交成分下限 |
-| `GESTURE_QUIET_ACCEL_MS2` | 3.0 m/s² | 静止判定の線形加速度上限 |
-| `GESTURE_PRONATION_MIN_DEG` | 20° | hold 反転の重力phi |
-| `GESTURE_PRONATION_Z_RATIO_DONE` | 0.50 | hold 反転のZ比変化 |
+| `GESTURE_START_PALM_UP_Z_MIN_RATIO` | 0.75 | 開始時の基板水平（\|Z比\|） |
+| `GESTURE_PALM_UP_DWELL_MS` | 500 ms | 掌上候補の連続静止 |
+| `GESTURE_PALM_UP_DWELL_TILT_MAX_DEG` | 20° | 候補開始姿勢からの許容差 |
+| `GESTURE_START_QUIET_ACCEL_MS2` | 4.0 m/s² | 掌上候補の線形加速度/RMS上限 |
+| `GESTURE_GYRO_SETTLE_MS` | 50 ms | ジャイロ起動後の整定待ち |
+| `GESTURE_PRONATION_MIN_DEG` | 15° | hold 反転の重力phi |
+| `GESTURE_PRONATION_Z_RATIO_DONE` | 0.40 | hold 反転のZ比変化 |
 | `GESTURE_PRONATION_Z_SIGN_MIN_MS2` | 2.0 m/s² | Z符号反転と認める\|az\|下限 |
-| `GESTURE_OUTBOUND_MIN_DEG` | 12° | シェイク後掌上のXZ phi |
-| `GESTURE_OUTBOUND_TILT_MIN_DEG` | 20° | シェイク後掌上の重力3D角 |
-| `GESTURE_OUTBOUND_Z_RATIO_DONE` | 0.35 | シェイク後掌上のZ比変化 |
-| `GESTURE_PHASE_MIN_DURATION_MS` | 120 ms | 掌上フェーズ最短時間 |
-| `GESTURE_OUTBOUND_MAX_DURATION_MS` | 1500 ms | シェイク後の掌上期限 |
 | `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.40 m/s² | 上向き加速パルス下限 |
 | `GESTURE_LIFT_BRAKE_MIN_MS2` | 0.15 m/s² | 逆向き減速パルス下限 |
 | `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.04 m/s | 正インパルス下限 |
 | `GESTURE_LIFT_NEG_IMPULSE_MIN_MS` | 0.015 m/s | 負インパルス下限 |
 | `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
-| `GESTURE_LIFT_PULSE_MIN_MS` / `MAX_MS` | 150 / 1800 ms | 双極パルスの時間窓 |
-| `GESTURE_OUTBOUND_GYRO_INTEGRATE_RATE_DPS` | 20 dps | 掌上の積分対象レート |
-| `GESTURE_OUTBOUND_GYRO_ANGLE_MIN_DEG` | 45° | 掌上 ∫ω_y |
-| `GESTURE_OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS` | 30 dps | 掌上の積分角経路に必要なpeak |
-| `GESTURE_OUTBOUND_GYRO_PEAK_DPS` | 50 dps | 掌上 peak \|ω_y\| |
+| `GESTURE_LIFT_PULSE_MIN_MS` | 150 ms | 短すぎる加減速パルスの下限 |
 | `GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS` | 20 dps | 録音停止の積分対象レート |
 | `GESTURE_STOP_GYRO_ANGLE_MIN_DEG` | 45° | 録音停止 ∫ω_y |
 | `GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS` | 30 dps | 録音停止の積分角経路に必要なpeak |
-| `GESTURE_STOP_GYRO_PEAK_DPS` | 50 dps | 録音停止 peak \|ω_y\| |
-| `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 20° | hold 反転 ∫ω_y |
-| `GESTURE_HOLD_GYRO_PEAK_DPS` | 30 dps | hold 反転 peak |
+| `GESTURE_STOP_GYRO_PEAK_DPS` | 50 dps | 互換用定数（peak単独停止は0.0.64で廃止） |
+| `GESTURE_OUTBOUND_MIN_DEG` | 20° | 録音停止の重力 phi 必須（LP） |
+| `GESTURE_OUTBOUND_Z_RATIO_DONE` | 0.50 | 録音停止の Δz 必須副条件 |
+| `GESTURE_STOP_HOLD_MS` | 500 ms | 録音停止の連続成立時間 |
+| `GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS` | 10 dps | hold 回内の積分対象レート |
+| `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 50° | hold 回内の ∫ω_y 下限 |
+| `GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN` | 0.42 | 挙上未成立時のみ peak \|ω_x\| / peak \|ω_y\|（挙上後は不要） |
 | `GESTURE_FINAL_QUIET_RATE_DPS` | 90 dps | hold 進入時のみ |
 | `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 15° | 静止開始時の重力方向からの保持中姿勢差上限 |
 | `GESTURE_FINAL_STILL_RMS_MS2` | 3.0 m/s² | 4サンプル静止RMS上限 |
+| `GESTURE_FINAL_HOLD_RMS_EXIT_MS2` | 3.5 m/s² | hold中のRMS中断閾値 |
+| `GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES` | 2 | hold中断に必要な連続超過数 |
 | `GESTURE_FINAL_HOLD_MS` | 400 ms | 最終静止保持時間 |
 | `GESTURE_GRAVITY_LP_TAU_S` | 0.30 s | 重力推定の低通時定数 |
-| `GESTURE_FINAL_HOLD_TIMEOUT_MS` | 5000 ms | 掌上成立後の最終成立期限 |
-| `GESTURE_SEQUENCE_TIMEOUT_MS` | 6000 ms | 全シーケンス期限 |
-| `GESTURE_RETRIGGER_BLOCK_MS` | 1200 ms | 開始直後の停止抑制 / 停止後の再開始抑制 |
+| `GESTURE_LIFT_START_TIMEOUT_MS` | 5000 ms | gyro起動後に挙上を開始するまでの期限 |
+| `GESTURE_MOTION_COMPLETE_MAX_MS` | 4500 ms | 挙上開始から400 ms最終静止完了までの上限 |
+| `GESTURE_RETRIGGER_BLOCK_MS` | 3000 ms | 開始直後の停止抑制（基準再ロック）/ 停止後の再開始抑制 |
 | `GYRO_ODR_HZ` | 104 | オンデマンドジャイロ ODR |
 | `GYRO_FULL_SCALE_DPS` | 500 | ジャイロ FS |
 | `SLEEP_IDLE_TIMEOUT_MS` | 10000 ms | ライトスリープ移行までの無動作時間 |
@@ -418,12 +419,19 @@ python3 gesture_monitor.py
 
 表示イベント: `motion_active`（x/y/z）、`motion_settled`（x/y/z + elapsed/peak/dist）、`double_tap`、`recording_start`、`recording_stop`、`sleep_enter`、`sleep_wake`
 
-### gesture_validator.py — シェイク→掌上→挙上→掌下静止ジェスチャー検証
+### gesture_validator.py — 掌上0.5秒静止→挙上→掌下静止ジェスチャー検証
 
-試行ごとにカウントダウンと Ping 音を合図に、シェイク→掌上→挙上→掌下で0.5秒静止、
-続けて掌上で録音終了するかを対話検証する。条件ごとの `[OK]` / `[NG]` / `[--]` を表示し、
+試行ごとにカウントダウンと Ping 音を合図に、掌上で0.5秒静止→挙上→掌下で0.4秒静止する。
+`recording_start`受信時に`START OK`を表示し、1.3秒後のGlass音と`STOP GO`後にだけ掌上へ戻す。
+これにより開始評価へ停止動作を混入させない。条件ごとの `[OK]` / `[NG]` / `[--]` を表示し、
 生の診断ログは JSON へ保存する。GO後の判定時間は既定15秒。開始後はホスト `0x00` を送らず、
 掌上の `recording_stop` を待つ。
+履歴有効ファームでは試行ごとに6軸CSV・PNGを保存し、加速度XYZとジャイロXYZの
+時系列グラフを表示する。`--no-plot`でPNG保存のみ、`--no-plot-files`で画像生成も無効にできる。
+
+グラフ上では、gyro起動前の灰色区間は正常な未取得区間である。gyro Yは回内・回外の主軸、
+gyro X/Zは挙上に伴う複合回転を含む。開始後の反対方向gyro Yピークは録音停止の掌上復帰に
+対応し得るため、`START OK` と `STOP GO` の前後を分けて評価する。
 
 物理操作を伴う試験は内容と回数を事前に説明し、準備完了を確認してから1試行ずつ開始する。
 カウントダウン、`GO`、接続状態、最終結果はmacOS Terminalへ表示する。ログも保存する場合は
@@ -452,14 +460,54 @@ python3 gesture_classifier.py
 
 ## ジェスチャ履歴デバッグビルド
 
-本番は `GESTURE_DEBUG_HISTORY=0`（既定）。履歴バッチ（0x33–0x35）を有効にするには:
+本番は `GESTURE_DEBUG_HISTORY=0`（既定）。判定履歴と6軸履歴バッチを有効にするには:
 
 ```bash
-# west / build に C フラグを足す例（スクリプト利用時は west 引数を追加）
-west build ... -- -DCMAKE_C_FLAGS="-DGESTURE_DEBUG_HISTORY=1"
+# sysbuild の west configure 引数に C フラグを足す
+west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
+  /path/to/harness-node/nordic-main --build-dir /tmp/harness-node-debug \
+  -- -DEXTRA_CFLAGS=-DGESTURE_DEBUG_HISTORY=1
 ```
 
 または `nordic-main/src/main.c` の `#ifndef GESTURE_DEBUG_HISTORY` 既定を一時的に `1` にする。
+
+履歴有効時は従来の判定履歴 `0x33–0x35` に加え、40 Hzの加速度XYZ・ジャイロXYZを
+`0x36 trajectory_begin`、`0x37 trajectory_chunk`、`0x38 trajectory_end` でバッチ送信する。
+最初の0.5秒はジャイロ未取得フラグ付きで、成功履歴は録音停止後、成立後の失敗履歴は即時送る。
+
+### ラベル付き6軸データ収集
+
+デバッグ版 `0.0.57` 以降では、ホストコマンド `0x04` が現行判定と独立した6秒収集を開始する。
+終了時に `0x36–0x38` を `result=3` で送り、加速度XYZ・ジャイロXYZを約40 Hzで保存する。
+収集モード自体は現行ジェスチャーの閾値や判定結果を変更しない。
+
+まず推奨12試行の一覧を出し、同じ `session-dir` に1試行ずつ保存する。
+
+```bash
+cd mac_client
+venv/bin/python gesture_dataset_collector.py --list-plan \
+  --session-dir output/gesture_dataset_YYYYMMDD_HHMMSS
+
+# 例: 右手・自然速度の正例を1回
+venv/bin/python gesture_dataset_collector.py \
+  --hand right --motion positive --speed natural \
+  --session-dir output/gesture_dataset_YYYYMMDD_HHMMSS
+
+# 12試行後
+MPLBACKEND=Agg venv/bin/python gesture_dataset_analyzer.py \
+  output/gesture_dataset_YYYYMMDD_HHMMSS
+```
+
+内訳は左右それぞれ、正例3回（自然・遅い・速い）と負例3回（挙上のみ・回転のみ・
+日常動作）の合計12回。各試行はCSV、6軸PNG、ラベルJSONを生成する。解析は特徴量CSV、
+左右を色分けした重ね合わせPNG、0.1–0.5 gの一定水平加速度と低周波ノイズを加えた
+感度CSV、追加収集フラグJSONを生成する。正例の手別ばらつきが30%を超える、または
+正例最小と負例最大の分離が25%未満の場合だけ該当条件を左右各1回追加し、最大16回とする。
+疑似横加速度は車・電車を再現するものではなく、一定オフセットが基線相対特徴へ及ぼす
+感度確認に限定する。
+
+対話試験は物理動作を伴うため、内容・回数・Ping音/`GO`を事前に案内し、準備完了を
+確認してから1試行ずつ開始する。
 
 ## LED 状態
 

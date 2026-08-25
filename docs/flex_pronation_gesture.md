@@ -1,38 +1,43 @@
-# シェイク→掌上→挙上→掌下静止ジェスチャー仕様
+# 掌上0.5秒静止→挙上→掌下静止ジェスチャー仕様
 
 対象デバイス: Seeed Studio XIAO nRF52840 Sense  
-対象ファームウェア: HarnessNode `0.0.54` 以降
+対象ファームウェア: HarnessNode `0.0.66` 以降（RMSヒステリシスは`0.0.60`以降）
+
+## 検証時の二段階プロトコル
+
+開始動作と停止動作を同じ時間窓で評価しないため、Mac validator は次の順で案内する。
+
+1. Ping音の後、掌上候補の静止 → 挙上 → 掌下への回内を行う。
+2. `START OK` が表示されるまで掌下を維持する。これは録音開始イベントを受信した合図である。
+3. `START OK` から既定1.3秒後、Glass音と `STOP GO` が出るまで掌下を維持する。
+4. `STOP GO` の後に掌上へ戻し、`recording_stop` を発生させる。
+
+`STOP GO` 前の `recording_stop` は停止ジェスチャーの先行入力として記録し、試行を不成立にする。
+`recording_start` が発生しなかった場合は停止合図も出ないため、停止動作の成否や所要時間は
+開始判定とは別に扱う。
 
 ## 発動条件
 
 - XIAO をリストバンドの**手の甲側**に置く
 - 部品面を皮膚側にし、基板 X 軸を前腕と直交、Y 軸を前腕に沿わせる
-- 手のひらを下向きにし、基板がほぼ水平（|Z 比| ≥ 0.80）のまま短く **1 回シェイク**する
-  - シェイクは重力に直交する線形加速度だけを見る
-  - 500 ms 窓の峰間 ≥ 5.0 m/s²、かつ `|平均| < 0.4 × 峰間`
-  - 持続する同じ符号の横 G（運転）では平均 ≈ ピークとなり不成立
-  - シェイク成立でジャイロ ON（104 Hz）。掌上窓 1.5 s 内に ~100 ms 整定
-- シェイク後 1.5 秒以内に掌を上へ反転させる（掌上）
-  - 基準はシェイク窓の最初のサンプル時点の重力 LP（振った瞬間の raw ではない）
-  - 相対変化: 重力 3D 角 ≥ 20°、phi ≥ 12°、`|Δz比| ≥ 0.35`、Z 符号反転、
-    **または** `peak|gyro_y| ≥ 50°/s` /（`|∫gyro_y dt| ≥ 45°` かつ
-    `peak|gyro_y| ≥ 30°/s`）。積分対象は `|gyro_y| ≥ 20°/s`（重力 OR ジャイロ）
-  - 口元への掌上は前腕ピッチになりやすく、XZ の phi だけでは拾えない
-  - 装着ごとの raw Z 符号に依存する絶対掌上は使わない
-  - 掌上成立時に基準 phi / az を取り直し、outbound の `gyro_y` 符号を記憶する
+- 掌を上にし、基板がほぼ水平（`|Z|/|a| ≥ 0.75`）のまま **0.5秒静止**する
+  - `|a|` 8.5–11.5 m/s²、4サンプルの線形加速度RMS ≤ 4.0 m/s²、候補開始姿勢から20°以内を連続して満たす
+  - 0.5秒未満で条件が崩れた候補は破棄し、静止を数え直す
+  - 0.5秒成立時にジャイロを104 Hz / ±500 dpsでONにし、50 ms整定後、その重力方向を掌上基準とする
+  - 加速度だけで水平な掌上/掌下を絶対判別できないため、水平静止は「掌上候補」として扱う
 - 掌向きを問わず、口元へ上げる（物理目安 **約 5 cm**）
 - 上げたあと、**掌上基準から手首を回して掌下** にし、**400 ms** 静止する
-  - 掌下: 重力反転 **または** outbound と逆符号の `gyro_y`（角 ≥ 20° / peak ≥ 30°/s）
+  - 掌下: 重力反転（phi≥15° または Δz≥0.40 または符号反転）と `|∫gyro_y dt| ≥ 50°`（積分対象 |ωy|≥10 dps）。挙上パルス未成立時のみ peak `|gyro_x| / |gyro_y| ≥ 0.42` も要求。一度成立したらその試行中はラッチする
   - 静止進入: 線形加速度 RMS ≤ 3.0 m/s²。進入時のみ `|gyro_y| ≤ 90°/s`
+  - hold中: RMS > 3.5 m/s²が2サンプル連続した場合だけ中断する
   - 保持中の姿勢差 ≤ 15°（静止開始時の重力方向から）
 - 録音中に手のひらを上へ向けると録音終了する。手を下ろすだけでは終了しない
 - ジャイロは録音終了（またはシーケンス失敗）で OFF
 
-右手・左手および USB 向きの差は、シェイク後の相対符号で吸収する。  
+右手・左手および USB 向きの差は、掌上候補から最終掌下への相対姿勢変化で吸収する。
 最終姿勢の仰角帯・甲上条件・回外は要求しない。
 
-運転の横 G は重力 LP（tau 0.30 s）で遅い車体加速度を姿勢から除き、
-シェイク判定では直交成分の直流（平均 ≈ ピーク）を落とす。
+重力 LP（tau 0.30 s）で姿勢成分を除き、候補開始のRMS静止判定と挙上パルス判定に使う。
 
 ## 装着と軸
 
@@ -43,14 +48,16 @@
 | `Z` | 部品面外向き | 基板水平（|Z 比|）の判定 |
 
 実機検証では装着ごとに raw `z` の符号が反転したため、
-水平姿勢は Z の絶対比、掌上はシェイク前 LP からの 3D / phi / Z 変化、
-掌下 hold は掌上基準からの相対 phi / Z 変化で判定する。角速度は **gyro_y**。
+水平姿勢は Z の絶対比、掌下 hold は0.5秒静止時の掌上基準からの
+相対 phi / Z 変化で判定する。角速度は **gyro_y**。
 
 ```text
-board_flat = abs(z / |a|) >= 0.80
-palm_up_after_shake = gravity gates OR peak|ω_y|>=50 dps OR (|∫ω_y|>=45° AND peak|ω_y|>=30 dps)
-palm_down_after_lift = gravity flip OR opposite-sign gyro_y gates
-hold_entry = palm_down AND rms<=3.0 AND tilt<=15° AND (timer running OR |ω_y|<=90)
+board_flat = abs(z / |a|) >= 0.75
+palm_up_dwell = board_flat AND 8.5<=|a|<=11.5 AND rms<=4.0 AND tilt<=20° for 500 ms
+palm_down_after_lift = latch(gravity flip AND gyro_y angle>=50° AND (peak_x/peak_y>=0.42 OR lift_stage!=WAIT_ACCEL))
+hold_entry = palm_down_latched AND rms<=3.0 AND tilt<=15° AND |ω_y|<=90
+hold_continue = palm_down_latched AND NOT(rms>3.5 for 2 samples) AND tilt<=15°
+motion_complete = lift_start_to_hold_done < 4500 ms
 ```
 
 ## 上昇動作の測り方（双極パルス）
@@ -60,7 +67,7 @@ hold_entry = palm_down AND rms<=3.0 AND tilt<=15° AND (timer running OR |ω_y|<
 1. 低通加速度を重力推定とし、rawとの差から線形加速度を得る
 2. 線形加速度をその時点の低通重力方向へ投影し、上向き加速度 `a_up` を得る
 3. 上向きの加速パルスを確認する。減速パルスがあれば早期に hold へ進む
-4. 正インパルスと 150–1800 ms の時間形状を満たしたら上昇成立。減速パルスは必須ではない。掌向きは見ない
+4. 正インパルスを満たし、減速パルスを検出するか、掌下・gyro静定・4サンプルRMS静止が揃ったらholdへ進む。掌向きは加速パルス判定中には見ない
 5. 掌上基準から手首が反転してから、短い加速度 RMS 窓が静止を示した時点の重力方向を保持基準とし、その後の角度差が 15° 以内か確認する
 
 変位の二重積分は使わない。約 5 cm はユーザー動作の目安であり、判定閾値ではない。
@@ -68,13 +75,17 @@ hold_entry = palm_down AND rms<=3.0 AND tilt<=15° AND (timer running OR |ω_y|<
 
 ## 録音停止（開始姿勢からの掌上）
 
-録音開始時の重力 LP（掌下静止）を基準として保存する。`reset_gesture_sequence()` では消さない。録音中も重力LPとジャイロは継続する。
+録音開始時の重力 LP（掌下静止）を仮基準とする。`reset_gesture_sequence()` では消さない。
+録音中も重力LPとジャイロは継続する。
 
-開始後 1200 ms を過ぎたあと、次のいずれかで即座に停止する（hold は待たない）:
+開始後 **3000 ms** は停止判定しない。その間は静かなら掌下基準を更新し、
+抑制終了時の姿勢を基準に固定する。その後、次のいずれかが **500 ms 連続**
+で成立したら停止する（重力は重力 LP の現在姿勢で判定）:
 
-1. 重力: 3D 角 ≥ 20°、phi ≥ 12°、`|Δz比| ≥ 0.35`、または Z 符号反転
-2. ジャイロ: `peak|gyro_y| ≥ 50°/s`、または積分対象 `|gyro_y| ≥ 20°/s` で
-   `|∫gyro_y dt| ≥ 45°` かつ `peak|gyro_y| ≥ 30°/s`
+1. 重力: **phi ≥ 20°** かつ（`|Δz比| ≥ 0.50` または Z 符号反転）
+   （3D tilt 単独では止めない）
+2. ジャイロ: 積分対象 `|gyro_y| ≥ 20°/s` で `|∫gyro_y dt| ≥ 45°` かつ
+   `peak|gyro_y| ≥ 30°/s`（peak 単独経路は廃止）
 3. 共通: `|a|` が 7.5–12.5 m/s²
 
 手を重力方向へ下ろすだけでは停止しない。`motion_active` でも止めない。ホスト `0x00` とシリアル `'s'` は従来どおり。停止後にジャイロ OFF。
@@ -82,10 +93,12 @@ hold_entry = palm_down AND rms<=3.0 AND tilt<=15° AND (timer running OR |ω_y|<
 ## 状態遷移
 
 ```text
-WAITING → OUTBOUND(掌上)  [shake accept → gyro ON]
+WAITING(掌上候補0.5秒) [dwell accept → gyro ON]
         → HOLDING_FINAL(WAIT_ACCEL → WAIT_BRAKE → WAIT_HOLD)
 WAIT_HOLD は掌上基準からの反転が取れるまで開始しない
-WAIT_BRAKE で 1800 ms 経過し正インパルスがあれば WAIT_HOLD へ。不足なら WAIT_ACCEL 再試行
+WAIT_BRAKE では減速パルス、または掌下・gyro静定・4サンプルRMS静止で WAIT_HOLD へ
+挙上開始から4500 ms時点で掌下連動が未成立なら`palm_down_gate_failed`、
+掌下成立後も400 ms最終静止が未完了なら`motion_too_slow`
 MATCH → recording (gyro stays ON) → stop palm-up → gyro OFF
 ```
 
@@ -93,47 +106,43 @@ MATCH → recording (gyro stays ON) → stop palm-up → gyro OFF
 
 | 項目 | 値 |
 |---|---:|
-| 開始水平 | \|Z 比\| ≥ 0.80 |
-| シェイク窓 | 20 サンプル（約 500 ms） |
-| シェイク峰間 | 重力直交成分 ≥ 5.0 m/s² |
-| シェイク平均比 | \|平均\| < 0.4 × 峰間 |
-| シェイク軸下限 | 直交成分 ≥ 2.0 m/s² で軸を固定 |
-| 掌上 | 重力ゲート **または** peak≥50 dps /（\|∫ω_y\|≥45° かつ peak≥30 dps） |
-| 掌上/停止の積分対象 | \|ω_y\| ≥ 20 dps |
-| 掌上窓 | シェイク後 1500 ms |
-| ジャイロ | シェイク成立で ON、録音終了で OFF。ODR 104 Hz、FS ±500 dps、整定 100 ms |
+| 開始水平 | \|Z 比\| ≥ 0.75 |
+| 掌上候補静止 | 500 ms、\|a\| 8.5–11.5 m/s²、RMS ≤ 4.0 m/s²、姿勢差 ≤ 20° |
+| ジャイロ | 0.5秒静止成立で ON、録音終了で OFF。ODR 104 Hz、FS ±500 dps、整定 50 ms |
 | 上向き加速度 | `a_up` ≥ 0.40 m/s² を2サンプル、正インパルス ≥ 0.04 m/s |
 | 逆向き減速 | 任意。`a_up` ≤ -0.15 m/s² なら早期に hold へ |
-| パルス形状 | 150–1800 ms。1800 ms 時点で正インパルスがあれば hold へ |
+| パルス形状 | 150 ms以上。固定の最大パルス時間は設けない |
 | hold の掌 | 重力反転 **または** 逆符号 gyro_y（角≥20° / peak≥30 dps） |
 | 保持中の姿勢差 | 静止開始時の重力方向から ≤ **15°** |
 | 静止進入 | 4サンプル RMS ≤ **3.0** m/s²。進入時のみ \|ω_y\|≤**90** dps |
+| hold中RMS | **3.5** m/s²超過が **2サンプル連続**した場合に中断 |
 | 最終静止 | **400** ms |
-| 最終到達期限 | 掌上後 **5000** ms |
-| 全シーケンス | 6000 ms |
-| 録音停止 | 重力ゲート **または** gyro_y ゲート。\|a\| 7.5–12.5 m/s² |
-| 録音停止 開始抑制 | 1200 ms |
+| 挙上開始待ち | gyro起動後 **5000** ms |
+| 動作完了期限 | 挙上開始から400 ms最終静止完了まで **4500 ms未満** |
+| 録音停止 | 重力（phi≥20 + Δz≥0.50/符号）**または** gyro_y（∫+peak）。500 ms 連続 |
+| 録音停止 開始抑制 | 3000 ms（期間中に掌下基準を再ロック） |
 
 ## 診断イベント（抜粋）
 
 | stage | 意味 |
 |---|---|
-| `outbound_start` | シェイク成立。v1=峰間、v2=Z絶対比、v3=平均 |
-| `outbound_ready` | 掌上。v1=phi、v2=3D角、v3=Δz 比 |
-| `outbound_gyro` (0x0F) | 掌上/停止時の gyro。v1=∫ω_y、v2=peak dps、v3=sign |
+| `outbound_start` | 掌上候補開始。v1=Z絶対比、v2=0、v3=線形加速度 |
+| `outbound_ready` | 0.5秒静止成立。v1=dwell ms、v2=Z絶対比、v3=線形加速度 |
 | `gyro_enabled` (0x0D) / `gyro_disabled` (0x0E) | ジャイロ電源 |
 | `wait_reject` reason `start_not_palm_up` | 基板が水平でない。v1=Z比、v2=下限、v3=線形加速度 |
-| `wait_reject` reason `quiet_not_ready` | シェイク窓未充足。v1=Z比、v2=件数、v3=必要件数 |
-| `wait_reject` reason `shake_not_oscillatory` | 直流横Gなど。v1=峰間、v2=平均、v3=\|平均\|/峰間 |
+| `wait_reject` reason `quiet_not_ready` | 水平だが重力帯または静止条件を満たさない |
 | `wait_reject` reason `final_hold_interrupted` | hold 中断。v1=RMS、v2=tilt、v3=\|gy\| |
 | `final_sample` (0x21) | 挙上中 100 ms 周期: pulse_stage, a_up, net_impulse |
 | `hold_sample` (0x22) | hold 中 100 ms 周期: rms, tilt, \|gy\| |
 | `final_hold_start` / `final_ready` | 静止保持開始 / 完了（v1=pos imp、v2=neg imp or hold_ms、v3=tilt） |
+| `motion_complete` (0x23) | 挙上開始から最終静止完了まで。v1=elapsed ms、v2=gyro Y peak、v3=積分角 |
+| `palm_down_gate` (0x24) | 掌下未成立の理由。重力反転不足、gyro Y積分角不足、peak gyro X/Y比不足を個別送信 |
 | `match` | 発動 |
 | `stop_palm_up` (0x0C) | 録音中の掌上停止。v1=phi、v2=3D角、v3=Δz（直後に `outbound_gyro`） |
 | `reset` reason `outbound_timeout` | 掌上不成 |
-| `reset` reason `final_hold_timeout` | 掌上後 5000 ms 以内に hold 不成 |
-| `reset` reason `final_accel_missing` | 掌上後 5000 ms 以内に上向き加速が不足 |
+| `reset` reason `final_accel_missing` | gyro起動後 5000 ms 以内に上向き加速が不足 |
+| `reset` reason `motion_too_slow` | 挙上開始から最終静止完了まで4500 ms以上 |
+| `reset` reason `palm_down_gate_failed` | 4500 ms時点で掌下の重力＋gyro連動条件が未成立。録音停止動作を開始時間へ含めず別分類する |
 
 ### 履歴バッチ（`GESTURE_DEBUG_HISTORY=1` のときのみ）
 
@@ -145,6 +154,97 @@ MATCH → recording (gyro stays ON) → stop palm-up → gyro OFF
 | `0x34` history_entry | u16 t_ms, stage, reason, f32×3（19 B） |
 | `0x35` history_end | count, session_id |
 
+40 Hzの6軸履歴は成功時に録音停止後、ジャイロON後の失敗時に即時送信する。
+
+| event | 内容 |
+|---|---|
+| `0x36` trajectory_begin | version, session, result/reason, count, period, gyro Y bias |
+| `0x37` trajectory_chunk | index付き最大8サンプル。`t_ms`, validity, accel XYZ, gyro XYZ |
+| `0x38` trajectory_end | sent count, overflow/notify error flags |
+
+デバッグ版ではホストコマンド `0x04` で、現行分類器を変更せずに6秒間の独立した
+6軸収集を開始できる。終了時は同じ `0x36–0x38` を `result=3` として送る。
+これにより不成立の負例も、ジェスチャー状態機械のリセット時刻に左右されず同じ長さで保存する。
+
+閾値を追加する前に、右手・左手それぞれで正例3回（自然・遅い・速い）と負例3回
+（挙上のみ・回転のみ・日常動作）、合計12回を収集する。左右の符号差を避けるため、
+候補特徴は基線相対のXY合成値、各gyro軸の絶対peak、gyro Y絶対積分を用いる。
+車・電車の実測は含めず、一定0.1–0.5 gと低周波ノイズを加えた感度解析は
+ロバスト性の予備評価としてのみ扱う。
+
+### 0.0.58–0.0.60 低速回内挙上の除外とhold安定化
+
+収集した使用可能13試行では、自然・高速の正例5試行の peak `|gyro_y|` は
+最小369.8 dps、左右の低速2試行は最大178.2 dpsだった。0.0.59では瞬間peakを
+速度の必須下限にはせず、挙上開始から400 ms最終静止完了までが3秒以上なら
+低速として除外する。回転のみの負例を除くため、挙上パルス未成立（WAIT_ACCEL）の間は
+peak `|gyro_x| / |gyro_y|` 0.42以上を要求する。挙上パルス成立後は加速度側で
+腕の動きが担保済みのため XY 比は必須にしない。`|∫gyro_y dt|` は80°以上を
+必要とする。すべて絶対値または比率で判定するため右手・左手を同じ条件で扱う。
+重力による掌下判定とのAND条件であり、gyro peak単独では成立しない。
+
+減速パルスを検出できなくても、掌下、gyro静定、加速度RMSが成立すれば最終holdへ
+進める。これにより実測1,625 msの自然動作を固定パルス上限だけで棄却せず、
+明らかに遅い動作だけを完了時間で除外する。
+
+0.0.60では、掌下の重力＋gyro連動条件を一度満たしたらシーケンス終了まで保持する。
+回転停止時の逆方向角速度で積分角が80°未満へ戻っても、成立済みの掌下を取り消さない。
+また、静止進入はRMS 3.0 m/s²以下のまま維持し、hold中は3.5 m/s²超過が
+2サンプル連続した場合だけ中断する。単発の境界ノイズで400 msを数え直さないための
+    ヒステリシスであり、進入条件自体は緩和しない。
+
+### 0.0.63 挙上後の XY 比必須解除
+
+実測で gyro_y 積分角≥80°かつ重力反転は足りるが peak|gx|/|gy| が 0.14 前後の
+自然な回内が `palm_down_xy_ratio_low` で落ちた。挙上は加速度パルスで既に判定
+しているため、0.0.63 では lift stage が WAIT_ACCEL を抜けたあとは XY 比を
+掌下ラッチの必須条件から外す。挙上前の手首回しのみは従来どおり XY 比で抑止する。
+
+### 0.0.64 録音停止の誤発火抑制
+
+掌下録音中に 3D tilt だけが 20° を一瞬超えて早期停止する事例があった
+（phi 未達・gyro ほぼゼロ）。0.0.64 では:
+
+- 重力停止は **phi≥20° 必須** +（tilt≥25° または Δz≥0.35 または Z 符号反転）
+- 判定は **現在姿勢の 250 ms 連続**（peak latch では止めない）
+- gyro の peak 単独（50 dps）経路を廃止（∫≥45° かつ peak≥30 のみ）
+- 開始直後の停止抑制を 1200 ms → 1500 ms
+
+### 0.0.65 低速回内の開始感度
+
+ゆっくり回内すると掌下ラッチ後に 400 ms hold が 3 秒期限を超え
+`motion_too_slow` になる事例（∫107° / peak439 / 3013 ms）があった。0.0.65 では:
+
+- 動作完了期限 3000 → **4500 ms**
+- hold 回内 ∫ 80° → **50°**、積分対象レート 15 → **10 dps**
+- 重力 phi 20° → **15°**、Δz 0.50 → **0.40**
+
+### 0.0.66 録音停止のさらなる誤発火抑制
+
+開始約1秒後に重力だけで停止する事例（phi差165° / gyroほぼ0、使用者は掌下静止
+の認識）があった。0.0.66 では:
+
+- 開始後抑制 1500 → **3000 ms**。抑制中は静かなら掌下基準を更新し終了時に固定
+- 連続成立 250 → **500 ms**
+- 重力は **LP の phi** +（**Δz≥0.50 または Z 符号反転**）。tilt 単独不可
+- 開始条件・案B（挙上待ち延長）は変更しない
+
+### 6軸グラフの読み方
+
+履歴有効ファーム（`GESTURE_DEBUG_HISTORY=1`）では、試行終了時に同じサンプル列からCSVとPNGを
+生成する。上段は加速度XYZ、下段はgyro XYZで、横軸はGOからの経過時間である。
+
+- 灰色のgyro未取得区間は、掌上0.5秒静止が成立する前の正常な期間。
+- 上段の加速度は、重力方向と挙上による線形加速度が重なった値。手を持ち上げたときの山は
+  `a_up` パルスの根拠になるが、軸の符号は右手・左手や装着方向で変わる。
+- 下段のgyro Yは前腕軸まわりの回内・回外を主に表す。回内後の反対方向の山は、録音停止の
+  掌上復帰動作に対応する場合があるため、開始判定の回内と停止判定の回外を時刻で分離して読む。
+- gyro X/Zは挙上時の手首姿勢や複合回転にも現れる。gyro Xの山だけでは回内成立とは判定しない。
+
+判定失敗時は、まず `reset` の理由を確認する。`palm_down_gate_failed` は「3秒を超えた低速」
+ではなく、掌下の重力反転・gyro Y積分角・gyro X/Y比のいずれかが成立しなかったことを示す。
+一方、`motion_too_slow` は掌下連動が一度成立した後、最終400 ms静止までに3秒以上かかった場合に限る。
+
 ## 検証
 
 ```bash
@@ -153,7 +253,7 @@ venv/bin/python gesture_validator.py --trials 1 --window 18 \
   --json-output /tmp/gesture-lift.json
 ```
 
-表示条件: 掌下シェイク、掌上、挙上、掌下で静止、姿勢安定、
+表示条件: 掌上候補、0.5秒静止、挙上、掌下で静止、姿勢安定、
 単一動作、発動、掌上で録音終了。各行に **実測値と閾値** を出す。
 停止は重力 OR gyro_y で判定する。
 `recording_start` のあとホスト `0x00` では止めず、掌上による `recording_stop` を待つ。

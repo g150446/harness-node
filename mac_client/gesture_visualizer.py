@@ -13,9 +13,12 @@ import sys
 import csv
 import argparse
 from collections import defaultdict
+from pathlib import Path
 import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
+
+from imu_trajectory import load_trajectory_csv, plot_trajectory
 
 LABEL_COLORS = {
     "recording_start": "#2196F3",   # 青
@@ -138,6 +141,25 @@ def main():
     parser.add_argument("csv", nargs="?", default="gesture_data.csv",
                         help="入力CSVファイル (default: gesture_data.csv)")
     args = parser.parse_args()
+
+    # New six-axis trajectory CSVs are produced by gesture_validator.py.
+    try:
+        with open(args.csv, newline="") as probe:
+            columns = next(csv.reader(probe), [])
+    except FileNotFoundError:
+        print(f"ERROR: {args.csv} が見つかりません。")
+        sys.exit(1)
+    if "ax_ms2" in columns and "gx_dps" in columns:
+        trajectory = load_trajectory_csv(Path(args.csv))
+        png_path = Path(args.csv).with_suffix(".png")
+        plot_trajectory(
+            trajectory,
+            png_path,
+            title=f"Gesture IMU Data — {args.csv}",
+            show=True,
+        )
+        print(f"PNG保存: {png_path}")
+        return
 
     try:
         gestures = load_csv(args.csv)
