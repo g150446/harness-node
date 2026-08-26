@@ -1,7 +1,7 @@
 # 掌上0.5秒静止→挙上→掌下静止ジェスチャー仕様
 
 対象デバイス: Seeed Studio XIAO nRF52840 Sense  
-対象ファームウェア: HarnessNode `0.0.66` 以降（RMSヒステリシスは`0.0.60`以降）
+対象ファームウェア: HarnessNode `0.0.68` 以降（RMSヒステリシスは`0.0.60`以降）
 
 ## 検証時の二段階プロトコル
 
@@ -26,11 +26,12 @@
   - 0.5秒成立時にジャイロを104 Hz / ±500 dpsでONにし、50 ms整定後、その重力方向を掌上基準とする
   - 加速度だけで水平な掌上/掌下を絶対判別できないため、水平静止は「掌上候補」として扱う
 - 掌向きを問わず、口元へ上げる（物理目安 **約 5 cm**）
-- 上げたあと、**掌上基準から手首を回して掌下** にし、**400 ms** 静止する
-  - 掌下: 重力反転（phi≥15° または Δz≥0.40 または符号反転）と `|∫gyro_y dt| ≥ 50°`（積分対象 |ωy|≥10 dps）。挙上パルス未成立時のみ peak `|gyro_x| / |gyro_y| ≥ 0.42` も要求。一度成立したらその試行中はラッチする
+- 上げたあと、**掌上基準から手首を回して掌下** にし、**500 ms** 静止する
+  - 掌下: 重力反転（phi≥15° または Δz≥0.40 または符号反転）と `|∫gyro_y dt| ≥ 50°`（積分対象 |ωy|≥10 dps）。peak `|gyro_x| / |gyro_y| ≥ 0.42` は、挙上未成立・回内先行・または挙上入口 impulse < 0.30 のときに要求。XY 免除は **回内前 lift かつ入口 +imp≥0.30** のときだけ。一度成立したらその試行中はラッチする
+  - 挙上: `a_up` 正インパルス ≥ **0.30** m/s（0.0.68）
   - 静止進入: 線形加速度 RMS ≤ 3.0 m/s²。進入時のみ `|gyro_y| ≤ 90°/s`
   - hold中: RMS > 3.5 m/s²が2サンプル連続した場合だけ中断する
-  - 保持中の姿勢差 ≤ 15°（静止開始時の重力方向から）
+  - 最終静止: **500** ms（0.0.68）。姿勢差 ≤ 15°
 - 録音中に手のひらを上へ向けると録音終了する。手を下ろすだけでは終了しない
 - ジャイロは録音終了（またはシーケンス失敗）で OFF
 
@@ -54,7 +55,9 @@
 ```text
 board_flat = abs(z / |a|) >= 0.75
 palm_up_dwell = board_flat AND 8.5<=|a|<=11.5 AND rms<=4.0 AND tilt<=20° for 500 ms
-palm_down_after_lift = latch(gravity flip AND gyro_y angle>=50° AND (peak_x/peak_y>=0.42 OR lift_stage!=WAIT_ACCEL))
+lift_before_flip = (|∫ωy| at lift entry) < 50°
+lift_strong = (pos_imp at lift entry) >= 0.30
+palm_down_after_lift = latch(gravity flip AND gyro_y angle>=50° AND (peak_x/peak_y>=0.42 OR (lift_done AND lift_before_flip AND lift_strong)))
 hold_entry = palm_down_latched AND rms<=3.0 AND tilt<=15° AND |ω_y|<=90
 hold_continue = palm_down_latched AND NOT(rms>3.5 for 2 samples) AND tilt<=15°
 motion_complete = lift_start_to_hold_done < 4500 ms
@@ -71,7 +74,7 @@ motion_complete = lift_start_to_hold_done < 4500 ms
 5. 掌上基準から手首が反転してから、短い加速度 RMS 窓が静止を示した時点の重力方向を保持基準とし、その後の角度差が 15° 以内か確認する
 
 変位の二重積分は使わない。約 5 cm はユーザー動作の目安であり、判定閾値ではない。
-加速インパルスと、掌上基準からの反転後の姿勢安定・400 ms 静止を満たす必要がある。減速は任意。
+加速インパルスと、掌上基準からの反転後の姿勢安定・500 ms 静止を満たす必要がある。減速は任意。
 
 ## 録音停止（開始姿勢からの掌上）
 
@@ -98,7 +101,7 @@ WAITING(掌上候補0.5秒) [dwell accept → gyro ON]
 WAIT_HOLD は掌上基準からの反転が取れるまで開始しない
 WAIT_BRAKE では減速パルス、または掌下・gyro静定・4サンプルRMS静止で WAIT_HOLD へ
 挙上開始から4500 ms時点で掌下連動が未成立なら`palm_down_gate_failed`、
-掌下成立後も400 ms最終静止が未完了なら`motion_too_slow`
+掌下成立後も500 ms最終静止が未完了なら`motion_too_slow`
 MATCH → recording (gyro stays ON) → stop palm-up → gyro OFF
 ```
 
@@ -109,16 +112,16 @@ MATCH → recording (gyro stays ON) → stop palm-up → gyro OFF
 | 開始水平 | \|Z 比\| ≥ 0.75 |
 | 掌上候補静止 | 500 ms、\|a\| 8.5–11.5 m/s²、RMS ≤ 4.0 m/s²、姿勢差 ≤ 20° |
 | ジャイロ | 0.5秒静止成立で ON、録音終了で OFF。ODR 104 Hz、FS ±500 dps、整定 50 ms |
-| 上向き加速度 | `a_up` ≥ 0.40 m/s² を2サンプル、正インパルス ≥ 0.04 m/s |
+| 上向き加速度 | `a_up` ≥ 0.40 m/s² を2サンプル、正インパルス ≥ 0.30 m/s |
 | 逆向き減速 | 任意。`a_up` ≤ -0.15 m/s² なら早期に hold へ |
 | パルス形状 | 150 ms以上。固定の最大パルス時間は設けない |
 | hold の掌 | 重力反転 **または** 逆符号 gyro_y（角≥20° / peak≥30 dps） |
 | 保持中の姿勢差 | 静止開始時の重力方向から ≤ **15°** |
 | 静止進入 | 4サンプル RMS ≤ **3.0** m/s²。進入時のみ \|ω_y\|≤**90** dps |
 | hold中RMS | **3.5** m/s²超過が **2サンプル連続**した場合に中断 |
-| 最終静止 | **400** ms |
+| 最終静止 | **500** ms |
 | 挙上開始待ち | gyro起動後 **5000** ms |
-| 動作完了期限 | 挙上開始から400 ms最終静止完了まで **4500 ms未満** |
+| 動作完了期限 | 挙上開始から500 ms最終静止完了まで **4500 ms未満** |
 | 録音停止 | 重力（phi≥20 + Δz≥0.50/符号）**または** gyro_y（∫+peak）。500 ms 連続 |
 | 録音停止 開始抑制 | 3000 ms（期間中に掌下基準を再ロック） |
 
@@ -229,6 +232,27 @@ peak `|gyro_x| / |gyro_y|` 0.42以上を要求する。挙上パルス成立後�
 - 重力は **LP の phi** +（**Δz≥0.50 または Z 符号反転**）。tilt 単独不可
 - 開始条件・案B（挙上待ち延長）は変更しない
 
+### 0.0.67 手首反転のみの開始誤検出抑制
+
+挙上なしの掌返し（flip_only）が、回内中の偽 `a_up` で lift stage を抜け、
+0.0.63 の XY 比免除により録音開始する事例があった（右手 2/2 再現、xy≈0.19–0.22）。
+一方、正しい挙上後の低 xy 回内（xy≈0.20）は MATCH が必要。0.0.67 では:
+
+- 挙上パルス成立時に `|∫ωy|` をスナップショットし、`lift_before_flip = (|∫ωy| < 50°)`
+- XY 比免除は **`lift_done AND lift_before_flip`** のときだけ
+- 回内が先に進んだあとの偽 lift や flip_only は xy≥0.42 が無い限り掌下ラッチしない
+- 挙上と回内が重なり xy が高い正例は従来どおり xy 経路で成立
+
+### 0.0.68 日常生活の誤開始抑制
+
+Android 履歴の日常 FP（hold +imp 中央≈0.14–0.26）がフルシーケンスで MATCH していた。
+0.0.68 では:
+
+- 挙上正インパルス 0.04 → **0.30** m/s
+- XY 免除は `lift_before_flip` **かつ** 入口 +imp≥**0.30**
+- 最終静止 400 → **500** ms
+- match 直前に `match_detail(0x0A)`: xy / lift_imp / roll_at_lift、reason bit=before_flip|xy_waived
+
 ### 6軸グラフの読み方
 
 履歴有効ファーム（`GESTURE_DEBUG_HISTORY=1`）では、試行終了時に同じサンプル列からCSVとPNGを
@@ -243,7 +267,7 @@ peak `|gyro_x| / |gyro_y|` 0.42以上を要求する。挙上パルス成立後�
 
 判定失敗時は、まず `reset` の理由を確認する。`palm_down_gate_failed` は「3秒を超えた低速」
 ではなく、掌下の重力反転・gyro Y積分角・gyro X/Y比のいずれかが成立しなかったことを示す。
-一方、`motion_too_slow` は掌下連動が一度成立した後、最終400 ms静止までに3秒以上かかった場合に限る。
+一方、`motion_too_slow` は掌下連動が一度成立した後、最終500 ms静止までに期限超過した場合に限る。
 
 ## 検証
 

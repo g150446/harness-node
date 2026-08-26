@@ -191,7 +191,7 @@ XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基�
 
 1. 甲側装着で掌を上にし、`|Z|/|a| ≥ 0.75`、`|a|` 8.5–11.5 m/s²、線形加速度RMS ≤ 4.0 m/s²、姿勢差20°以内を0.5秒維持する。成立時にジャイロON、50 ms整定後に使用する。
 2. 成立時の重力方向を掌上基準とし、重力LPで姿勢成分を除いた線形加速度から上向き加速パルスを検出する（物理動作の目安は約5 cm上昇）。
-3. holdは掌上基準からの重力反転とgyro連動条件が成立してから開始し、成立した掌下は試行中ラッチする。線形加速度RMS ≤ 3.0 m/s²で進入し、hold中はRMS > 3.5 m/s²が2サンプル連続した場合だけ中断する。姿勢差15°以内を400 ms維持すると録音を開始する。挙上はgyro起動後5秒以内に開始し、挙上開始から最終静止完了までは3秒未満とする。
+3. holdは掌上基準からの重力反転とgyro連動条件が成立してから開始し、成立した掌下は試行中ラッチする。線形加速度RMS ≤ 3.0 m/s²で進入し、hold中はRMS > 3.5 m/s²が2サンプル連続した場合だけ中断する。姿勢差15°以内を500 ms維持すると録音を開始する。挙上はgyro起動後5秒以内に開始し、挙上開始から最終静止完了までは4.5秒未満とする。挙上 +imp≥0.30、XY免除は回内前liftかつ入口+imp≥0.30のときだけ（0.0.68）。
 
 回外・最終仰角帯・甲上条件は要求しない。詳細は`docs/flex_pronation_gesture.md`を参照する。
 
@@ -307,7 +307,7 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 | `GESTURE_PRONATION_Z_SIGN_MIN_MS2` | 2.0 m/s² | Z符号反転と認める\|az\|下限 |
 | `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.40 m/s² | 上向き加速パルス下限 |
 | `GESTURE_LIFT_BRAKE_MIN_MS2` | 0.15 m/s² | 逆向き減速パルス下限 |
-| `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.04 m/s | 正インパルス下限 |
+| `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.30 m/s | 正インパルス下限（0.0.68） |
 | `GESTURE_LIFT_NEG_IMPULSE_MIN_MS` | 0.015 m/s | 負インパルス下限 |
 | `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
 | `GESTURE_LIFT_PULSE_MIN_MS` | 150 ms | 短すぎる加減速パルスの下限 |
@@ -320,16 +320,18 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 | `GESTURE_STOP_HOLD_MS` | 500 ms | 録音停止の連続成立時間 |
 | `GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS` | 10 dps | hold 回内の積分対象レート |
 | `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 50° | hold 回内の ∫ω_y 下限 |
-| `GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN` | 0.42 | 挙上未成立時のみ peak \|ω_x\| / peak \|ω_y\|（挙上後は不要） |
+| `GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN` | 0.42 | peak \|ω_x\| / peak \|ω_y\| |
+| `GESTURE_LIFT_PREFLIP_MAX_DEG` | 50° | 挙上時 \|∫ωy\| 上限（回内前判定） |
+| `GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS` | 0.30 | XY 免除に必要な入口 +imp |
 | `GESTURE_FINAL_QUIET_RATE_DPS` | 90 dps | hold 進入時のみ |
 | `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 15° | 静止開始時の重力方向からの保持中姿勢差上限 |
 | `GESTURE_FINAL_STILL_RMS_MS2` | 3.0 m/s² | 4サンプル静止RMS上限 |
 | `GESTURE_FINAL_HOLD_RMS_EXIT_MS2` | 3.5 m/s² | hold中のRMS中断閾値 |
 | `GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES` | 2 | hold中断に必要な連続超過数 |
-| `GESTURE_FINAL_HOLD_MS` | 400 ms | 最終静止保持時間 |
+| `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止保持時間（0.0.68） |
 | `GESTURE_GRAVITY_LP_TAU_S` | 0.30 s | 重力推定の低通時定数 |
 | `GESTURE_LIFT_START_TIMEOUT_MS` | 5000 ms | gyro起動後に挙上を開始するまでの期限 |
-| `GESTURE_MOTION_COMPLETE_MAX_MS` | 4500 ms | 挙上開始から400 ms最終静止完了までの上限 |
+| `GESTURE_MOTION_COMPLETE_MAX_MS` | 4500 ms | 挙上開始から500 ms最終静止完了までの上限 |
 | `GESTURE_RETRIGGER_BLOCK_MS` | 3000 ms | 開始直後の停止抑制（基準再ロック）/ 停止後の再開始抑制 |
 | `GYRO_ODR_HZ` | 104 | オンデマンドジャイロ ODR |
 | `GYRO_FULL_SCALE_DPS` | 500 | ジャイロ FS |

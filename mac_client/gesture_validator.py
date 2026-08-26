@@ -88,7 +88,7 @@ DIAG_STAGE_NAMES = {
     0x07: "final_hold_start",
     0x08: "final_ready",
     0x09: "match",
-    0x0A: "gyro_bias_ready",
+    0x0A: "match_detail",
     0x0C: "stop_palm_up",
     0x0D: "gyro_enabled",
     0x0E: "gyro_disabled",
@@ -144,14 +144,16 @@ HOLD_PRONATION_ANGLE_MIN_DEG = 15.0
 HOLD_PRONATION_Z_RATIO_DONE = 0.40
 HOLD_GYRO_ANGLE_MIN_DEG = 50.0
 HOLD_GYRO_INTEGRATE_RATE_DPS = 10.0
-# Firmware requires xy ratio only while lift stage is still WAIT_ACCEL.
+# Firmware waives xy only when lift is early (pre-flip) AND strong.
 HOLD_GYRO_XY_PEAK_RATIO_MIN = 0.42
+LIFT_PREFLIP_MAX_DEG = 50.0
+LIFT_XY_WAIVER_IMPULSE_MIN_MS = 0.30
 # Final: upward acceleration pulse, braking pulse, stable pose, then hold.
-FINAL_POS_IMPULSE_MIN_MS = 0.04
+FINAL_POS_IMPULSE_MIN_MS = 0.30
 FINAL_NEG_IMPULSE_MIN_MS = 0.015
 FINAL_BRAKE_RATIO_MIN = 0.05
 FINAL_TILT_MAX_DEG = 15.0
-FINAL_HOLD_MIN_MS = 400
+FINAL_HOLD_MIN_MS = 500
 MOTION_COMPLETE_MAX_MS = 4500
 FINAL_STILL_RMS_MS2 = 3.0
 FINAL_HOLD_RMS_EXIT_MS2 = 3.5
@@ -2070,8 +2072,8 @@ def run_self_test() -> int:
     assert HOLD_GYRO_INTEGRATE_RATE_DPS == 10.0
     assert MOTION_COMPLETE_MAX_MS == 4500
     assert FINAL_TILT_MAX_DEG == 15.0
-    assert FINAL_HOLD_MIN_MS == 400
-    eligible = (0.90, 20.0, 0.04, 0.015, 15.0, 400)
+    assert FINAL_HOLD_MIN_MS == 500
+    eligible = (0.90, 20.0, 0.30, 0.015, 15.0, 500)
     assert gesture_gate_eligible(*eligible)
     assert gesture_gate_eligible(0.75, *eligible[1:])
     assert not gesture_gate_eligible(0.74, *eligible[1:])
@@ -2232,8 +2234,8 @@ def run_self_test() -> int:
     )
     assert start_condition.status == "PASS"
     assert "peak=66.0dps" in start_condition.detail
-    assert not gesture_gate_eligible(0.90, 20.0, 0.039, *eligible[3:])
-    assert not gesture_gate_eligible(0.90, 20.0, 0.04, 0.015, 15.1, 400)
+    assert not gesture_gate_eligible(0.90, 20.0, 0.29, *eligible[3:])
+    assert not gesture_gate_eligible(0.90, 20.0, 0.30, 0.015, 15.1, 500)
     assert not gesture_gate_eligible(*eligible[:-1], 399)
     assert not gesture_gate_eligible(*eligible, shake_ptp_ms2=4.9)
     assert not gesture_gate_eligible(*eligible, shake_ptp_ms2=6.0, shake_mean_ms2=3.0)

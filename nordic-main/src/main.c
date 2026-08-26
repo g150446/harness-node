@@ -167,6 +167,9 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS     10.0f
 #define GESTURE_HOLD_GYRO_ANGLE_MIN_DEG         50.0f
 #define GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN      0.42f
+/* XY waiver only if lift fired before pronation AND impulse is strong. */
+#define GESTURE_LIFT_PREFLIP_MAX_DEG            50.0f
+#define GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS    0.30f
 #define GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS     20.0f
 #define GESTURE_STOP_GYRO_ANGLE_MIN_DEG          45.0f
 #define GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS     30.0f
@@ -178,13 +181,14 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 /* Final: upward acceleration pulse, braking pulse, then a quiet hold. */
 #define GESTURE_LIFT_ACCEL_MIN_MS2               0.40f
 #define GESTURE_LIFT_BRAKE_MIN_MS2               0.15f
-#define GESTURE_LIFT_POS_IMPULSE_MIN_MS           0.04f
+/* 0.0.68: daily FP had +imp ~0.10–0.26; require a clearer arm lift. */
+#define GESTURE_LIFT_POS_IMPULSE_MIN_MS           0.30f
 #define GESTURE_LIFT_NEG_IMPULSE_MIN_MS           0.015f
 #define GESTURE_LIFT_BRAKE_RATIO_MIN              0.05f
 #define GESTURE_LIFT_PULSE_MIN_MS                  150
 #define GESTURE_LIFT_CONSECUTIVE_SAMPLES             2
 #define GESTURE_LIFT_FINAL_TILT_MAX_DEG           15.0f
-#define GESTURE_FINAL_HOLD_MS                     400
+#define GESTURE_FINAL_HOLD_MS                     500
 #define GESTURE_LIFT_START_TIMEOUT_MS            5000
 #define GESTURE_MOTION_COMPLETE_MAX_MS           4500
 #define GESTURE_FINAL_STILL_RMS_MS2              3.0f
@@ -211,6 +215,9 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_DIAG_FINAL_HOLD_START         0x07
 #define GESTURE_DIAG_FINAL_READY              0x08
 #define GESTURE_DIAG_MATCH                    0x09
+/* Match metrics: v1=xy_ratio, v2=pos_imp_at_lift, v3=roll_at_lift.
+ * reason bit0=lift_before_flip, bit1=xy_waived. */
+#define GESTURE_DIAG_MATCH_DETAIL             0x0A
 #define GESTURE_DIAG_STOP_PALM_UP             0x0C
 #define GESTURE_DIAG_GYRO_ENABLED             0x0D
 #define GESTURE_DIAG_GYRO_DISABLED            0x0E
@@ -467,6 +474,9 @@ static float gesture_lift_final_tilt_deg;
 static float gesture_lift_max_hold_tilt_deg;
 static bool gesture_lift_hold_axis_valid;
 static bool gesture_lift_pose_failed;
+static bool gesture_lift_before_flip;
+static float gesture_lift_pos_impulse_at_entry_ms;
+static float gesture_lift_roll_at_entry_deg;
 static bool gesture_palm_down_latched;
 static int64_t gesture_lift_event_start_ms;
 static uint8_t gesture_lift_accel_samples;
@@ -1233,9 +1243,13 @@ static bool gesture_gyro_hold_flip_ok(void)
         gesture_gyro_x_peak_abs_dps >=
             gesture_gyro_peak_abs_dps *
                 GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN;
-    /* Accel lift pulse already proves arm motion; require xy coupling only
-     * while still waiting for that pulse (rejects pure wrist roll alone). */
-    bool lift_stage_ok = gesture_lift_stage != GESTURE_LIFT_WAIT_ACCEL;
+    /* Accel lift waives xy only when it is early (pre-flip) AND strong enough
+     * to look like an intentional arm raise (rejects daily micro-lifts). */
+    bool lift_stage_ok =
+        gesture_lift_stage != GESTURE_LIFT_WAIT_ACCEL &&
+        gesture_lift_before_flip &&
+        gesture_lift_pos_impulse_at_entry_ms >=
+            GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS;
 
     return angle_ok && (lift_coupled || lift_stage_ok);
 }
@@ -1441,6 +1455,9 @@ static void reset_gesture_motion(void)
     gesture_lift_max_hold_tilt_deg = 0.0f;
     gesture_lift_hold_axis_valid = false;
     gesture_lift_pose_failed = false;
+    gesture_lift_before_flip = false;
+    gesture_lift_pos_impulse_at_entry_ms = 0.0f;
+    gesture_lift_roll_at_entry_deg = 0.0f;
     gesture_palm_down_latched = false;
     gesture_lift_event_start_ms = 0;
     gesture_lift_accel_samples = 0;
@@ -1733,6 +1750,9 @@ static void retry_lift_pulse(void)
     gesture_lift_final_tilt_deg = 0.0f;
     gesture_lift_hold_axis_valid = false;
     gesture_lift_pose_failed = false;
+    gesture_lift_before_flip = false;
+    gesture_lift_pos_impulse_at_entry_ms = 0.0f;
+    gesture_lift_roll_at_entry_deg = 0.0f;
     gesture_lift_event_start_ms = 0;
     gesture_lift_accel_samples = 0;
     gesture_lift_brake_samples = 0;
@@ -1958,11 +1978,14 @@ static void report_palm_down_gate(float phi_deg, float z_gravity_ratio,
                           signed_roll, GESTURE_HOLD_GYRO_ANGLE_MIN_DEG,
                           gesture_gyro_peak_abs_dps);
     } else if (xy_ratio < GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN &&
-               gesture_lift_stage == GESTURE_LIFT_WAIT_ACCEL) {
+               !(gesture_lift_stage != GESTURE_LIFT_WAIT_ACCEL &&
+                 gesture_lift_before_flip &&
+                 gesture_lift_pos_impulse_at_entry_ms >=
+                     GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS)) {
         send_gesture_diag(GESTURE_DIAG_PALM_DOWN_GATE,
                           GESTURE_DIAG_REASON_PALM_DOWN_XY_RATIO_LOW,
                           xy_ratio, GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN,
-                          gesture_gyro_x_peak_abs_dps);
+                          gesture_lift_pos_impulse_at_entry_ms);
     }
 }
 
@@ -2260,8 +2283,20 @@ static void process_gesture_sample(float ax, float ay, float az,
                     GESTURE_LIFT_CONSECUTIVE_SAMPLES &&
                 gesture_lift_pos_impulse_ms >=
                     GESTURE_LIFT_POS_IMPULSE_MIN_MS) {
+                float roll_at_lift = fabsf(gesture_gyro_roll_deg);
+
+                gesture_lift_roll_at_entry_deg = roll_at_lift;
+                gesture_lift_pos_impulse_at_entry_ms =
+                    gesture_lift_pos_impulse_ms;
+                gesture_lift_before_flip =
+                    roll_at_lift < GESTURE_LIFT_PREFLIP_MAX_DEG;
                 gesture_lift_stage = GESTURE_LIFT_WAIT_BRAKE;
                 gesture_lift_brake_samples = 0;
+                printk(">>> Gesture lift pulse: roll=%.1f before_flip=%d "
+                       "imp=%.3f\n",
+                       (double)roll_at_lift,
+                       gesture_lift_before_flip ? 1 : 0,
+                       (double)gesture_lift_pos_impulse_at_entry_ms);
             }
         } else if (gesture_lift_stage == GESTURE_LIFT_WAIT_BRAKE) {
             gesture_lift_net_impulse_ms += a_up * dt_s;
@@ -2464,6 +2499,22 @@ static void process_gesture_sample(float ax, float ay, float az,
                                   gesture_lift_pos_impulse_ms,
                                   (float)hold_ms,
                                   gesture_lift_final_tilt_deg);
+                {
+                    float xy = gesture_gyro_hold_xy_peak_ratio();
+                    bool xy_waived =
+                        gesture_lift_before_flip &&
+                        gesture_lift_pos_impulse_at_entry_ms >=
+                            GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS;
+                    uint8_t detail_reason =
+                        (gesture_lift_before_flip ? 0x01 : 0x00) |
+                        (xy_waived ? 0x02 : 0x00);
+
+                    send_gesture_diag(GESTURE_DIAG_MATCH_DETAIL,
+                                      detail_reason,
+                                      xy,
+                                      gesture_lift_pos_impulse_at_entry_ms,
+                                      gesture_lift_roll_at_entry_deg);
+                }
                 send_gesture_diag(GESTURE_DIAG_MATCH,
                                   GESTURE_DIAG_REASON_NONE,
                                   gesture_pronation_phi_deg,

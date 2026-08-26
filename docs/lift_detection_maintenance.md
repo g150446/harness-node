@@ -9,7 +9,7 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 
 1. 掌上候補で 0.5 秒静止する（成立時にジャイロ ON）
 2. 手を上げる（掌向きは問わない）
-3. 掌を下にして 400 ms 静止
+3. 掌を下にして 500 ms 静止
 4. 録音中に手のひらを上へ向けると録音終了（手下ろしでは終了しない。重力 OR gyro_y）
 5. 録音終了でジャイロ OFF
 
@@ -24,11 +24,11 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
    - 成立時 `gyro_set_enabled(true)`（104 Hz / ±500 dps）し、その姿勢を掌上基準とする。
 2. `GESTURE_HOLDING_FINAL`
    - `WAIT_ACCEL` / `WAIT_BRAKE`: `a_up` パルス。掌向きは見ない。
-   - `WAIT_HOLD`: 掌上基準からの反転（重力 OR 逆符号 gyro_y）後、RMS 静止と 400 ms hold。
+   - `WAIT_HOLD`: 掌上基準からの反転（重力 OR 逆符号 gyro_y）後、RMS 静止と 500 ms hold。
    - 掌下の重力＋gyro連動条件は一度成立したらその試行中ラッチする。
    - hold **進入時のみ** `|ω_y| ≤ 90 dps`、RMS ≤ 3.0。進入後はRMS > 3.5が2サンプル連続した場合だけ中断する。
    - gyro起動後、5000 ms以内に挙上が始まらなければ `final_accel_missing`。
-   - 挙上開始から4500 ms時点で掌下連動が未成立なら`palm_down_gate_failed`、成立済みで400 ms holdが未完了なら`motion_too_slow`。
+   - 挙上開始から4500 ms時点で掌下連動が未成立なら`palm_down_gate_failed`、成立済みで500 ms holdが未完了なら`motion_too_slow`。
 3. 録音中
    - 開始時の重力 LP を基準に保存し、掌上反転（重力 OR gyro_y）で録音停止。
    - 手下ろしでは止めない。`motion_active` でも止めない。停止後ジャイロ OFF。
@@ -56,18 +56,20 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 | `GESTURE_STOP_HOLD_MS` | 500 ms | 録音停止の連続成立時間 |
 | `GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS` | 10 dps | hold 回内の積分対象レート |
 | `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 50° | hold 回内の ∫ω_y |
-| `GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN` | 0.42 | 挙上未成立時のみ: peak \|ω_x\| / peak \|ω_y\|（挙上後は不要） |
+| `GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN` | 0.42 | peak \|ω_x\| / peak \|ω_y\| |
+| `GESTURE_LIFT_PREFLIP_MAX_DEG` | 50° | 挙上成立時の \|∫ωy\| 上限（未満=回内前） |
+| `GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS` | 0.30 | XY 免除に必要な入口 +imp |
+| `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.30 | 挙上正インパルス下限（0.0.68） |
+| `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止（0.0.68） |
 | `GESTURE_FINAL_QUIET_RATE_DPS` | 90 dps | hold **進入時のみ** |
 | `GESTURE_PRONATION_MIN_DEG` | 15° | hold 反転角（phi）。Z 比 0.40 または符号反転でも成立 |
 | `GESTURE_PRONATION_Z_RATIO_DONE` | 0.40 | hold 反転の Z 比変化 |
 | `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.40 m/s² | 上向き加速パルス下限 |
-| `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.04 m/s | 正インパルス下限 |
 | `GESTURE_LIFT_PULSE_MIN_MS` | 150 ms | 短すぎるパルスの下限 |
 | `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 15° | hold 中の姿勢差上限 |
 | `GESTURE_FINAL_STILL_RMS_MS2` | 3.0 m/s² | 静止進入 RMS 上限 |
 | `GESTURE_FINAL_HOLD_RMS_EXIT_MS2` | 3.5 m/s² | hold中のRMS中断閾値 |
 | `GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES` | 2 | 中断に必要な連続超過数 |
-| `GESTURE_FINAL_HOLD_MS` | 400 ms | 最終静止時間 |
 | `GESTURE_LIFT_START_TIMEOUT_MS` | 5000 ms | gyro起動後に挙上を開始するまでの期限 |
 | `GESTURE_MOTION_COMPLETE_MAX_MS` | 4500 ms | 挙上開始から最終静止完了まで。4.5秒以上は不成立 |
 | `GESTURE_RETRIGGER_BLOCK_MS` | 3000 ms | 開始直後の停止抑制（基準再ロック）/ 停止後の再開始抑制 |
@@ -142,9 +144,10 @@ cd nordic-main
   peak 42.6 dps は `0.0.54` の停止条件では不成立
 - 挙上開始期限5 s、動作完了期限4.5 s、静止進入RMS 3.0、保持中RMS 3.5超過×2 / tilt 15°、進入時 gyro quiet 90 dps
 - 録音開始の掌下 hold は重力変化に加え、`|∫gyro_y|≥50°`（積分 |ωy|≥10 dps）、
-  （挙上未成立時のみ）`peak|gyro_x|/peak|gyro_y|≥0.42` をすべて満たす。
-  挙上パルス成立後は XY 比を要求しない（0.0.63）。動作完了期限は 4500 ms（0.0.65）。
-  手首回転のみは成立させない。録音停止は 0.0.66 の厳格条件。
+  および `peak|gyro_x|/peak|gyro_y|≥0.42`（ただし挙上が回内前に立った
+  `lift_before_flip` かつ入口 +imp≥0.30 のときだけ XY 免除、0.0.68）を満たす。
+  動作完了期限は 4500 ms（0.0.65）。手首回転のみ・日常の微小挙上は成立させない。
+  録音停止は 0.0.66 の厳格条件。
 
 ## 保守上の注意
 
@@ -160,7 +163,7 @@ cd nordic-main
 - 録音停止は掌下基準からの掌上（重力: LP phi + Δz≥0.50/符号、または gyro ∫+peak）。
   抑制後 500 ms 連続（0.0.66）。tilt 単独・gyro peak 単独では止めない。手下ろしと
   3軸 `motion_active` では止めない。
-- 最終静止は進入RMS 3.0 m/s²以下、保持中は3.5 m/s²超過2サンプル連続で中断、継続400 ms。
+- 最終静止は進入RMS 3.0 m/s²以下、保持中は3.5 m/s²超過2サンプル連続で中断、継続500 ms。
   挙上開始待ちは5 s、動作完了は4.5 s未満。
 - 減速パルスは任意。取れない場合も掌下・gyro静定・4サンプルRMS静止でholdへ進む。
 - 実機ログでは掌上候補の Z 比・静止時間、加速度/ジャイロ6軸、正負インパルス、姿勢差、
@@ -171,7 +174,7 @@ cd nordic-main
 - `nordic-main/src/main.c`: 状態機械、閾値、BLE 診断
 - `mac_client/gesture_validator.py`: BLE 試験、診断表示、JSON / 6軸グラフ、`--start-only`
 - `mac_client/imu_trajectory.py`: 6軸バッチ復元・CSV・PNG
-- `docs/flex_pronation_gesture.md`: 仕様正本（現行 0.0.66）
+- `docs/flex_pronation_gesture.md`: 仕様正本（現行 0.0.68）
 - `mac_client/gesture_dataset_collector.py`: 6秒のラベル付き6軸収集
 - `mac_client/gesture_dataset_analyzer.py`: 左右比較、特徴抽出、疑似横加速度感度解析
 - `mac_client/imu_trajectory.py`: 6軸バッチ復元、CSV、グラフ共通処理
