@@ -10,7 +10,7 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 1. 掌上候補で 0.5 秒静止する（成立時にジャイロ ON）
 2. 手を上げる（掌向きは問わない）
 3. 掌を下にして 500 ms 静止
-4. 録音中に手のひらを上へ向けると録音終了（手下ろしでは終了しない。重力 OR gyro_y）
+4. 録音中に挙上と逆向きの線形パルス（手下ろし）で録音終了
 5. 録音終了でジャイロ OFF
 
 物理的な上昇距離は操作の目安であり、判定では変位を積分しない。
@@ -30,8 +30,8 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
    - gyro起動後、5000 ms以内に挙上が始まらなければ `final_accel_missing`。
    - 挙上開始から4500 ms時点で掌下連動が未成立なら`palm_down_gate_failed`、成立済みで500 ms holdが未完了なら`motion_too_slow`。
 3. 録音中
-   - 開始時の重力 LP を基準に保存し、掌上反転（重力 OR gyro_y）で録音停止。
-   - 手下ろしでは止めない。`motion_active` でも止めない。停止後ジャイロ OFF。
+   - MATCH 時に挙上軸 `L` を固定し、逆向き線形パルス + settle で録音停止。
+   - 掌上のみ・静止のみでは止めない。停止後ジャイロ OFF。
 
 上向き加速と逆向き減速は、連続サンプル数、正負インパルス、
 減速/加速インパルス比を組み合わせて判定する。明瞭な減速が取れなくても、
@@ -47,15 +47,14 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 | `GESTURE_START_QUIET_ACCEL_MS2` | 4.0 m/s² | 掌上候補の線形加速度/RMS上限 |
 | `GYRO_ODR_HZ` / `GYRO_FULL_SCALE_DPS` | 104 / 500 | オンデマンドジャイロ |
 | `GESTURE_GYRO_SETTLE_MS` | 50 ms | ジャイロ整定 |
-| `GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS` | 20 dps | 録音停止の積分対象レート |
-| `GESTURE_STOP_GYRO_ANGLE_MIN_DEG` | 45° | 録音停止の ∫ω_y |
-| `GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS` | 30 dps | 録音停止の積分角経路に必要なpeak |
-| `GESTURE_STOP_GYRO_PEAK_DPS` | 50 dps | 互換用（peak単独停止は0.0.64で廃止） |
-| `GESTURE_OUTBOUND_MIN_DEG` | 20° | 録音停止の重力 phi 必須（LP） |
-| `GESTURE_OUTBOUND_Z_RATIO_DONE` | 0.50 | 録音停止の Δz 必須副条件 |
-| `GESTURE_STOP_HOLD_MS` | 500 ms | 録音停止の連続成立時間 |
+| `GESTURE_STOP_OPP_ACCEL_MIN_MS2` | 0.25 | 録音停止の逆向き a 下限（0.0.71） |
+| `GESTURE_STOP_OPP_IMPULSE_MIN_MS` | 0.10 | 録音停止の負インパルス下限 |
+| `GESTURE_STOP_OPP_IMPULSE_LIFT_RATIO` | 0.20 | 負インパルス ≥ ratio×lift |
+| `GESTURE_STOP_OPP_IMPULSE_LIFT_CAP_MS` | 0.35 | lift 相対閾値の上限 |
+| `GESTURE_STOP_OPP_PULSE_MIN_MS` / `MAX` | 60 / 2000 | パルス時間窓（車両の長G除外） |
+| `GESTURE_STOP_SETTLE_MS` | 80 ms | パルス後の quiet 保持 |
 | `GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS` | 10 dps | hold 回内の積分対象レート |
-| `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 50° | hold 回内の ∫ω_y |
+| `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 30° | hold 回内の ∫ω_y（0.0.70） |
 | `GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN` | 0.42 | peak \|ω_x\| / peak \|ω_y\| |
 | `GESTURE_LIFT_PREFLIP_MAX_DEG` | 50° | 挙上成立時の \|∫ωy\| 上限（未満=回内前） |
 | `GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS` | 0.30 | XY 免除に必要な入口 +imp |
@@ -84,24 +83,24 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 
 - `outbound_start`: 掌上候補の Z 比、線形加速度
 - `outbound_ready`: 掌上静止時間、Z 比、線形加速度
-- `outbound_gyro`: ∫ω_y、peak dps、sign（掌上時と停止時）
+- `outbound_gyro`: ∫ω_y、peak dps、sign（開始 hold 時）
 - `gyro_enabled` / `gyro_disabled`
 - `final_sample` / `hold_sample`
 - `final_hold_start` / `final_ready` / `match`
 - `motion_complete`: 挙上開始から最終静止完了までの時間、gyro Y peak、積分角
 - `palm_down_gate`: 重力反転、gyro Y積分角、peak gyro X/Y比の不足理由
-- `stop_palm_up` + 直後の `outbound_gyro`（停止は重力 OR gyro）
+- `stop_hand_lower` (0x0C): opp_imp / peak a_opp / pulse_ms（手下ろし停止）
 - `wait_reject` reason `final_hold_interrupted`: RMS / tilt / \|gy\|
-- `reset` reason `palm_down_gate_failed`: 3秒時点で掌下連動条件が一度も成立しなかった
-- `reset` reason `motion_too_slow`: 掌下成立後も最終静止が3秒以内に完了しなかった
+- `reset` reason `palm_down_gate_failed`: 掌下連動条件が期限までに一度も成立しなかった
+- `reset` reason `motion_too_slow`: 掌下成立後も最終静止が期限内に完了しなかった
 
 validatorは開始と停止を二段階で案内する。Ping音の`GO`後は`START OK`まで掌下を維持し、
-1.3秒後のGlass音と`STOP GO`が出てから掌上へ戻す。STOP GO前の停止は失敗として区別する。
+Glass音と`STOP GO`のあとに**腕を下ろす**。STOP GO前の停止は失敗として区別する。
 開始イベントが発生しなかった試行では停止合図も出ず、停止動作の所要時間は開始判定に混ぜない。
 
 履歴有効ファームのPNGは、上段が加速度XYZ、下段がgyro XYZ、灰色部分がgyro未取得期間である。
-gyro Yの回内・回外ピークは、`START OK` 前後（録音開始）と `STOP GO` 後（録音停止）を分けて
-確認する。gyro X/Zのピークは挙上に伴う複合回転でも生じるため、単独で掌下成立とは判定しない。
+gyro Yの回内は `START OK` 前後（録音開始）で確認する。停止は加速度の逆向きパルス側を見る。
+gyro X/Zのピークは挙上に伴う複合回転でも生じるため、単独で掌下成立とは判定しない。
 
 変更後は少なくとも次を実行する。
 
@@ -130,44 +129,31 @@ cd nordic-main
 
 実機試験では、正例を 5 回実施して 4/5 以上を目安とする。続いて、
 掌上のまま上げる、持続横 G、歩行で no-match を確認する。車載振動は安全に
-実施できる場合だけ追加する。停止は手下ろしではなく掌上で確認する。
+実施できる場合だけ追加する。停止は**手下ろし**で確認する（掌上では止めない）。
 
-2026-08-22 の確認結果（`0.0.54`、BLE OTA、slot0 active+confirmed）:
+2026-08-27 の確認結果（`0.0.70`→`0.0.71`）:
 
 - validator self-test: PASS
-- `xiao_ble/nrf52840/sense` + sysbuild: PASS
-- 掌下静止を挟む正例: 4/4 PASS。録音開始相当から掌上停止まで
-  6.045 / 5.895 / 4.905 / 7.875 s
-- 全4試行で静止中の早期停止なし。4.905 s の試行は最後の意図的な掌上が
-  5秒より95 ms早く、重力 phi 16.71°で停止した
-- `0.0.53` で再現した静止時の積分角 25.1° / peak 17.3 dps と、短い
-  peak 42.6 dps は `0.0.54` の停止条件では不成立
-- 挙上開始期限5 s、動作完了期限4.5 s、静止進入RMS 3.0、保持中RMS 3.5超過×2 / tilt 15°、進入時 gyro quiet 90 dps
-- 録音開始の掌下 hold は重力変化に加え、`|∫gyro_y|≥50°`（積分 |ωy|≥10 dps）、
-  および `peak|gyro_x|/peak|gyro_y|≥0.42`（ただし挙上が回内前に立った
-  `lift_before_flip` かつ入口 +imp≥0.30 のときだけ XY 免除、0.0.68）を満たす。
-  動作完了期限は 4500 ms（0.0.65）。手首回転のみ・日常の微小挙上は成立させない。
-  録音停止は 0.0.66 の厳格条件。
+- Mac 通し: 開始 + 手下ろし停止 PASS（opp_imp≈1.4）
+- Android「リンゴ」履歴: 旧閾値では約 13 s で opp_imp≈0.189 の弱い停止。0.0.71 で緩和
+- hold `|∫gyro_y|` は 50°→30°（0.0.70）。自然な掌下 ∫≈35° を通す
+- 録音停止は挙上軸逆向きパルス + settle（0.0.69+）。掌上経路は廃止
 
 ## 保守上の注意
 
-- ジャイロはオンデマンド（掌上0.5秒静止成立〜録音終了）。待機時は ODR=0。閾値変更時は重力 OR ジャイロの両方を確認する。
+- ジャイロはオンデマンド（掌上0.5秒静止成立〜録音終了）。待機時は ODR=0。
 - hold 中の gyro quiet は **進入時のみ**。進入後に \|ω_y\| で中断しない。
 - 掌下の重力＋gyro連動成立は試行中ラッチし、停止時の逆回転で積分角が減っても取り消さない。
-- 単一閾値を下げるだけで合格率を上げない。開始時の水平・静止条件と掌下 hold（20°）を維持する。
-- 開始感度を上げるため掌上水平（Z比0.75）、0.5秒連続静止、候補中の姿勢差20°とする。誤検出は後段の挙上パルス、回内gyro連動、掌下holdで抑える。
+- 単一閾値を下げるだけで合格率を上げない。開始の水平・静止と掌下 hold を維持する。
 - 掌上基準は0.5秒静止成立時の重力 LP。成立瞬間の raw では武装しない。
 - 重力 LP はパルス開始まで追従し、hold の姿勢基準は静止進入時に固定する。
-- 録音停止の基準は開始時の重力 LP を仮置きし、開始後 3000 ms 抑制中に静かなら再ロック。
-  `reset_gesture_sequence()` では消さない。
-- 録音停止は掌下基準からの掌上（重力: LP phi + Δz≥0.50/符号、または gyro ∫+peak）。
-  抑制後 500 ms 連続（0.0.66）。tilt 単独・gyro peak 単独では止めない。手下ろしと
-  3軸 `motion_active` では止めない。
+- 録音停止は MATCH 時の挙上軸 `L` を固定し、開始後 3000 ms 抑制のあと逆向きパルス + settle。
+  `reset_gesture_sequence()` では消さない。掌上・静止のみでは止めない。
 - 最終静止は進入RMS 3.0 m/s²以下、保持中は3.5 m/s²超過2サンプル連続で中断、継続500 ms。
   挙上開始待ちは5 s、動作完了は4.5 s未満。
 - 減速パルスは任意。取れない場合も掌下・gyro静定・4サンプルRMS静止でholdへ進む。
 - 実機ログでは掌上候補の Z 比・静止時間、加速度/ジャイロ6軸、正負インパルス、姿勢差、
-  hold 時間、reset reason を確認する。
+  hold 時間、`stop_hand_lower` の opp_imp/peak/pulse、reset reason を確認する。
 
 ## 関連ファイル
 

@@ -89,7 +89,7 @@ DIAG_STAGE_NAMES = {
     0x08: "final_ready",
     0x09: "match",
     0x0A: "match_detail",
-    0x0C: "stop_palm_up",
+    0x0C: "stop_hand_lower",
     0x0D: "gyro_enabled",
     0x0E: "gyro_disabled",
     0x0F: "outbound_gyro",
@@ -132,17 +132,27 @@ START_QUIET_HOLD_MS = 500
 START_QUIET_ACCEL_MAX_MS2 = 4.0
 SHAKE_PTP_MIN_MS2 = 5.0
 SHAKE_MEAN_RATIO_MAX = 0.4
-# Recording-stop palm-up (0.0.66+): LP phi + strong Z; 500 ms; 3s post-start inhibit.
+# Recording-stop hand-lower (0.0.69): reverse lift-axis pulse + settle.
 PRONATION_ANGLE_MIN_DEG = 20.0
 PRONATION_TILT_MIN_DEG = 30.0
 PRONATION_START_DEG = 20.0
 PRONATION_Z_RATIO_START = 0.50
 PRONATION_Z_RATIO_DONE = 0.50
-STOP_HOLD_MS = 500
 STOP_POST_START_INHIBIT_MS = 3000
+STOP_OPP_ACCEL_MIN_MS2 = 0.25
+STOP_OPP_CONSECUTIVE_SAMPLES = 2
+STOP_OPP_IMPULSE_MIN_MS = 0.10
+STOP_OPP_IMPULSE_LIFT_RATIO = 0.20
+STOP_OPP_IMPULSE_LIFT_CAP_MS = 0.35
+STOP_OPP_PULSE_MIN_MS = 60
+STOP_OPP_PULSE_MAX_MS = 2000
+STOP_SETTLE_MS = 80
+STOP_SETTLE_LINEAR_MS2 = 4.0
+# Legacy aliases kept for older notes / self-test migration.
+STOP_HOLD_MS = STOP_SETTLE_MS
 HOLD_PRONATION_ANGLE_MIN_DEG = 15.0
 HOLD_PRONATION_Z_RATIO_DONE = 0.40
-HOLD_GYRO_ANGLE_MIN_DEG = 50.0
+HOLD_GYRO_ANGLE_MIN_DEG = 30.0
 HOLD_GYRO_INTEGRATE_RATE_DPS = 10.0
 # Firmware waives xy only when lift is early (pre-flip) AND strong.
 HOLD_GYRO_XY_PEAK_RATIO_MIN = 0.42
@@ -162,7 +172,6 @@ FINAL_QUIET_RATE_DPS = 90.0
 OUTBOUND_GYRO_INTEGRATE_RATE_DPS = 20.0
 OUTBOUND_GYRO_ANGLE_MIN_DEG = 45.0
 OUTBOUND_GYRO_ANGLE_PEAK_MIN_DPS = 30.0
-# Peak-only stop removed in firmware 0.0.64; constant kept for legacy notes.
 OUTBOUND_GYRO_PEAK_DPS = 50.0
 STOP_GYRO_INTEGRATE_RATE_DPS = 20.0
 STOP_GYRO_ANGLE_MIN_DEG = 45.0
@@ -255,6 +264,28 @@ def gesture_gate_eligible(
     )
 
 
+def recording_stop_hand_lower_eligible(
+    opp_impulse_ms: float,
+    opp_peak_ms2: float = 0.0,
+    pulse_ms: float = 0.0,
+    lift_impulse_ms: float = 0.0,
+) -> bool:
+    """Mirror firmware recording-stop hand-lower pulse (0.0.71)."""
+    need_imp = min(
+        STOP_OPP_IMPULSE_LIFT_CAP_MS,
+        max(
+            STOP_OPP_IMPULSE_MIN_MS,
+            lift_impulse_ms * STOP_OPP_IMPULSE_LIFT_RATIO,
+        ),
+    )
+    return (
+        opp_impulse_ms >= need_imp
+        and opp_peak_ms2 >= STOP_OPP_ACCEL_MIN_MS2
+        and pulse_ms >= STOP_OPP_PULSE_MIN_MS
+        and pulse_ms <= STOP_OPP_PULSE_MAX_MS
+    )
+
+
 def recording_stop_palm_up_eligible(
     palm_up_deg: float,
     palm_up_tilt_deg: float = 0.0,
@@ -263,17 +294,10 @@ def recording_stop_palm_up_eligible(
     gyro_roll_deg: float = 0.0,
     gyro_peak_dps: float = 0.0,
 ) -> bool:
-    """Mirror firmware recording-stop palm-up (gravity OR gyro_y), 0.0.66+."""
-    del palm_up_tilt_deg  # tilt alone must not stop (0.0.66)
-    z_ok = z_ratio_delta >= PRONATION_Z_RATIO_DONE or z_sign_flip
-    gravity_ok = abs(palm_up_deg) >= PRONATION_ANGLE_MIN_DEG and z_ok
-    gyro_ok = (
-        abs(gyro_roll_deg) >= STOP_GYRO_ANGLE_MIN_DEG
-        and gyro_peak_dps >= STOP_GYRO_ANGLE_PEAK_MIN_DPS
-    )
-    if STOP_GYRO_PEAK_ONLY:
-        gyro_ok = gyro_ok or gyro_peak_dps >= STOP_GYRO_PEAK_DPS
-    return gravity_ok or gyro_ok
+    """Deprecated palm-up stop (removed in 0.0.69). Always False."""
+    del palm_up_deg, palm_up_tilt_deg, z_ratio_delta, z_sign_flip
+    del gyro_roll_deg, gyro_peak_dps
+    return False
 
 
 def sequence_reset_seen(diagnostics: list[dict[str, Any]]) -> bool:
@@ -971,10 +995,10 @@ def format_event(event: GestureEvent) -> str:
             suffix = (
                 f" dwell={v1:.0f}ms z={v2:.2f} linear={v3:.2f}m/s^2"
             )
-        elif stage == "stop_palm_up":
+        elif stage in ("stop_hand_lower", "stop_palm_up"):
             suffix = (
-                f" pronation={v1:+.1f}deg tilt_3d={v2:.1f}deg "
-                f"gyro_roll={v3:+.1f}deg"
+                f" opp_imp={v1:.3f}m/s peak={v2:.2f}m/s^2 "
+                f"pulse={v3:.0f}ms"
             )
         elif stage == "gyro_enabled":
             suffix = f" odr={v1:.0f}Hz bias_y={v2:+.2f} valid={v3:.0f}"
@@ -1119,8 +1143,11 @@ def diagnostic_record(event: GestureEvent) -> dict[str, Any]:
             "z_ratio": event.value2,
             "linear_accel_ms2": event.value3,
         }
-    elif stage == "stop_palm_up":
+    elif stage in ("stop_hand_lower", "stop_palm_up"):
         record["metrics"] = {
+            "opp_impulse_ms": event.value1,
+            "opp_peak_ms2": event.value2,
+            "pulse_ms": event.value3,
             "pronation_angle_deg": event.value1,
             "tilt_3d_deg": event.value2,
             "z_ratio_delta": event.value3,
@@ -1257,6 +1284,7 @@ def trajectory_markers(
         "final_hold_start": "hold",
         "motion_complete": "motion complete",
         "match": "START OK",
+        "stop_hand_lower": "STOP OK",
         "stop_palm_up": "STOP OK",
     }
     markers: list[tuple[int, str]] = []
@@ -1483,7 +1511,7 @@ class GestureValidator:
 
     async def _announce_stop_go(self) -> None:
         await self._play_cue(self.args.stop_cue_sound)
-        print("  >>> STOP GO <<< 掌上へ戻してください", flush=True)
+        print("  >>> STOP GO <<< 掌は返さず腕を下ろしてください", flush=True)
 
     async def run_trial(self, trial: int) -> TrialResult:
         self._drain_events()
@@ -1584,6 +1612,8 @@ class GestureValidator:
                         stop_cue_latency_ms = max(
                             0, round((self.loop.time() - start) * 1000)
                         )
+                        # Keep enough time after STOP GO for the hand-lower.
+                        deadline = max(deadline, self.loop.time() + 12.0)
             elif event.code == EVT_RECORDING_STOP:
                 if matched and not self.args.start_only:
                     gesture_stopped = True
@@ -1649,7 +1679,7 @@ class GestureValidator:
                 elif matched:
                     reason = (
                         f"recording_startを{latency_ms} msで受信したが"
-                        "掌上停止なし"
+                        "手下ろし停止なし"
                     )
                 else:
                     reason = f"{self.args.window:g}秒以内にrecording_startなし"
@@ -1665,97 +1695,70 @@ class GestureValidator:
         if self.args.start_only:
             conditions.append(
                 ConditionResult(
-                    "掌上で録音終了",
+                    "手下ろしで録音終了",
                     "SKIP",
                     "開始のみモード（ホスト0x00で停止）",
                 )
             )
             stop_diag = None
         else:
-            stop_diag = _latest_diagnostic(diagnostics, stage="stop_palm_up")
+            stop_diag = _latest_diagnostic(
+                diagnostics, stage="stop_hand_lower"
+            ) or _latest_diagnostic(diagnostics, stage="stop_palm_up")
         if stop_diag is not None:
-            phi = float(stop_diag.get("value1") or 0.0)
-            tilt = float(stop_diag.get("value2") or 0.0)
-            z_delta = abs(float(stop_diag.get("value3") or 0.0))
-            # FW emits outbound_gyro immediately after stop_palm_up with stop metrics.
-            match_idx = max(
-                (
-                    i
-                    for i, r in enumerate(diagnostics)
-                    if r.get("stage") == "match"
-                ),
-                default=-1,
+            opp_imp = float(stop_diag.get("value1") or 0.0)
+            opp_peak = float(stop_diag.get("value2") or 0.0)
+            pulse_ms = float(stop_diag.get("value3") or 0.0)
+            match_diag = _latest_diagnostic(diagnostics, stage="match")
+            lift_imp = float((match_diag or {}).get("value2") or 0.0)
+            stop_ok = recording_stop_hand_lower_eligible(
+                opp_imp, opp_peak, pulse_ms, lift_imp
             )
-            stop_gyros = [
-                r
-                for i, r in enumerate(diagnostics)
-                if r.get("stage") == "outbound_gyro" and i > match_idx
-            ]
-            if not stop_gyros:
-                stop_gyros = [
-                    r for r in diagnostics if r.get("stage") == "outbound_gyro"
-                ]
-            gyro_roll = 0.0
-            gyro_peak = 0.0
-            if stop_gyros:
-                g = stop_gyros[-1]
-                gyro_roll = float(g.get("value1") or 0.0)
-                gyro_peak = float(g.get("value2") or 0.0)
-            gravity_ok = recording_stop_palm_up_eligible(phi, tilt, z_delta)
-            gyro_ok = recording_stop_palm_up_eligible(
-                0.0, gyro_roll_deg=gyro_roll, gyro_peak_dps=gyro_peak
+            need_imp = max(
+                STOP_OPP_IMPULSE_MIN_MS,
+                lift_imp * STOP_OPP_IMPULSE_LIFT_RATIO,
             )
-            stop_ok = gravity_ok or gyro_ok
-            via = []
-            if gravity_ok:
-                via.append("重力")
-            if gyro_ok:
-                via.append("gyro_y")
             conditions.append(
                 ConditionResult(
-                    "掌上で録音終了",
+                    "手下ろしで録音終了",
                     (
                         "PASS"
                         if stop_ok and gesture_stopped and not stop_before_cue
                         else "FAIL"
                     ),
-                    f"実測 phi={phi:.1f}° 3D={tilt:.1f}° Δz={z_delta:.2f} "
-                    f"∫ωy={gyro_roll:+.1f}° peak={gyro_peak:.1f}dps | "
-                    f"閾値 (phi≥{PRONATION_ANGLE_MIN_DEG:.0f} かつ "
-                    f"(Δz≥{PRONATION_Z_RATIO_DONE:.2f} または符号反転)) または "
-                    f"(|∫ωy|≥{STOP_GYRO_ANGLE_MIN_DEG:.0f} かつ "
-                    f"peak≥{STOP_GYRO_ANGLE_PEAK_MIN_DPS:.0f}) "
-                    f"/ {STOP_HOLD_MS}ms連続 "
-                    f"/ 開始後{STOP_POST_START_INHIBIT_MS}ms抑制 "
-                    f"(積分対象 |ωy|≥{STOP_GYRO_INTEGRATE_RATE_DPS:.0f})"
-                    + (f" → {'+'.join(via)}" if via else "")
+                    f"実測 opp_imp={opp_imp:.3f} peak={opp_peak:.2f} "
+                    f"pulse={pulse_ms:.0f}ms lift_imp={lift_imp:.3f} | "
+                    f"閾値 opp_imp≥{need_imp:.3f} peak≥{STOP_OPP_ACCEL_MIN_MS2:.2f} "
+                    f"pulse {STOP_OPP_PULSE_MIN_MS}-{STOP_OPP_PULSE_MAX_MS}ms "
+                    f"+ settle {STOP_SETTLE_MS}ms "
+                    f"/ 開始後{STOP_POST_START_INHIBIT_MS}ms抑制"
                     + (" / STOP GO前に停止" if stop_before_cue else ""),
                 )
             )
         elif not self.args.start_only and gesture_stopped:
             conditions.append(
                 ConditionResult(
-                    "掌上で録音終了",
+                    "手下ろしで録音終了",
                     "FAIL" if stop_before_cue else "PASS",
                     (
                         "STOP GO前にrecording_stopを受信"
                         if stop_before_cue
-                        else "recording_stopを受信（stop_palm_up diag なし）"
+                        else "recording_stopを受信（stop_hand_lower diag なし）"
                     ),
                 )
             )
         elif not self.args.start_only and matched:
             conditions.append(
                 ConditionResult(
-                    "掌上で録音終了",
+                    "手下ろしで録音終了",
                     "FAIL",
-                    "判定時間内に掌上停止なし",
+                    "判定時間内に手下ろし停止なし",
                 )
             )
         elif not self.args.start_only:
             conditions.append(
                 ConditionResult(
-                    "掌上で録音終了",
+                    "手下ろしで録音終了",
                     "NOT_REACHED",
                     "録音開始前",
                 )
@@ -2023,13 +2026,15 @@ def run_self_test() -> int:
     )
 
     stop_packet = bytearray([0x00, 0x55, EVT_GESTURE_DIAG, 0x0C, 0x00])
-    stop_packet.extend(struct.pack("<fff", 9.6, 16.0, 0.28))
+    stop_packet.extend(struct.pack("<fff", 0.42, 2.5, 280.0))
     stop_diag = parse_event_packet(bytes(stop_packet), now=14.2)
     assert stop_diag is not None
     assert stop_diag.diag_stage == 0x0C
-    assert "stop_palm_up" in format_event(stop_diag)
+    assert "stop_hand_lower" in format_event(stop_diag)
     assert math.isclose(
-        diagnostic_record(stop_diag)["metrics"]["z_ratio_delta"], 0.28, abs_tol=1e-6
+        diagnostic_record(stop_diag)["metrics"]["opp_impulse_ms"],
+        0.42,
+        abs_tol=1e-6,
     )
 
     gyro_packet = bytearray([0x00, 0x55, EVT_GESTURE_DIAG, 0x20, 0x00])
@@ -2068,7 +2073,7 @@ def run_self_test() -> int:
     assert START_QUIET_ACCEL_MAX_MS2 == 4.0
     assert HOLD_PRONATION_ANGLE_MIN_DEG == 15.0
     assert HOLD_PRONATION_Z_RATIO_DONE == 0.40
-    assert HOLD_GYRO_ANGLE_MIN_DEG == 50.0
+    assert HOLD_GYRO_ANGLE_MIN_DEG == 30.0
     assert HOLD_GYRO_INTEGRATE_RATE_DPS == 10.0
     assert MOTION_COMPLETE_MAX_MS == 4500
     assert FINAL_TILT_MAX_DEG == 15.0
@@ -2088,64 +2093,30 @@ def run_self_test() -> int:
     assert not gesture_gate_eligible(
         0.90, 4.0, 0.04, 0.015, 15.0, 400, palm_up_tilt_deg=29.9
     )
-    # 0.0.66 stop: phi + strong Z only; tilt alone / peak alone rejected.
-    assert PRONATION_ANGLE_MIN_DEG == 20.0
-    assert PRONATION_Z_RATIO_DONE == 0.50
-    assert STOP_HOLD_MS == 500
+    # 0.0.69 stop: reverse lift-axis pulse + settle; palm-up path removed.
+    assert STOP_OPP_ACCEL_MIN_MS2 == 0.25
+    assert STOP_OPP_IMPULSE_MIN_MS == 0.10
+    assert STOP_OPP_IMPULSE_LIFT_RATIO == 0.20
+    assert STOP_OPP_IMPULSE_LIFT_CAP_MS == 0.35
+    assert STOP_OPP_PULSE_MIN_MS == 60
+    assert STOP_OPP_PULSE_MAX_MS == 2000
+    assert STOP_SETTLE_MS == 80
     assert STOP_POST_START_INHIBIT_MS == 3000
-    assert not recording_stop_palm_up_eligible(20.0)  # phi alone insufficient
-    assert not recording_stop_palm_up_eligible(20.0, palm_up_tilt_deg=90.0)
-    assert not recording_stop_palm_up_eligible(20.0, z_ratio_delta=0.49)
-    assert recording_stop_palm_up_eligible(20.0, z_ratio_delta=0.50)
-    assert recording_stop_palm_up_eligible(20.0, z_sign_flip=True)
-    assert not recording_stop_palm_up_eligible(19.9, z_ratio_delta=0.50)
-    # Prior false-stop: tilt 22.5 alone must not stop.
+    assert recording_stop_hand_lower_eligible(0.12, 1.0, 200.0, 0.50)
+    assert recording_stop_hand_lower_eligible(0.10, 0.25, 60.0, 0.0)
+    # リンゴ log shape should pass after 0.0.71
+    assert recording_stop_hand_lower_eligible(0.189, 0.57, 732.0, 0.356)
+    assert not recording_stop_hand_lower_eligible(0.08, 1.0, 200.0, 0.0)
+    assert not recording_stop_hand_lower_eligible(0.12, 0.20, 200.0, 0.0)
+    assert not recording_stop_hand_lower_eligible(0.12, 1.0, 40.0, 0.0)
+    assert not recording_stop_hand_lower_eligible(0.12, 1.0, 2100.0, 0.0)
+    # Relative to lift, capped so strong lifts do not demand huge lowers
+    assert recording_stop_hand_lower_eligible(0.35, 1.0, 200.0, 2.5)
+    assert not recording_stop_hand_lower_eligible(0.30, 1.0, 200.0, 2.5)
+    # Palm-up / gyro stop path removed.
+    assert not recording_stop_palm_up_eligible(20.0, z_ratio_delta=0.50)
     assert not recording_stop_palm_up_eligible(
-        4.8, palm_up_tilt_deg=22.5, z_ratio_delta=0.02, gyro_peak_dps=7.1
-    )
-    # Last false-stop shape: huge phi without Z change must not stop.
-    assert not recording_stop_palm_up_eligible(
-        165.0, palm_up_tilt_deg=146.0, z_ratio_delta=0.02, gyro_peak_dps=8.0
-    )
-    assert OUTBOUND_GYRO_INTEGRATE_RATE_DPS == 20.0
-    assert STOP_GYRO_INTEGRATE_RATE_DPS == 20.0
-    assert not recording_stop_palm_up_eligible(0.0, gyro_peak_dps=50.0)
-    assert not recording_stop_palm_up_eligible(0.0, gyro_peak_dps=80.0)
-    assert not recording_stop_palm_up_eligible(
-        0.0, gyro_roll_deg=44.9, gyro_peak_dps=30.0
-    )
-    assert not recording_stop_palm_up_eligible(
-        0.0, gyro_roll_deg=45.0, gyro_peak_dps=29.9
-    )
-    assert recording_stop_palm_up_eligible(
-        0.0,
-        gyro_roll_deg=STOP_GYRO_ANGLE_MIN_DEG,
-        gyro_peak_dps=STOP_GYRO_ANGLE_PEAK_MIN_DPS,
-    )
-    quiet_rate_dps = 17.3
-    quiet_integral_deg = sum(
-        quiet_rate_dps * 0.025
-        for _ in range(round(4.0 / 0.025))
-        if abs(quiet_rate_dps) >= STOP_GYRO_INTEGRATE_RATE_DPS
-    )
-    assert quiet_integral_deg == 0.0
-    # 2026-08-22 hardware regression: a brief 42.6 dps spike with almost no
-    # integrated rotation or gravity change must not stop recording.
-    assert not recording_stop_palm_up_eligible(
-        9.4,
-        palm_up_tilt_deg=2.4,
-        z_ratio_delta=0.03,
-        gyro_roll_deg=1.6,
-        gyro_peak_dps=42.6,
-    )
-    # 2026-08-22 v0.0.53 regression: stationary bias accumulated to 25.1°
-    # with only a 17.3 dps peak; the stricter angle route must reject it.
-    assert not recording_stop_palm_up_eligible(
-        2.2,
-        palm_up_tilt_deg=1.6,
-        z_ratio_delta=0.01,
-        gyro_roll_deg=-25.1,
-        gyro_peak_dps=17.3,
+        0.0, gyro_roll_deg=45.0, gyro_peak_dps=30.0
     )
 
     def outbound_gyro_condition_status(roll_deg: float, peak_dps: float) -> str:
@@ -2211,18 +2182,11 @@ def run_self_test() -> int:
             },
             {"stage": "match", "reason": "none"},
             {
-                "stage": "stop_palm_up",
+                "stage": "stop_hand_lower",
                 "reason": "none",
-                "value1": 12.5,
-                "value2": 4.0,
-                "value3": 0.04,
-            },
-            {
-                "stage": "outbound_gyro",
-                "reason": "none",
-                "value1": 0.6,
-                "value2": 21.8,
-                "value3": 0.0,
+                "value1": 0.40,
+                "value2": 2.5,
+                "value3": 280.0,
             },
         ],
         matched=True,
@@ -2583,7 +2547,7 @@ def main() -> int:
             args.instruction = (
                 "手の甲側装着で掌を上にして0.5秒静止し、手を上げてから、"
                 "掌を下にしてSTART OKまで維持してください。"
-                "Glass音とSTOP GOのあとに手のひらを上へ向けてください"
+                "Glass音とSTOP GOのあとに掌は返さず腕を下ろしてください"
             )
 
     try:

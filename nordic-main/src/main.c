@@ -157,7 +157,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_PRONATION_Z_SIGN_MIN_MS2         2.0f
 #define GESTURE_PRONATION_GRAVITY_MIN_MS2        7.5f
 #define GESTURE_PRONATION_GRAVITY_MAX_MS2       12.5f
-/* Recording-stop palm-up (0.0.66): LP phi + strong Z change; no tilt-alone. */
+/* Legacy palm-up stop constants kept for diag field layout only (unused). */
 #define GESTURE_OUTBOUND_MIN_DEG                 20.0f
 #define GESTURE_OUTBOUND_Z_RATIO_DONE            0.50f
 #define GESTURE_OUTBOUND_TILT_MIN_DEG            30.0f
@@ -165,15 +165,29 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_GYRO_SETTLE_MS                    50
 #define GESTURE_GYRO_BIAS_CAPTURE_MAX_DPS        15.0f
 #define GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS     10.0f
-#define GESTURE_HOLD_GYRO_ANGLE_MIN_DEG         50.0f
+/* 0.0.70: natural palm-down had ∫~35°; 50° rejected valid starts. */
+#define GESTURE_HOLD_GYRO_ANGLE_MIN_DEG         30.0f
 #define GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN      0.42f
 /* XY waiver only if lift fired before pronation AND impulse is strong. */
 #define GESTURE_LIFT_PREFLIP_MAX_DEG            50.0f
 #define GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS    0.30f
+/* Recording-stop (0.0.69): reverse of lift-axis linear pulse, then settle.
+ * Palm-up / gyro_y stop paths removed. Pulse window rejects long vehicle G. */
+/* 0.0.71: Android real-use (リンゴ log) stop barely passed opp=0.189/peak=0.57
+ * after ~13s; Mac deliberate lower was opp~1.4. Loosen for phone-held lowers. */
+#define GESTURE_STOP_OPP_ACCEL_MIN_MS2           0.25f
+#define GESTURE_STOP_OPP_CONSECUTIVE_SAMPLES        2
+#define GESTURE_STOP_OPP_IMPULSE_MIN_MS           0.10f
+#define GESTURE_STOP_OPP_IMPULSE_LIFT_RATIO       0.20f
+#define GESTURE_STOP_OPP_IMPULSE_LIFT_CAP_MS      0.35f
+#define GESTURE_STOP_OPP_PULSE_MIN_MS              60
+#define GESTURE_STOP_OPP_PULSE_MAX_MS             2000
+#define GESTURE_STOP_SETTLE_MS                     80
+#define GESTURE_STOP_SETTLE_LINEAR_MS2            4.0f
+/* Legacy gyro stop constants (unused after 0.0.69). */
 #define GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS     20.0f
 #define GESTURE_STOP_GYRO_ANGLE_MIN_DEG          45.0f
 #define GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS     30.0f
-/* Peak-only gyro stop removed (0.0.64); keep constant for diag compatibility. */
 #define GESTURE_STOP_GYRO_PEAK_DPS              50.0f
 #define GESTURE_STOP_HOLD_MS                     500
 /* Gyro quiet only gates *entering* hold; residual wrist rate during hold is looser. */
@@ -218,10 +232,12 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 /* Match metrics: v1=xy_ratio, v2=pos_imp_at_lift, v3=roll_at_lift.
  * reason bit0=lift_before_flip, bit1=xy_waived. */
 #define GESTURE_DIAG_MATCH_DETAIL             0x0A
-#define GESTURE_DIAG_STOP_PALM_UP             0x0C
+#define GESTURE_DIAG_STOP_PALM_UP             0x0C  /* legacy name; hand-lower */
 #define GESTURE_DIAG_GYRO_ENABLED             0x0D
 #define GESTURE_DIAG_GYRO_DISABLED            0x0E
 #define GESTURE_DIAG_OUTBOUND_GYRO            0x0F  /* roll_deg, peak_dps, sign */
+/* Stop hand-lower: v1=neg_impulse, v2=peak_a_opp, v3=pulse_ms */
+#define GESTURE_DIAG_STOP_HAND_LOWER          0x0C
 #define GESTURE_DIAG_HOLD_SAMPLE              0x22  /* rms, tilt_deg, |gy|_dps */
 #define GESTURE_DIAG_MOTION_COMPLETE           0x23  /* elapsed_ms, peak_y, roll */
 #define GESTURE_DIAG_PALM_DOWN_GATE            0x24  /* gate-specific metrics */
@@ -486,15 +502,21 @@ static int64_t gesture_debug_final_last_ms;
 static float gesture_accel_history_ms2[GESTURE_FINAL_RMS_WINDOW_SAMPLES];
 static uint8_t gesture_accel_history_index;
 static uint8_t gesture_accel_history_count;
-/* Palm-down pose frozen at recording start; stop on a loose palm-up flip. */
+/* Lift-axis unit vector frozen at MATCH; stop on opposite linear pulse. */
+static bool recording_stop_axis_valid;
+static bool recording_stop_armed;
+static float recording_stop_axis_x, recording_stop_axis_y, recording_stop_axis_z;
+static float recording_stop_lift_impulse_ms;
+static float recording_stop_opp_impulse_ms;
+static float recording_stop_opp_peak_ms2;
+static float recording_stop_pulse_ms_latched;
+static float gesture_lift_dir_acc_x, gesture_lift_dir_acc_y, gesture_lift_dir_acc_z;
+static int64_t recording_stop_pulse_since_ms;
+static int64_t recording_stop_settle_since_ms;
+static uint8_t recording_stop_opp_samples;
+static bool recording_stop_pulse_latched;
+/* Legacy fields retained so older reset call sites compile cleanly. */
 static bool recording_stop_ref_valid;
-static float recording_stop_ref_phi_deg;
-static float recording_stop_ref_az;
-static float recording_stop_ref_z_ratio;
-static float recording_stop_ref_gx, recording_stop_ref_gy, recording_stop_ref_gz;
-static float recording_stop_peak_phi_deg;
-static float recording_stop_peak_tilt_deg;
-static int64_t recording_stop_hold_since_ms;
 static bool recording_stop_ref_locked;
 
 /* On-demand gyro (powered while gesture sequence or recording is active). */
@@ -507,8 +529,6 @@ static float gesture_gyro_roll_deg;
 static float gesture_gyro_peak_abs_dps;
 static float gesture_gyro_x_peak_abs_dps;
 static float gesture_outbound_gyro_sign;
-static float recording_stop_gyro_roll_deg;
-static float recording_stop_gyro_peak_abs_dps;
 
 #if GESTURE_DEBUG_HISTORY
 typedef struct {
@@ -1196,7 +1216,7 @@ static void gyro_set_enabled(bool enable)
         printk(">>> Gyro OFF\n");
         send_gesture_diag(GESTURE_DIAG_GYRO_DISABLED, GESTURE_DIAG_REASON_NONE,
                           gesture_gyro_roll_deg, gesture_gyro_peak_abs_dps,
-                          recording_stop_gyro_roll_deg);
+                          0.0f);
     }
 }
 
@@ -1269,12 +1289,6 @@ static float gesture_gyro_hold_xy_peak_ratio(void)
         : 0.0f;
 }
 
-static bool gesture_gyro_stop_ok(void)
-{
-    /* Peak-only path removed: brief wrist flicks must not stop recording. */
-    return fabsf(recording_stop_gyro_roll_deg) >= GESTURE_STOP_GYRO_ANGLE_MIN_DEG &&
-           recording_stop_gyro_peak_abs_dps >= GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS;
-}
 
 #if GESTURE_DEBUG_HISTORY
 static void gesture_history_clear(void)
@@ -1458,6 +1472,9 @@ static void reset_gesture_motion(void)
     gesture_lift_before_flip = false;
     gesture_lift_pos_impulse_at_entry_ms = 0.0f;
     gesture_lift_roll_at_entry_deg = 0.0f;
+    gesture_lift_dir_acc_x = 0.0f;
+    gesture_lift_dir_acc_y = 0.0f;
+    gesture_lift_dir_acc_z = 0.0f;
     gesture_palm_down_latched = false;
     gesture_lift_event_start_ms = 0;
     gesture_lift_accel_samples = 0;
@@ -1493,99 +1510,91 @@ static bool gesture_board_flat(float z_gravity_ratio)
     return fabsf(z_gravity_ratio) >= GESTURE_START_PALM_UP_Z_MIN_RATIO;
 }
 
+static void reset_recording_stop_pulse(void)
+{
+    recording_stop_opp_impulse_ms = 0.0f;
+    recording_stop_opp_peak_ms2 = 0.0f;
+    recording_stop_pulse_ms_latched = 0.0f;
+    recording_stop_pulse_since_ms = 0;
+    recording_stop_settle_since_ms = 0;
+    recording_stop_opp_samples = 0;
+    recording_stop_pulse_latched = false;
+}
+
 static void reset_recording_stop_state(void)
 {
+    recording_stop_axis_valid = false;
+    recording_stop_armed = false;
+    recording_stop_axis_x = 0.0f;
+    recording_stop_axis_y = 0.0f;
+    recording_stop_axis_z = 0.0f;
+    recording_stop_lift_impulse_ms = 0.0f;
     recording_stop_ref_valid = false;
     recording_stop_ref_locked = false;
-    recording_stop_ref_phi_deg = 0.0f;
-    recording_stop_ref_az = 0.0f;
-    recording_stop_ref_z_ratio = 0.0f;
-    recording_stop_ref_gx = 0.0f;
-    recording_stop_ref_gy = 0.0f;
-    recording_stop_ref_gz = 0.0f;
-    recording_stop_peak_phi_deg = 0.0f;
-    recording_stop_peak_tilt_deg = 0.0f;
-    recording_stop_hold_since_ms = 0;
-    recording_stop_gyro_roll_deg = 0.0f;
-    recording_stop_gyro_peak_abs_dps = 0.0f;
+    reset_recording_stop_pulse();
 }
 
-static void capture_recording_stop_reference(void)
+static void capture_recording_stop_axis_from_lift(void)
 {
-    float gx = gesture_gravity_lp_x;
-    float gy = gesture_gravity_lp_y;
-    float gz = gesture_gravity_lp_z;
-    float n = vector_norm3(gx, gy, gz);
+    float n = vector_norm3(gesture_lift_dir_acc_x,
+                           gesture_lift_dir_acc_y,
+                           gesture_lift_dir_acc_z);
+    float g_norm = vector_norm3(gesture_gravity_lp_x,
+                                gesture_gravity_lp_y,
+                                gesture_gravity_lp_z);
 
-    if (n <= 0.1f) {
-        return;
+    if (n > 0.05f) {
+        recording_stop_axis_x = gesture_lift_dir_acc_x / n;
+        recording_stop_axis_y = gesture_lift_dir_acc_y / n;
+        recording_stop_axis_z = gesture_lift_dir_acc_z / n;
+        recording_stop_axis_valid = true;
+    } else if (g_norm > 0.1f) {
+        /* a_up uses gravity; fallback keeps reverse-of-lift semantics. */
+        recording_stop_axis_x = gesture_gravity_lp_x / g_norm;
+        recording_stop_axis_y = gesture_gravity_lp_y / g_norm;
+        recording_stop_axis_z = gesture_gravity_lp_z / g_norm;
+        recording_stop_axis_valid = true;
+    } else {
+        recording_stop_axis_valid = false;
     }
 
-    recording_stop_ref_phi_deg = atan2f(-gx, gz) * (float)GESTURE_RAD_TO_DEG;
-    recording_stop_ref_az = gz;
-    recording_stop_ref_z_ratio = gz / n;
-    recording_stop_ref_gx = gx / n;
-    recording_stop_ref_gy = gy / n;
-    recording_stop_ref_gz = gz / n;
-    recording_stop_peak_phi_deg = 0.0f;
-    recording_stop_peak_tilt_deg = 0.0f;
-    recording_stop_hold_since_ms = 0;
-    recording_stop_gyro_roll_deg = 0.0f;
-    recording_stop_gyro_peak_abs_dps = 0.0f;
-    recording_stop_ref_valid = true;
+    recording_stop_lift_impulse_ms =
+        gesture_lift_pos_impulse_at_entry_ms > 0.05f
+            ? gesture_lift_pos_impulse_at_entry_ms
+            : gesture_lift_pos_impulse_ms;
+    recording_stop_armed = recording_stop_axis_valid;
+    recording_stop_ref_valid = recording_stop_axis_valid;
+    recording_stop_ref_locked = false;
+    reset_recording_stop_pulse();
 }
 
-static float recording_stop_tilt_deg(float ax, float ay, float az)
+static float recording_stop_impulse_threshold(void)
 {
-    float n = vector_norm3(ax, ay, az);
-    float rn = vector_norm3(recording_stop_ref_gx,
-                            recording_stop_ref_gy,
-                            recording_stop_ref_gz);
-
-    if (n <= 0.1f || rn <= 0.1f) {
-        return 0.0f;
+    float from_lift = recording_stop_lift_impulse_ms *
+                      GESTURE_STOP_OPP_IMPULSE_LIFT_RATIO;
+    if (from_lift > GESTURE_STOP_OPP_IMPULSE_LIFT_CAP_MS) {
+        from_lift = GESTURE_STOP_OPP_IMPULSE_LIFT_CAP_MS;
     }
-    float c = (ax * recording_stop_ref_gx +
-               ay * recording_stop_ref_gy +
-               az * recording_stop_ref_gz) / (n * rn);
-    c = CLAMP(c, -1.0f, 1.0f);
-    return acosf(c) * (float)GESTURE_RAD_TO_DEG;
+    return from_lift > GESTURE_STOP_OPP_IMPULSE_MIN_MS
+               ? from_lift
+               : GESTURE_STOP_OPP_IMPULSE_MIN_MS;
 }
 
-static bool recording_stop_z_sign_flipped(float az)
+static void request_recording_stop_hand_lower(int64_t now)
 {
-    return (az * recording_stop_ref_az < 0.0f) &&
-           fabsf(az) >= GESTURE_PRONATION_Z_SIGN_MIN_MS2 &&
-           fabsf(recording_stop_ref_az) >= GESTURE_PRONATION_Z_SIGN_MIN_MS2;
-}
+    float pulse_ms = recording_stop_pulse_ms_latched;
 
-static bool recording_stop_palm_up_detected(float phi_deg, float tilt_deg,
-                                           float z_gravity_ratio, float az)
-{
-    bool z_ok =
-        fabsf(z_gravity_ratio - recording_stop_ref_z_ratio) >=
-            GESTURE_OUTBOUND_Z_RATIO_DONE ||
-        recording_stop_z_sign_flipped(az);
-    /* phi + strong Z change required; tilt alone must not stop recording. */
-    bool gravity_ok = phi_deg >= GESTURE_OUTBOUND_MIN_DEG && z_ok;
-    (void)tilt_deg;
-
-    return gravity_ok || gesture_gyro_stop_ok();
-}
-
-static void request_recording_stop_palm_up(int64_t now, float phi_deg,
-                                          float tilt_deg, float z_delta)
-{
-    printk(">>> Palm-up while recording → stop phi=%.1f tilt=%.1f z_d=%.2f "
-           "gyro_roll=%.1f peak=%.1f\n",
-           (double)phi_deg, (double)tilt_deg, (double)z_delta,
-           (double)recording_stop_gyro_roll_deg,
-           (double)recording_stop_gyro_peak_abs_dps);
-    send_gesture_diag(GESTURE_DIAG_STOP_PALM_UP, GESTURE_DIAG_REASON_NONE,
-                      phi_deg, tilt_deg, z_delta);
-    send_gesture_diag(GESTURE_DIAG_OUTBOUND_GYRO, GESTURE_DIAG_REASON_NONE,
-                      recording_stop_gyro_roll_deg,
-                      recording_stop_gyro_peak_abs_dps, 0.0f);
+    (void)now;
+    printk(">>> Hand-lower while recording → stop opp_imp=%.3f peak=%.2f "
+           "pulse=%.0fms lift_imp=%.3f\n",
+           (double)recording_stop_opp_impulse_ms,
+           (double)recording_stop_opp_peak_ms2,
+           (double)pulse_ms,
+           (double)recording_stop_lift_impulse_ms);
+    send_gesture_diag(GESTURE_DIAG_STOP_HAND_LOWER, GESTURE_DIAG_REASON_NONE,
+                      recording_stop_opp_impulse_ms,
+                      recording_stop_opp_peak_ms2,
+                      pulse_ms);
     stop_requested = true;
     inhibit_next_settle = true;
     gesture_block_until_ms = now + GESTURE_RETRIGGER_BLOCK_MS;
@@ -1597,103 +1606,113 @@ static void process_recording_stop_sample(float ax, float ay, float az,
                                          float dt_s, int64_t now)
 {
     float accel_norm = vector_norm3(ax, ay, az);
-    float g_norm = vector_norm3(gesture_gravity_lp_x,
-                                gesture_gravity_lp_y,
-                                gesture_gravity_lp_z);
-    float z_gravity_ratio = 0.0f;
-    float phi = 0.0f;
-    float phi_change = 0.0f;
-    float tilt_deg = 0.0f;
-    float az_lp = gesture_gravity_lp_z;
+    float a_along;
+    float a_opp;
+    float need_imp;
+    int64_t pulse_ms;
     bool quiet;
-    bool candidate;
 
-    if (stop_requested) {
+    (void)gy_dps;
+    (void)gyro_ok;
+
+    if (stop_requested || !recording_stop_axis_valid) {
         return;
     }
 
+    /* Post-start inhibit: ignore opposite pulses while pose settles. */
+    if (now < gesture_block_until_ms) {
+        reset_recording_stop_pulse();
+        recording_stop_armed = true;
+        return;
+    }
+    recording_stop_armed = true;
+
+    a_along = gesture_linear_world_x * recording_stop_axis_x +
+              gesture_linear_world_y * recording_stop_axis_y +
+              gesture_linear_world_z * recording_stop_axis_z;
+    a_opp = -a_along;
+    need_imp = recording_stop_impulse_threshold();
     quiet = accel_norm >= GESTURE_PRONATION_GRAVITY_MIN_MS2 &&
             accel_norm <= GESTURE_PRONATION_GRAVITY_MAX_MS2 &&
-            gesture_linear_accel_norm_ms2 <= GESTURE_QUIET_ACCEL_MS2;
+            gesture_linear_accel_norm_ms2 <= GESTURE_STOP_SETTLE_LINEAR_MS2;
 
-    /* During post-start inhibit, keep refreshing the palm-down reference. */
-    if (now < gesture_block_until_ms) {
-        if (quiet) {
-            capture_recording_stop_reference();
-            recording_stop_ref_locked = false;
+    if (!recording_stop_pulse_latched) {
+        if (a_opp >= GESTURE_STOP_OPP_ACCEL_MIN_MS2) {
+            if (recording_stop_pulse_since_ms == 0) {
+                recording_stop_pulse_since_ms = now;
+                recording_stop_opp_impulse_ms = 0.0f;
+                recording_stop_opp_peak_ms2 = 0.0f;
+                recording_stop_opp_samples = 0;
+            }
+            if (recording_stop_opp_samples < 255) {
+                recording_stop_opp_samples++;
+            }
+            recording_stop_opp_impulse_ms += a_opp * dt_s;
+            if (a_opp > recording_stop_opp_peak_ms2) {
+                recording_stop_opp_peak_ms2 = a_opp;
+            }
+        } else if (recording_stop_pulse_since_ms > 0 && a_opp > 0.05f) {
+            recording_stop_opp_impulse_ms += a_opp * dt_s;
+            if (a_opp > recording_stop_opp_peak_ms2) {
+                recording_stop_opp_peak_ms2 = a_opp;
+            }
+            recording_stop_opp_samples = 0;
+        } else if (recording_stop_pulse_since_ms > 0) {
+            pulse_ms = now - recording_stop_pulse_since_ms;
+            if (recording_stop_opp_impulse_ms >= need_imp &&
+                pulse_ms >= GESTURE_STOP_OPP_PULSE_MIN_MS &&
+                pulse_ms <= GESTURE_STOP_OPP_PULSE_MAX_MS &&
+                recording_stop_opp_peak_ms2 >=
+                    GESTURE_STOP_OPP_ACCEL_MIN_MS2) {
+                recording_stop_pulse_latched = true;
+                recording_stop_pulse_ms_latched = (float)pulse_ms;
+                recording_stop_settle_since_ms = 0;
+            } else {
+                reset_recording_stop_pulse();
+            }
         }
-        if (gyro_ok) {
-            /* Discard roll accumulated before the settled reference is locked. */
-            recording_stop_gyro_roll_deg = 0.0f;
-            recording_stop_gyro_peak_abs_dps = 0.0f;
+
+        if (recording_stop_pulse_since_ms > 0 &&
+            !recording_stop_pulse_latched) {
+            pulse_ms = now - recording_stop_pulse_since_ms;
+            if (pulse_ms > GESTURE_STOP_OPP_PULSE_MAX_MS) {
+                /* Sustained vehicle-like G: discard. */
+                reset_recording_stop_pulse();
+            } else if (recording_stop_opp_samples >=
+                           GESTURE_STOP_OPP_CONSECUTIVE_SAMPLES &&
+                       recording_stop_opp_impulse_ms >= need_imp &&
+                       pulse_ms >= GESTURE_STOP_OPP_PULSE_MIN_MS &&
+                       a_opp < GESTURE_STOP_OPP_ACCEL_MIN_MS2) {
+                recording_stop_pulse_latched = true;
+                recording_stop_pulse_ms_latched = (float)pulse_ms;
+                recording_stop_settle_since_ms = 0;
+            }
         }
-        recording_stop_hold_since_ms = 0;
         return;
     }
 
-    if (!recording_stop_ref_valid || !recording_stop_ref_locked) {
-        if (quiet) {
-            capture_recording_stop_reference();
-        } else if (!recording_stop_ref_valid) {
-            capture_recording_stop_reference();
-        }
-        if (!recording_stop_ref_valid) {
-            return;
-        }
-        recording_stop_ref_locked = true;
-        recording_stop_gyro_roll_deg = 0.0f;
-        recording_stop_gyro_peak_abs_dps = 0.0f;
-        recording_stop_hold_since_ms = 0;
+    /* After a valid opposite pulse, require a short quiet settle. */
+    if (a_opp >= GESTURE_STOP_OPP_ACCEL_MIN_MS2) {
+        recording_stop_pulse_latched = false;
+        recording_stop_pulse_since_ms = now;
+        recording_stop_opp_impulse_ms = a_opp * dt_s;
+        recording_stop_opp_peak_ms2 = a_opp;
+        recording_stop_opp_samples = 1;
+        recording_stop_settle_since_ms = 0;
         return;
     }
-
-    if (g_norm > 0.1f) {
-        z_gravity_ratio = gesture_gravity_lp_z / g_norm;
-        phi = atan2f(-gesture_gravity_lp_x, gesture_gravity_lp_z) *
-              (float)GESTURE_RAD_TO_DEG;
-    }
-    phi_change = fabsf(deg_diff(phi, recording_stop_ref_phi_deg));
-    tilt_deg = recording_stop_tilt_deg(gesture_gravity_lp_x,
-                                       gesture_gravity_lp_y,
-                                       gesture_gravity_lp_z);
-
-    /* Peaks are diagnostics only; stop decision uses current LP pose. */
-    if (phi_change > recording_stop_peak_phi_deg) {
-        recording_stop_peak_phi_deg = phi_change;
-    }
-    if (tilt_deg > recording_stop_peak_tilt_deg) {
-        recording_stop_peak_tilt_deg = tilt_deg;
-    }
-    if (gyro_ok) {
-        accumulate_gyro_roll(gy_dps, dt_s,
-                             GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS,
-                             &recording_stop_gyro_roll_deg,
-                             &recording_stop_gyro_peak_abs_dps);
-    }
-
-    if (accel_norm < GESTURE_PRONATION_GRAVITY_MIN_MS2 ||
-        accel_norm > GESTURE_PRONATION_GRAVITY_MAX_MS2) {
-        recording_stop_hold_since_ms = 0;
+    if (!quiet) {
+        recording_stop_settle_since_ms = 0;
         return;
     }
-
-    candidate = recording_stop_palm_up_detected(phi_change, tilt_deg,
-                                               z_gravity_ratio, az_lp);
-    if (!candidate) {
-        recording_stop_hold_since_ms = 0;
+    if (recording_stop_settle_since_ms == 0) {
+        recording_stop_settle_since_ms = now;
         return;
     }
-    if (recording_stop_hold_since_ms == 0) {
-        recording_stop_hold_since_ms = now;
+    if ((now - recording_stop_settle_since_ms) < GESTURE_STOP_SETTLE_MS) {
         return;
     }
-    if ((now - recording_stop_hold_since_ms) < GESTURE_STOP_HOLD_MS) {
-        return;
-    }
-
-    request_recording_stop_palm_up(
-        now, phi_change, tilt_deg,
-        fabsf(z_gravity_ratio - recording_stop_ref_z_ratio));
+    request_recording_stop_hand_lower(now);
 }
 
 static float deg_diff(float a, float b)
@@ -1753,6 +1772,9 @@ static void retry_lift_pulse(void)
     gesture_lift_before_flip = false;
     gesture_lift_pos_impulse_at_entry_ms = 0.0f;
     gesture_lift_roll_at_entry_deg = 0.0f;
+    gesture_lift_dir_acc_x = 0.0f;
+    gesture_lift_dir_acc_y = 0.0f;
+    gesture_lift_dir_acc_z = 0.0f;
     gesture_lift_event_start_ms = 0;
     gesture_lift_accel_samples = 0;
     gesture_lift_brake_samples = 0;
@@ -2010,10 +2032,16 @@ static void process_gesture_sample(float ax, float ay, float az,
 
     if (is_recording) {
         update_gravity_lp(ax, ay, az, dt_s);
+#if GESTURE_DEBUG_HISTORY
+        if (gesture_trajectory_active) {
+            uint8_t flags = (gyro_enabled ? BIT(0) : 0) |
+                            (gyro_read_ok ? BIT(1) : 0) |
+                            (gyro_ok ? BIT(2) : 0);
+            gesture_trajectory_push(now, flags, ax, ay, az,
+                                    gx_raw_dps, gy_raw_dps, gz_raw_dps);
+        }
+#endif
         if (!stop_requested) {
-            if (!recording_stop_ref_valid) {
-                capture_recording_stop_reference();
-            }
             process_recording_stop_sample(ax, ay, az, gy_dps, gyro_ok,
                                           dt_s, now);
         }
@@ -2035,18 +2063,7 @@ static void process_gesture_sample(float ax, float ay, float az,
 
     if (recording_requested) {
         update_gravity_lp(ax, ay, az, dt_s);
-        /* Keep refining palm-down stop reference until recording is active. */
-        if (accel_norm >= GESTURE_PRONATION_GRAVITY_MIN_MS2 &&
-            accel_norm <= GESTURE_PRONATION_GRAVITY_MAX_MS2 &&
-            gesture_linear_accel_norm_ms2 <= GESTURE_QUIET_ACCEL_MS2) {
-            capture_recording_stop_reference();
-            recording_stop_ref_locked = false;
-        } else if (!recording_stop_ref_valid) {
-            capture_recording_stop_reference();
-            recording_stop_ref_locked = false;
-        }
-        recording_stop_gyro_roll_deg = 0.0f;
-        recording_stop_gyro_peak_abs_dps = 0.0f;
+        /* Stop axis already frozen at MATCH; wait for DMIC start. */
         return;
     }
 
@@ -2262,19 +2279,31 @@ static void process_gesture_sample(float ax, float ay, float az,
             if (a_up >= GESTURE_LIFT_ACCEL_MIN_MS2) {
                 if (gesture_lift_event_start_ms == 0) {
                     gesture_lift_event_start_ms = now;
+                    gesture_lift_dir_acc_x = 0.0f;
+                    gesture_lift_dir_acc_y = 0.0f;
+                    gesture_lift_dir_acc_z = 0.0f;
                 }
                 gesture_lift_accel_samples++;
                 gesture_lift_pos_impulse_ms += a_up * dt_s;
                 gesture_lift_net_impulse_ms += a_up * dt_s;
+                gesture_lift_dir_acc_x += gesture_linear_world_x * dt_s;
+                gesture_lift_dir_acc_y += gesture_linear_world_y * dt_s;
+                gesture_lift_dir_acc_z += gesture_linear_world_z * dt_s;
             } else if (gesture_lift_event_start_ms > 0 && a_up > 0.0f) {
                 gesture_lift_pos_impulse_ms += a_up * dt_s;
                 gesture_lift_net_impulse_ms += a_up * dt_s;
+                gesture_lift_dir_acc_x += gesture_linear_world_x * dt_s;
+                gesture_lift_dir_acc_y += gesture_linear_world_y * dt_s;
+                gesture_lift_dir_acc_z += gesture_linear_world_z * dt_s;
                 gesture_lift_accel_samples = 0;
             } else if (a_up <= 0.0f) {
                 gesture_lift_event_start_ms = 0;
                 gesture_lift_accel_samples = 0;
                 gesture_lift_pos_impulse_ms = 0.0f;
                 gesture_lift_net_impulse_ms = 0.0f;
+                gesture_lift_dir_acc_x = 0.0f;
+                gesture_lift_dir_acc_y = 0.0f;
+                gesture_lift_dir_acc_z = 0.0f;
             } else {
                 gesture_lift_accel_samples = 0;
             }
@@ -2520,16 +2549,14 @@ static void process_gesture_sample(float ax, float ay, float az,
                                   gesture_pronation_phi_deg,
                                   gesture_lift_pos_impulse_ms,
                                   (float)hold_ms);
-#if GESTURE_DEBUG_HISTORY
-                gesture_trajectory_finish(1, GESTURE_DIAG_REASON_NONE);
-#endif
                 gesture_rearm_required = true;
-                capture_recording_stop_reference();
+                /* Freeze lift axis before sequence reset clears lift state. */
+                capture_recording_stop_axis_from_lift();
                 {
                     float gx = gesture_gravity_lp_x;
                     float gy = gesture_gravity_lp_y;
                     float gz = gesture_gravity_lp_z;
-                    /* Keep gyro on through recording for stop detection. */
+                    /* Gyro optional during recording; linear stop is primary. */
                     recording_requested = true;
                     gesture_block_until_ms = now + GESTURE_RETRIGGER_BLOCK_MS;
                     last_activity_ms = now;
@@ -3525,6 +3552,11 @@ static void audio_thread(void *p1, void *p2, void *p3)
             is_recording = false;
             reset_recording_stop_state();
             gyro_set_enabled(false);
+#if GESTURE_DEBUG_HISTORY
+            if (gesture_trajectory_active && gesture_trajectory_committed) {
+                gesture_trajectory_finish(1, GESTURE_DIAG_REASON_NONE);
+            }
+#endif
 
             /* Preserve ordering: all accepted PCM notifications must complete before stop. */
             (void)drain_audio_notifications();

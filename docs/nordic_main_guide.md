@@ -197,12 +197,15 @@ XIAOをリストバンドの手の甲側に置き、部品面を皮膚側、基�
 
 ### 録音停止トリガー
 
-録音開始時点の重力 LP（掌下）を仮基準とし、開始後 **3000 ms** は停止判定しない。
-その間静かなら基準を更新し、抑制終了時の掌下姿勢を固定する。その後、重力掌上
-ゲート（LP の phi≥20° かつ Δz≥0.50 または Z 符号反転）**または** gyro_y ゲート
-（∫≥45° かつ peak≥30 dps）が **500 ms 連続**し、かつ `|a|` が 7.5–12.5 m/s² のとき
-`stop_requested = true` となり、DMIC を停止して `0x02` を送りジャイロを OFF する。
-tilt 単独では止めない。手を重力方向へ下ろすだけでは停止しない。ホスト `0x00` と
+MATCH 時に挙上パルスの線形加速度方向を単位ベクトル `L` として固定する（弱ければ重力 LP）。
+開始後 **3000 ms** は停止判定しない。その後:
+
+1. `a_opp = -dot(linear, L)` が **≥ 0.25 m/s²** の短いパルス
+2. 負インパルス ≥ min(0.35, max(0.10, 0.20×lift_imp))、長さ **60–2000 ms**
+3. パルス後 **80 ms** の quiet settle（`|a|` 7.5–12.5、linear ≤ 4.0）
+
+成立で `stop_requested = true` → DMIC 停止 → イベント `0x02` → ジャイロ OFF。
+掌上反転・静止のみでは止めない（0.0.69+、感度は 0.0.71）。ホスト `0x00` と
 シリアル `'s'` による停止は従来どおり。
 
 ### ライトスリープ
@@ -311,15 +314,14 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 | `GESTURE_LIFT_NEG_IMPULSE_MIN_MS` | 0.015 m/s | 負インパルス下限 |
 | `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
 | `GESTURE_LIFT_PULSE_MIN_MS` | 150 ms | 短すぎる加減速パルスの下限 |
-| `GESTURE_STOP_GYRO_INTEGRATE_RATE_DPS` | 20 dps | 録音停止の積分対象レート |
-| `GESTURE_STOP_GYRO_ANGLE_MIN_DEG` | 45° | 録音停止 ∫ω_y |
-| `GESTURE_STOP_GYRO_ANGLE_PEAK_MIN_DPS` | 30 dps | 録音停止の積分角経路に必要なpeak |
-| `GESTURE_STOP_GYRO_PEAK_DPS` | 50 dps | 互換用定数（peak単独停止は0.0.64で廃止） |
-| `GESTURE_OUTBOUND_MIN_DEG` | 20° | 録音停止の重力 phi 必須（LP） |
-| `GESTURE_OUTBOUND_Z_RATIO_DONE` | 0.50 | 録音停止の Δz 必須副条件 |
-| `GESTURE_STOP_HOLD_MS` | 500 ms | 録音停止の連続成立時間 |
+| `GESTURE_STOP_OPP_ACCEL_MIN_MS2` | 0.25 | 録音停止の逆向き a 下限（0.0.71） |
+| `GESTURE_STOP_OPP_IMPULSE_MIN_MS` | 0.10 | 録音停止の負インパルス下限 |
+| `GESTURE_STOP_OPP_IMPULSE_LIFT_RATIO` | 0.20 | 負インパルス ≥ ratio×lift（上限あり） |
+| `GESTURE_STOP_OPP_IMPULSE_LIFT_CAP_MS` | 0.35 | lift 相対閾値の上限 |
+| `GESTURE_STOP_OPP_PULSE_MIN_MS` / `MAX` | 60 / 2000 | パルス時間窓 |
+| `GESTURE_STOP_SETTLE_MS` | 80 ms | パルス後 quiet |
 | `GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS` | 10 dps | hold 回内の積分対象レート |
-| `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 50° | hold 回内の ∫ω_y 下限 |
+| `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 30° | hold 回内の ∫ω_y 下限（0.0.70） |
 | `GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN` | 0.42 | peak \|ω_x\| / peak \|ω_y\| |
 | `GESTURE_LIFT_PREFLIP_MAX_DEG` | 50° | 挙上時 \|∫ωy\| 上限（回内前判定） |
 | `GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS` | 0.30 | XY 免除に必要な入口 +imp |
@@ -432,7 +434,7 @@ python3 gesture_monitor.py
 時系列グラフを表示する。`--no-plot`でPNG保存のみ、`--no-plot-files`で画像生成も無効にできる。
 
 グラフ上では、gyro起動前の灰色区間は正常な未取得区間である。gyro Yは回内・回外の主軸、
-gyro X/Zは挙上に伴う複合回転を含む。開始後の反対方向gyro Yピークは録音停止の掌上復帰に
+gyro X/Zは挙上に伴う複合回転を含む。録音停止は手下ろし（線形加速度の逆向きパルス）で行い、
 対応し得るため、`START OK` と `STOP GO` の前後を分けて評価する。
 
 物理操作を伴う試験は内容と回数を事前に説明し、準備完了を確認してから1試行ずつ開始する。
