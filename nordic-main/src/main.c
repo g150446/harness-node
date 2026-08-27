@@ -133,13 +133,13 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
  * Board on the back of the wrist, component-side against skin.  Axes: X across
  * the forearm, Y along the forearm (pronation axis = gyro_y), Z normal to the
  * board (component-out). Sequence: palm-up horizontal dwell → lift →
- * rotate from the palm-up pose and hold still 0.4 s.
+ * rotate from the palm-up pose and hold still 0.5 s.
  * A horizontal, still pose held for 0.5 seconds is treated as the palm-up
  * candidate. Gyro enables when that dwell is accepted, stays on through
  * recording, and powers down when
  * recording ends (or the sequence resets without a match).
- * Recording stops on a palm-up flip from the pose frozen at start
- * (gravity and/or gyro_y). Dropping the hand does not stop.
+ * A match additionally requires a strong lift and a near-complete palm flip.
+ * Recording stops on the reverse-of-lift hand-lower pulse.
  */
 #define GESTURE_GRAVITY_MS2                  9.80665f
 #define GESTURE_RAD_TO_DEG                   57.29577951308232
@@ -197,6 +197,10 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_LIFT_BRAKE_MIN_MS2               0.15f
 /* 0.0.68: daily FP had +imp ~0.10–0.26; require a clearer arm lift. */
 #define GESTURE_LIFT_POS_IMPULSE_MIN_MS           0.30f
+/* 0.0.72 final match gate: reject daily motion after the permissive early
+ * palm-down latch. Android false positives were below this combined gate. */
+#define GESTURE_MATCH_POS_IMPULSE_MIN_MS          0.65f
+#define GESTURE_MATCH_PRONATION_MIN_DEG          140.0f
 #define GESTURE_LIFT_NEG_IMPULSE_MIN_MS           0.015f
 #define GESTURE_LIFT_BRAKE_RATIO_MIN              0.05f
 #define GESTURE_LIFT_PULSE_MIN_MS                  150
@@ -275,6 +279,9 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_DIAG_REASON_PALM_DOWN_GYRO_ANGLE_LOW 0x26
 #define GESTURE_DIAG_REASON_PALM_DOWN_XY_RATIO_LOW  0x27
 #define GESTURE_DIAG_REASON_PALM_DOWN_GATE_FAILED   0x28
+#define GESTURE_DIAG_REASON_MATCH_LIFT_IMPULSE_LOW  0x29
+#define GESTURE_DIAG_REASON_MATCH_PRONATION_LOW     0x2a
+#define GESTURE_DIAG_REASON_MATCH_GATE_FAILED       0x2b
 
 /* ============================================================================
  * BLE UUIDs (Handy-compatible)
@@ -2516,6 +2523,58 @@ static void process_gesture_sample(float ax, float ay, float az,
 
             int64_t hold_ms = now - gesture_final_since_ms;
             if (hold_ms >= GESTURE_FINAL_HOLD_MS) {
+                bool match_lift_ok =
+                    gesture_lift_pos_impulse_ms >=
+                        GESTURE_MATCH_POS_IMPULSE_MIN_MS;
+                bool match_pronation_ok =
+                    gesture_pronation_phi_deg >=
+                        GESTURE_MATCH_PRONATION_MIN_DEG;
+
+                if (!match_lift_ok || !match_pronation_ok) {
+                    uint8_t failure_bits =
+                        (!match_lift_ok ? 0x01 : 0x00) |
+                        (!match_pronation_ok ? 0x02 : 0x00);
+
+                    printk(">>> Gesture rejected by final gate: "
+                           "impulse=%.3f/%.2f phi=%.1f/%.0f bits=0x%02x\n",
+                           (double)gesture_lift_pos_impulse_ms,
+                           (double)GESTURE_MATCH_POS_IMPULSE_MIN_MS,
+                           (double)gesture_pronation_phi_deg,
+                           (double)GESTURE_MATCH_PRONATION_MIN_DEG,
+                           failure_bits);
+
+                    if (!match_lift_ok) {
+                        send_gesture_diag(
+                            GESTURE_DIAG_WAIT_REJECT,
+                            GESTURE_DIAG_REASON_MATCH_LIFT_IMPULSE_LOW,
+                            gesture_lift_pos_impulse_ms,
+                            GESTURE_MATCH_POS_IMPULSE_MIN_MS,
+                            gesture_pronation_phi_deg);
+                    }
+                    if (!match_pronation_ok) {
+                        send_gesture_diag(
+                            GESTURE_DIAG_WAIT_REJECT,
+                            GESTURE_DIAG_REASON_MATCH_PRONATION_LOW,
+                            gesture_pronation_phi_deg,
+                            GESTURE_MATCH_PRONATION_MIN_DEG,
+                            gesture_lift_pos_impulse_ms);
+                    }
+                    send_gesture_diag(
+                        GESTURE_DIAG_RESET,
+                        GESTURE_DIAG_REASON_MATCH_GATE_FAILED,
+                        gesture_lift_pos_impulse_ms,
+                        gesture_pronation_phi_deg,
+                        (float)failure_bits);
+#if GESTURE_DEBUG_HISTORY
+                    gesture_trajectory_finish(
+                        2, GESTURE_DIAG_REASON_MATCH_GATE_FAILED);
+#endif
+                    gesture_rearm_required = true;
+                    reset_gesture_sequence();
+                    gesture_quiet_since_ms = 0;
+                    return;
+                }
+
                 int64_t motion_ms = now - gesture_lift_event_start_ms;
                 printk(">>> Gesture MATCH: palm-up dwell + lift + palm-down hold\n");
                 send_gesture_diag(GESTURE_DIAG_MOTION_COMPLETE,

@@ -1,7 +1,7 @@
 # 掌上0.5秒静止→挙上→掌下静止ジェスチャー仕様
 
 対象デバイス: Seeed Studio XIAO nRF52840 Sense  
-対象ファームウェア: HarnessNode `0.0.71` 以降（手下ろし停止は`0.0.69`、hold gyro 30°は`0.0.70`）
+対象ファームウェア: HarnessNode `0.0.72` 以降（最終誤発火ゲートは`0.0.72`）
 
 ## 検証時の二段階プロトコル
 
@@ -28,10 +28,11 @@
 - 掌向きを問わず、口元へ上げる（物理目安 **約 5 cm**）
 - 上げたあと、**掌上基準から手首を回して掌下** にし、**500 ms** 静止する
   - 掌下: 重力反転（phi≥15° または Δz≥0.40 または符号反転）と `|∫gyro_y dt| ≥ 30°`（0.0.70、積分対象 |ωy|≥10 dps）。peak `|gyro_x| / |gyro_y| ≥ 0.42` は、挙上未成立・回内先行・または挙上入口 impulse < 0.30 のときに要求。XY 免除は **回内前 lift かつ入口 +imp≥0.30** のときだけ。一度成立したらその試行中はラッチする
-  - 挙上: `a_up` 正インパルス ≥ **0.30** m/s（0.0.68）
+  - 挙上候補: `a_up` 正インパルス ≥ **0.30** m/s（0.0.68）
   - 静止進入: 線形加速度 RMS ≤ 3.0 m/s²。進入時のみ `|gyro_y| ≤ 90°/s`
   - hold中: RMS > 3.5 m/s²が2サンプル連続した場合だけ中断する
   - 最終静止: **500** ms（0.0.68）。姿勢差 ≤ 15°
+  - 最終発火: 挙上全体の正インパルス ≥ **0.65 m/s** **かつ**掌上基準からの重力角 phi ≥ **140°**（0.0.72）。30°のgyro条件は遅い回内をholdへ進める予備条件であり、単独では発火しない
 - 録音中に**挙上と逆向きの線形パルス（手下ろし）**で録音終了する。掌上反転・静止のみでは終了しない（0.0.69+）
 - ジャイロは録音終了（またはシーケンス失敗）で OFF
 
@@ -61,6 +62,7 @@ palm_down_after_lift = latch(gravity flip AND gyro_y angle>=50° AND (peak_x/pea
 hold_entry = palm_down_latched AND rms<=3.0 AND tilt<=15° AND |ω_y|<=90
 hold_continue = palm_down_latched AND NOT(rms>3.5 for 2 samples) AND tilt<=15°
 motion_complete = lift_start_to_hold_done < 4500 ms
+match_gate = positive_impulse>=0.65 AND palm_up_reference_phi>=140°
 ```
 
 ## 上昇動作の測り方（双極パルス）
@@ -100,7 +102,8 @@ WAIT_HOLD は掌上基準からの反転が取れるまで開始しない
 WAIT_BRAKE では減速パルス、または掌下・gyro静定・4サンプルRMS静止で WAIT_HOLD へ
 挙上開始から4500 ms時点で掌下連動が未成立なら`palm_down_gate_failed`、
 掌下成立後も500 ms最終静止が未完了なら`motion_too_slow`
-MATCH → recording (gyro stays ON) → stop palm-up → gyro OFF
+500 ms静止後に最終発火ゲート不足なら`match_gate_failed`
+MATCH → recording (gyro stays ON) → stop hand-lower → gyro OFF
 ```
 
 ## しきい値
@@ -111,6 +114,7 @@ MATCH → recording (gyro stays ON) → stop palm-up → gyro OFF
 | 掌上候補静止 | 500 ms、\|a\| 8.5–11.5 m/s²、RMS ≤ 4.0 m/s²、姿勢差 ≤ 20° |
 | ジャイロ | 0.5秒静止成立で ON、録音終了で OFF。ODR 104 Hz、FS ±500 dps、整定 50 ms |
 | 上向き加速度 | `a_up` ≥ 0.40 m/s² を2サンプル、正インパルス ≥ 0.30 m/s |
+| 最終発火ゲート | 挙上全体の正インパルス ≥ **0.65 m/s** かつ掌上基準からの phi ≥ **140°** |
 | 逆向き減速 | 任意。`a_up` ≤ -0.15 m/s² なら早期に hold へ |
 | パルス形状 | 150 ms以上。固定の最大パルス時間は設けない |
 | hold の掌 | 重力反転 **かつ** 逆符号 gyro_y（∫≥30° + XY連動または lift 免除） |
@@ -144,6 +148,7 @@ MATCH → recording (gyro stays ON) → stop palm-up → gyro OFF
 | `reset` reason `final_accel_missing` | gyro起動後 5000 ms 以内に上向き加速が不足 |
 | `reset` reason `motion_too_slow` | 挙上開始から最終静止完了まで4500 ms以上 |
 | `reset` reason `palm_down_gate_failed` | 4500 ms時点で掌下の重力＋gyro連動条件が未成立。録音停止動作を開始時間へ含めず別分類する |
+| `wait_reject` / `reset` reason `match_*` | 500 ms静止後の最終発火ゲート不足。実測インパルス・phiと閾値を通知する |
 
 ### 履歴バッチ（`GESTURE_DEBUG_HISTORY=1` のときのみ）
 
@@ -269,6 +274,13 @@ Mac の意図的下ろし（opp≈1.4）より弱い。0.0.71 では:
 - pulse **60–2000** ms、settle **80** ms、quiet linear ≤ **4.0**
 - lift 相対閾値に上限を付け、強挙上後も止めやすくする
 
+### 0.0.72 運転・料理中の開始誤発火抑制
+
+2026-08-27 18:00以降のRazr履歴45件をすべて負例として分析した。最終正インパルスは
+0.303–1.178 m/s、掌上基準からのphiは35.4–173.5°で、単独閾値では正例と重なった。
+最終正インパルス≥0.65 m/sとphi≥140°をAND条件にすると負例45/45を棄却し、
+保存済み意図的正例10/10を維持したため、500 ms hold完了後の最終発火ゲートに採用した。
+
 ### 6軸グラフの読み方
 
 履歴有効ファーム（`GESTURE_DEBUG_HISTORY=1`）では、試行終了時に同じサンプル列からCSVとPNGを
@@ -295,8 +307,8 @@ venv/bin/python gesture_validator.py --trials 1 --window 18 \
 
 表示条件: 掌上候補、0.5秒静止、挙上、掌下で静止、姿勢安定、
 単一動作、発動、手下ろしで録音終了。各行に **実測値と閾値** を出す。
-停止は重力 OR gyro_y で判定する。
-`recording_start` のあとホスト `0x00` では止めず、掌上による `recording_stop` を待つ。
+停止は挙上軸と逆向きの手下ろしパルスで判定する。
+`recording_start` のあとホスト `0x00` では止めず、手下ろしによる `recording_stop` を待つ。
 判定時間内に停止がなければ後始末として `0x00` を送る。
 
 対話式の実機試験では、カウントダウン、開始合図、BLE 接続状態、判定結果を
@@ -319,6 +331,28 @@ macOS Terminal に表示する。ログを保存するときは `tee` を使い�
 操作による掌上が5秒より95 ms早かったため4.905 sだが、静止中の自動停止ではない。
 録音開始相当時刻は、`match` 後に受信した `gyro_enabled` の時刻を使用した。
 
+### 0.0.72 実機受入（2026-08-27）
+
+`0.0.72` をBLE OTAで更新し、slot 0が`active=true`、`confirmed=true`、
+version `0.0.72`であることを確認した。Mac validatorの現装着側正例は、ユーザー指示により
+2試行で終了し、両方とも開始・手下ろし停止がPASSした。
+
+| 試行 | 最終正インパルス | phi | 最終hold | 結果 |
+|---:|---:|---:|---:|---|
+| 1 | 2.911 m/s | 161.2° | 500 ms | PASS |
+| 2 | 0.883 m/s | 175.5° | 500 ms | PASS |
+
+残りの受入試験はAndroidデバイスから実施する。Mac側で予定していた3回目、反対側3回、
+運転・料理の安全な模擬負例各3回は未実施であり、Android側の結果で置き換えて記録する。
+運転の確認は必ず停車・駐車状態で行い、料理の確認では火や刃物を使用しない。
+
+Android受入では次を確認する。
+
+1. アプリがHarnessNodeへ接続し、意図的な正例で録音開始・手下ろし停止が成立する。
+2. 運転・料理の安全な模擬動作では録音が開始しない。
+3. 試行前後の`voice_history_prefs.xml`を比較し、負例による新規認識履歴がない。
+4. 誤発火した場合は時刻、動作、認識文、無音判定を保存し、同時刻のジェスチャ診断と照合する。
+
 ## ビルド・OTA
 
 ```bash
@@ -332,4 +366,5 @@ cd mac_client && venv/bin/python ota_updater.py --device HarnessNode \
 ```
 
 `prj.conf` の `CONFIG_MCUBOOT_IMGTOOL_SIGN_VERSION` と `VERSION` を揃えてからビルドすること。  
-更新後 version `0.0.54` が slot0 active+confirmed であること。
+更新後は対象versionがslot 0でactiveかつconfirmedであること。`0.0.72`の確認済みhashは
+`b896ca684f5ed3edd489e9539eecd021b11970def83dbeb7767784497c6659f6`。

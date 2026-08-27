@@ -59,6 +59,8 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 | `GESTURE_LIFT_PREFLIP_MAX_DEG` | 50° | 挙上成立時の \|∫ωy\| 上限（未満=回内前） |
 | `GESTURE_LIFT_XY_WAIVER_IMPULSE_MIN_MS` | 0.30 | XY 免除に必要な入口 +imp |
 | `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.30 | 挙上正インパルス下限（0.0.68） |
+| `GESTURE_MATCH_POS_IMPULSE_MIN_MS` | 0.65 | 最終発火に必要な挙上全体の正インパルス（0.0.72） |
+| `GESTURE_MATCH_PRONATION_MIN_DEG` | 140° | 最終発火に必要な掌上基準からの重力角（0.0.72） |
 | `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止（0.0.68） |
 | `GESTURE_FINAL_QUIET_RATE_DPS` | 90 dps | hold **進入時のみ** |
 | `GESTURE_PRONATION_MIN_DEG` | 15° | hold 反転角（phi）。Z 比 0.40 または符号反転でも成立 |
@@ -93,6 +95,8 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 - `wait_reject` reason `final_hold_interrupted`: RMS / tilt / \|gy\|
 - `reset` reason `palm_down_gate_failed`: 掌下連動条件が期限までに一度も成立しなかった
 - `reset` reason `motion_too_slow`: 掌下成立後も最終静止が期限内に完了しなかった
+- `wait_reject` reason `match_lift_impulse_low` / `match_pronation_low`: 最終発火ゲートの個別不足。v1=実測、v2=閾値、v3=もう一方の実測
+- `reset` reason `match_gate_failed`: 500 ms静止は成立したが最終発火ゲート不足。v1=正インパルス、v2=phi、v3=失敗bit
 
 validatorは開始と停止を二段階で案内する。Ping音の`GO`後は`START OK`まで掌下を維持し、
 Glass音と`STOP GO`のあとに**腕を下ろす**。STOP GO前の停止は失敗として区別する。
@@ -131,12 +135,15 @@ cd nordic-main
 掌上のまま上げる、持続横 G、歩行で no-match を確認する。車載振動は安全に
 実施できる場合だけ追加する。停止は**手下ろし**で確認する（掌上では止めない）。
 
-2026-08-27 の確認結果（`0.0.70`→`0.0.71`）:
+2026-08-27 の確認結果（`0.0.70`→`0.0.72`）:
 
 - validator self-test: PASS
 - Mac 通し: 開始 + 手下ろし停止 PASS（opp_imp≈1.4）
 - Android「リンゴ」履歴: 旧閾値では約 13 s で opp_imp≈0.189 の弱い停止。0.0.71 で緩和
 - hold `|∫gyro_y|` は 50°→30°（0.0.70）。自然な掌下 ∫≈35° を通す
+- 2026-08-27 18:00以降のAndroid負例45件に対し、最終正インパルス≥0.65かつphi≥140°で45/45を棄却し、保存済み正例10/10を維持（0.0.72）
+- `0.0.72` OTA後、slot 0のactive + confirmedと署名versionを確認
+- Mac現装着側の正例2/2で開始・手下ろし停止PASS。Mac試験はユーザー指示で終了し、残りはAndroid実機で継続
 - 録音停止は挙上軸逆向きパルス + settle（0.0.69+）。掌上経路は廃止
 
 ## 保守上の注意
@@ -160,9 +167,8 @@ cd nordic-main
 - `nordic-main/src/main.c`: 状態機械、閾値、BLE 診断
 - `mac_client/gesture_validator.py`: BLE 試験、診断表示、JSON / 6軸グラフ、`--start-only`
 - `mac_client/imu_trajectory.py`: 6軸バッチ復元・CSV・PNG
-- `docs/flex_pronation_gesture.md`: 仕様正本（現行 0.0.68）
+- `docs/flex_pronation_gesture.md`: 仕様正本（現行 0.0.72）
 - `mac_client/gesture_dataset_collector.py`: 6秒のラベル付き6軸収集
 - `mac_client/gesture_dataset_analyzer.py`: 左右比較、特徴抽出、疑似横加速度感度解析
 - `mac_client/imu_trajectory.py`: 6軸バッチ復元、CSV、グラフ共通処理
-- `docs/flex_pronation_gesture.md`: ジェスチャ仕様
 - `docs/nordic_main_guide.md`: ビルド、OTA、運用

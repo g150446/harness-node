@@ -124,6 +124,9 @@ DIAG_REASON_NAMES = {
     0x26: "palm_down_gyro_angle_low",
     0x27: "palm_down_xy_ratio_low",
     0x28: "palm_down_gate_failed",
+    0x29: "match_lift_impulse_low",
+    0x2A: "match_pronation_low",
+    0x2B: "match_gate_failed",
 }
 
 START_BOARD_FLAT_Z_MIN_RATIO = 0.75
@@ -160,6 +163,8 @@ LIFT_PREFLIP_MAX_DEG = 50.0
 LIFT_XY_WAIVER_IMPULSE_MIN_MS = 0.30
 # Final: upward acceleration pulse, braking pulse, stable pose, then hold.
 FINAL_POS_IMPULSE_MIN_MS = 0.30
+MATCH_POS_IMPULSE_MIN_MS = 0.65
+MATCH_PRONATION_MIN_DEG = 140.0
 FINAL_NEG_IMPULSE_MIN_MS = 0.015
 FINAL_BRAKE_RATIO_MIN = 0.05
 FINAL_TILT_MAX_DEG = 15.0
@@ -310,6 +315,16 @@ def motion_completed_in_time(elapsed_ms: float) -> bool:
     return 0.0 <= elapsed_ms < MOTION_COMPLETE_MAX_MS
 
 
+def gesture_match_final_gate_eligible(
+    positive_impulse_ms: float, pronation_deg: float
+) -> bool:
+    """Mirror the 0.0.72 final match gate after palm-down hold."""
+    return (
+        positive_impulse_ms >= MATCH_POS_IMPULSE_MIN_MS
+        and pronation_deg >= MATCH_PRONATION_MIN_DEG
+    )
+
+
 def stop_occurred_after_cue(
     stop_cue_latency_ms: Optional[int], stop_latency_ms: Optional[int]
 ) -> bool:
@@ -358,6 +373,7 @@ def build_condition_results(
     final_start = _latest_diagnostic(diagnostics, stage="final_hold_start")
     final_ready = _latest_diagnostic(diagnostics, stage="final_ready")
     motion_complete = _latest_diagnostic(diagnostics, stage="motion_complete")
+    match_diag = _latest_diagnostic(diagnostics, stage="match")
     wait_quiet = _latest_diagnostic(
         diagnostics,
         stage="wait_reject",
@@ -389,6 +405,7 @@ def build_condition_results(
             "lift_palm_still_up",
             "motion_too_slow",
             "palm_down_gate_failed",
+            "match_gate_failed",
         ),
     )
     pulse_retry = _latest_diagnostic(
@@ -469,6 +486,49 @@ def build_condition_results(
             )
         )
 
+    match_gate_reset = (
+        final_reset
+        if final_reset is not None
+        and final_reset.get("reason") == "match_gate_failed"
+        else None
+    )
+    if (
+        match_diag is not None
+        and match_diag.get("value1") is not None
+        and match_diag.get("value2") is not None
+    ):
+        match_impulse = float(match_diag.get("value2") or 0.0)
+        match_pronation = float(match_diag.get("value1") or 0.0)
+    elif match_gate_reset is not None:
+        match_impulse = float(match_gate_reset.get("value1") or 0.0)
+        match_pronation = float(match_gate_reset.get("value2") or 0.0)
+    else:
+        match_impulse = None
+        match_pronation = None
+
+    if match_impulse is not None:
+        conditions.append(
+            ConditionResult(
+                "最終挙上強度",
+                "PASS" if match_impulse >= MATCH_POS_IMPULSE_MIN_MS else "FAIL",
+                f"実測 {match_impulse:.3f} m/s | 閾値 ≥{MATCH_POS_IMPULSE_MIN_MS:.2f} m/s",
+            )
+        )
+        conditions.append(
+            ConditionResult(
+                "掌上から掌下への反転",
+                "PASS" if match_pronation >= MATCH_PRONATION_MIN_DEG else "FAIL",
+                f"実測 {match_pronation:.1f}° | 閾値 ≥{MATCH_PRONATION_MIN_DEG:.0f}°",
+            )
+        )
+    else:
+        conditions.append(
+            ConditionResult("最終挙上強度", "NOT_REACHED", "最終発火ゲート未到達")
+        )
+        conditions.append(
+            ConditionResult("掌上から掌下への反転", "NOT_REACHED", "最終発火ゲート未到達")
+        )
+
     if outbound_ready is not None:
         dwell_ms = float(outbound_ready["value1"] or 0.0)
         z_ratio = abs(float(outbound_ready["value2"] or 0.0))
@@ -527,11 +587,17 @@ def build_condition_results(
         "final_hold_timeout",
         "lift_palm_still_up",
         "palm_down_gate_failed",
+        "match_gate_failed",
     ):
         pos_impulse = float(final_reset.get("value1") or 0.0)
         neg_impulse = float(final_reset.get("value2") or 0.0)
         if final_reset["reason"] == "palm_down_gate_failed":
             detail = "挙上パルス成立後、掌下連動条件が未成立"
+        elif final_reset["reason"] == "match_gate_failed":
+            detail = (
+                f"挙上パルス {pos_impulse:.3f} m/s成立後、"
+                "最終発火ゲートで棄却"
+            )
         else:
             detail = (
                 f"加速 {pos_impulse:.3f} m/s、減速 {neg_impulse:.3f} m/s（成立済み）"
@@ -1077,10 +1143,21 @@ def format_event(event: GestureEvent) -> str:
                 f"elapsed={v3:.0f}ms"
             )
         elif stage == "wait_reject":
-            suffix = (
-                f" reason={reason} value1={v1:.2f} "
-                f"value2={v2:.2f} value3={v3:.1f}"
-            )
+            if reason == "match_lift_impulse_low":
+                suffix = (
+                    f" reason={reason} positive_impulse={v1:.3f}m/s "
+                    f"required={v2:.2f}m/s pronation={v3:.1f}deg"
+                )
+            elif reason == "match_pronation_low":
+                suffix = (
+                    f" reason={reason} pronation={v1:.1f}deg "
+                    f"required={v2:.0f}deg positive_impulse={v3:.3f}m/s"
+                )
+            else:
+                suffix = (
+                    f" reason={reason} value1={v1:.2f} "
+                    f"value2={v2:.2f} value3={v3:.1f}"
+                )
         elif reason == "turnaround_timeout":
             suffix = (
                 f" reason={reason} elapsed={v1:.0f}ms "
@@ -1100,6 +1177,11 @@ def format_event(event: GestureEvent) -> str:
             suffix = (
                 f" reason={reason} elapsed={v1:.0f}ms "
                 f"signed_roll={v2:.1f}deg xy_ratio={v3:.2f}"
+            )
+        elif reason == "match_gate_failed":
+            suffix = (
+                f" reason={reason} positive_impulse={v1:.3f}m/s "
+                f"pronation={v2:.1f}deg failure_bits={int(v3)}"
             )
         else:
             suffix = f" reason={reason} values={v1:.2f},{v2:.2f},{v3:.2f}"
@@ -1187,6 +1269,24 @@ def diagnostic_record(event: GestureEvent) -> dict[str, Any]:
             "motion_elapsed_ms": event.value1,
             "gyro_y_peak_dps": event.value2,
             "gyro_y_integral_deg": event.value3,
+        }
+    elif stage == "reset" and reason == "match_gate_failed":
+        record["metrics"] = {
+            "positive_impulse_ms": event.value1,
+            "pronation_angle_deg": event.value2,
+            "failure_bits": event.value3,
+        }
+    elif stage == "wait_reject" and reason == "match_lift_impulse_low":
+        record["metrics"] = {
+            "positive_impulse_ms": event.value1,
+            "required_impulse_ms": event.value2,
+            "pronation_angle_deg": event.value3,
+        }
+    elif stage == "wait_reject" and reason == "match_pronation_low":
+        record["metrics"] = {
+            "pronation_angle_deg": event.value1,
+            "required_pronation_deg": event.value2,
+            "positive_impulse_ms": event.value3,
         }
     elif stage == "reset" and reason in (
         "final_accel_missing",
@@ -2056,6 +2156,20 @@ def run_self_test() -> int:
     assert final.diag_stage == 0x08
     assert "hold=525ms" in format_event(final)
 
+    match_gate_packet = bytearray(
+        [0x00, 0x55, EVT_GESTURE_DIAG, 0x10, 0x29]
+    )
+    match_gate_packet.extend(struct.pack("<fff", 0.638, 0.65, 153.6))
+    match_gate = parse_event_packet(bytes(match_gate_packet), now=16.5)
+    assert match_gate is not None
+    assert "required=0.65m/s" in format_event(match_gate)
+    match_gate_record = diagnostic_record(match_gate)
+    assert math.isclose(
+        match_gate_record["metrics"]["required_impulse_ms"],
+        0.65,
+        rel_tol=1e-6,
+    )
+
     bias_packet = bytearray(
         [0x00, 0x55, EVT_GESTURE_DIAG, 0x0A, 0x00]
     )
@@ -2078,6 +2192,81 @@ def run_self_test() -> int:
     assert MOTION_COMPLETE_MAX_MS == 4500
     assert FINAL_TILT_MAX_DEG == 15.0
     assert FINAL_HOLD_MIN_MS == 500
+    assert MATCH_POS_IMPULSE_MIN_MS == 0.65
+    assert MATCH_PRONATION_MIN_DEG == 140.0
+    assert gesture_match_final_gate_eligible(0.65, 140.0)
+    assert not gesture_match_final_gate_eligible(0.649, 140.0)
+    assert not gesture_match_final_gate_eligible(0.65, 139.9)
+
+    # De-identified (final positive impulse, palm-up reference angle) replay.
+    # Android 2026-08-27 18:00+ labels all 45 records as false positives.
+    android_false_positive_regression = [
+        (0.453637, 94.341827),
+        (0.380244, 147.922485),
+        (0.606543, 124.721581),
+        (0.541128, 120.005676),
+        (0.619267, 140.790863),
+        (0.515249, 89.626007),
+        (0.316049, 100.010941),
+        (0.521128, 35.383652),
+        (0.391389, 72.995178),
+        (0.454178, 72.241272),
+        (0.523483, 41.429001),
+        (0.422851, 101.257347),
+        (0.706178, 42.493492),
+        (0.352658, 81.310791),
+        (0.379812, 92.696991),
+        (0.514638, 76.439804),
+        (0.307426, 99.555664),
+        (0.317836, 52.513206),
+        (0.924223, 120.045547),
+        (0.326881, 61.969872),
+        (0.454647, 173.499725),
+        (0.392254, 47.517334),
+        (0.545940, 41.548798),
+        (0.375240, 141.261673),
+        (0.508888, 111.016388),
+        (0.307067, 113.648445),
+        (0.333314, 103.727112),
+        (0.638360, 153.558060),
+        (0.420161, 137.856674),
+        (0.778483, 137.790817),
+        (0.478118, 88.654877),
+        (0.579495, 85.624634),
+        (0.302808, 97.471863),
+        (0.782338, 71.117325),
+        (0.633290, 90.213257),
+        (0.629624, 163.651886),
+        (0.422142, 117.385010),
+        (0.335667, 69.190308),
+        (0.657063, 64.689644),
+        (0.690903, 69.442535),
+        (1.178500, 92.087898),
+        (0.438945, 42.783249),
+        (0.467577, 52.722748),
+        (0.403868, 59.182060),
+        (0.558119, 91.195984),
+    ]
+    known_true_positive_regression = [
+        (0.853, 179.0),
+        (0.927, 179.1),
+        (0.828, 147.3),
+        (0.867, 177.9),
+        (1.067, 179.6),
+        (0.700, 170.8),
+        (0.744, 177.3),
+        (0.952, 173.7),
+        (2.522, 163.5),
+        (2.527, 158.4),
+    ]
+    assert not any(
+        gesture_match_final_gate_eligible(*sample)
+        for sample in android_false_positive_regression
+    )
+    assert all(
+        gesture_match_final_gate_eligible(*sample)
+        for sample in known_true_positive_regression
+    )
     eligible = (0.90, 20.0, 0.30, 0.015, 15.0, 500)
     assert gesture_gate_eligible(*eligible)
     assert gesture_gate_eligible(0.75, *eligible[1:])

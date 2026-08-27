@@ -311,6 +311,8 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 | `GESTURE_LIFT_ACCEL_MIN_MS2` | 0.40 m/s² | 上向き加速パルス下限 |
 | `GESTURE_LIFT_BRAKE_MIN_MS2` | 0.15 m/s² | 逆向き減速パルス下限 |
 | `GESTURE_LIFT_POS_IMPULSE_MIN_MS` | 0.30 m/s | 正インパルス下限（0.0.68） |
+| `GESTURE_MATCH_POS_IMPULSE_MIN_MS` | 0.65 m/s | 最終発火の挙上全体インパルス下限（0.0.72） |
+| `GESTURE_MATCH_PRONATION_MIN_DEG` | 140° | 最終発火の掌上基準phi下限（0.0.72） |
 | `GESTURE_LIFT_NEG_IMPULSE_MIN_MS` | 0.015 m/s | 負インパルス下限 |
 | `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
 | `GESTURE_LIFT_PULSE_MIN_MS` | 150 ms | 短すぎる加減速パルスの下限 |
