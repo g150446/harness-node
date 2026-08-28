@@ -27,7 +27,7 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
    - `WAIT_HOLD`: 掌上基準からの反転（重力 OR 逆符号 gyro_y）後、RMS 静止と 500 ms hold。
    - 掌下の重力＋gyro連動条件は一度成立したらその試行中ラッチする。
    - hold **進入時のみ** `|ω_y| ≤ 90 dps`、RMS ≤ 3.0。進入後はRMS > 3.5が2サンプル連続した場合だけ中断する。
-   - gyro起動後、5000 ms以内に挙上が始まらなければ `final_accel_missing`。
+   - gyro起動後、8000 ms以内に挙上が始まらなければ `final_accel_missing`（0.0.74）。
    - 挙上開始から4500 ms時点で掌下連動が未成立なら`palm_down_gate_failed`、成立済みで500 ms holdが未完了なら`motion_too_slow`。
 3. 録音中
    - MATCH 時に挙上軸 `L` を固定し、逆向き線形パルス + settle で録音停止。
@@ -48,11 +48,16 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 | `GYRO_ODR_HZ` / `GYRO_FULL_SCALE_DPS` | 104 / 500 | オンデマンドジャイロ |
 | `GESTURE_GYRO_SETTLE_MS` | 50 ms | ジャイロ整定 |
 | `GESTURE_STOP_OPP_ACCEL_MIN_MS2` | 0.25 | 録音停止の逆向き a 下限（0.0.71） |
+| `GESTURE_STOP_OPP_ACCEL_SOFT` / `SOFT2` | 0.18 / 0.15 | 5 s / 10 s 経過後の peak 下限（0.0.73） |
 | `GESTURE_STOP_OPP_IMPULSE_MIN_MS` | 0.10 | 録音停止の負インパルス下限 |
+| `GESTURE_STOP_OPP_IMPULSE_SOFT` / `SOFT2` | 0.08 / 0.07 | 5 s / 10 s 経過後の imp 下限 |
 | `GESTURE_STOP_OPP_IMPULSE_LIFT_RATIO` | 0.20 | 負インパルス ≥ ratio×lift |
 | `GESTURE_STOP_OPP_IMPULSE_LIFT_CAP_MS` | 0.35 | lift 相対閾値の上限 |
 | `GESTURE_STOP_OPP_PULSE_MIN_MS` / `MAX` | 60 / 2000 | パルス時間窓（車両の長G除外） |
-| `GESTURE_STOP_SETTLE_MS` | 80 ms | パルス後の quiet 保持 |
+| `GESTURE_STOP_OPP_PULSE_SLOW_MS` | 180 | slow-path の最短パルス |
+| `GESTURE_STOP_PULSE_GAP_MS` | 50 | パルス終端ヒステリシス |
+| `GESTURE_STOP_SETTLE_MS` / soft / soft2 | 80 / 50 / 40 | パルス後 quiet 保持 |
+| `GESTURE_STOP_SOFTEN_AFTER_MS` / `2` | 5000 / 10000 | soft 閾値への経過時間 |
 | `GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS` | 10 dps | hold 回内の積分対象レート |
 | `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 30° | hold 回内の ∫ω_y（0.0.70） |
 | `GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN` | 0.42 | peak \|ω_x\| / peak \|ω_y\| |
@@ -69,9 +74,9 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 | `GESTURE_LIFT_PULSE_MIN_MS` | 150 ms | 短すぎるパルスの下限 |
 | `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 15° | hold 中の姿勢差上限 |
 | `GESTURE_FINAL_STILL_RMS_MS2` | 3.0 m/s² | 静止進入 RMS 上限 |
-| `GESTURE_FINAL_HOLD_RMS_EXIT_MS2` | 3.5 m/s² | hold中のRMS中断閾値 |
-| `GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES` | 2 | 中断に必要な連続超過数 |
-| `GESTURE_LIFT_START_TIMEOUT_MS` | 5000 ms | gyro起動後に挙上を開始するまでの期限 |
+| `GESTURE_FINAL_HOLD_RMS_EXIT_MS2` | 4.0 m/s² | hold中のRMS中断閾値（0.0.74） |
+| `GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES` | 3 | 中断に必要な連続超過数（0.0.74） |
+| `GESTURE_LIFT_START_TIMEOUT_MS` | 8000 ms | gyro起動後に挙上を開始するまでの期限（0.0.74） |
 | `GESTURE_MOTION_COMPLETE_MAX_MS` | 4500 ms | 挙上開始から最終静止完了まで。4.5秒以上は不成立 |
 | `GESTURE_RETRIGGER_BLOCK_MS` | 3000 ms | 開始直後の停止抑制（基準再ロック）/ 停止後の再開始抑制 |
 
@@ -92,6 +97,7 @@ nRF52840 Sense の **加速度（常時）** と **ジャイロ（オンデマ�
 - `motion_complete`: 挙上開始から最終静止完了までの時間、gyro Y peak、積分角
 - `palm_down_gate`: 重力反転、gyro Y積分角、peak gyro X/Y比の不足理由
 - `stop_hand_lower` (0x0C): opp_imp / peak a_opp / pulse_ms（手下ろし停止）
+- `stop_near_miss` (0x0B): 失敗パルス。reason=impulse/peak/pulse_*、v1/v2/v3=opp/peak/need または pulse
 - `wait_reject` reason `final_hold_interrupted`: RMS / tilt / \|gy\|
 - `reset` reason `palm_down_gate_failed`: 掌下連動条件が期限までに一度も成立しなかった
 - `reset` reason `motion_too_slow`: 掌下成立後も最終静止が期限内に完了しなかった
@@ -140,11 +146,14 @@ cd nordic-main
 - validator self-test: PASS
 - Mac 通し: 開始 + 手下ろし停止 PASS（opp_imp≈1.4）
 - Android「リンゴ」履歴: 旧閾値では約 13 s で opp_imp≈0.189 の弱い停止。0.0.71 で緩和
+- 2026-08-28 13:06 Android「リンゴと一言つぶやいてリンゴ」: MATCH→stop 約 24 s、opp≈0.181。0.0.73 で soft-lower + near-miss
 - hold `|∫gyro_y|` は 50°→30°（0.0.70）。自然な掌下 ∫≈35° を通す
 - 2026-08-27 18:00以降のAndroid負例45件に対し、最終正インパルス≥0.65かつphi≥140°で45/45を棄却し、保存済み正例10/10を維持（0.0.72）
 - `0.0.72` OTA後、slot 0のactive + confirmedと署名versionを確認
 - Mac現装着側の正例2/2で開始・手下ろし停止PASS。Mac試験はユーザー指示で終了し、残りはAndroid実機で継続
-- 録音停止は挙上軸逆向きパルス + settle（0.0.69+）。掌上経路は廃止
+- 録音停止は挙上軸逆向きパルス + settle（0.0.69+）。掌上経路は廃止。0.0.73 で時間減衰・ヒステリシス
+- 2026-08-28: `0.0.74` OTA（slot 0 active+confirmed）。Mac 開始+停止 PASS（latency≈4.9 s）。
+  挙上開始 8 s、hold RMS exit 4.0×3、`lift_near_miss` で弱い a_up を可視化
 
 ## 保守上の注意
 
@@ -156,19 +165,22 @@ cd nordic-main
 - 重力 LP はパルス開始まで追従し、hold の姿勢基準は静止進入時に固定する。
 - 録音停止は MATCH 時の挙上軸 `L` を固定し、開始後 3000 ms 抑制のあと逆向きパルス + settle。
   `reset_gesture_sequence()` では消さない。掌上・静止のみでは止めない。
-- 最終静止は進入RMS 3.0 m/s²以下、保持中は3.5 m/s²超過2サンプル連続で中断、継続500 ms。
-  挙上開始待ちは5 s、動作完了は4.5 s未満。
+- 0.0.73: 失敗パルスは `stop_near_miss`。5 s/10 s で soft 閾値。パルス終端 50 ms ギャップと
+  settle 中 2 サンプル連続スパイクまで unlatch しない。
+- 0.0.74: 挙上開始待ち 8 s。弱い lift は `lift_near_miss`。hold 中断は RMS>4.0 が3サンプル連続。
+  最終 match ゲート（imp≥0.65 ∧ phi≥140°）は変更しない。
+- 最終静止は進入RMS 3.0 m/s²以下、保持中は4.0 m/s²超過3サンプル連続で中断、継続500 ms。
+  動作完了は4.5 s未満。
 - 減速パルスは任意。取れない場合も掌下・gyro静定・4サンプルRMS静止でholdへ進む。
 - 実機ログでは掌上候補の Z 比・静止時間、加速度/ジャイロ6軸、正負インパルス、姿勢差、
-  hold 時間、`stop_hand_lower` の opp_imp/peak/pulse、reset reason を確認する。
+  hold 時間、`lift_near_miss` / `stop_hand_lower` / `stop_near_miss`、reset reason を確認する。
 
 ## 関連ファイル
 
 - `nordic-main/src/main.c`: 状態機械、閾値、BLE 診断
 - `mac_client/gesture_validator.py`: BLE 試験、診断表示、JSON / 6軸グラフ、`--start-only`
 - `mac_client/imu_trajectory.py`: 6軸バッチ復元・CSV・PNG
-- `docs/flex_pronation_gesture.md`: 仕様正本（現行 0.0.72）
+- `docs/flex_pronation_gesture.md`: 仕様正本（現行 0.0.74）
 - `mac_client/gesture_dataset_collector.py`: 6秒のラベル付き6軸収集
 - `mac_client/gesture_dataset_analyzer.py`: 左右比較、特徴抽出、疑似横加速度感度解析
-- `mac_client/imu_trajectory.py`: 6軸バッチ復元、CSV、グラフ共通処理
 - `docs/nordic_main_guide.md`: ビルド、OTA、運用

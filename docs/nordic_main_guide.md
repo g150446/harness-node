@@ -317,11 +317,16 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 | `GESTURE_LIFT_BRAKE_RATIO_MIN` | 0.05 | 減速/加速インパルス比下限 |
 | `GESTURE_LIFT_PULSE_MIN_MS` | 150 ms | 短すぎる加減速パルスの下限 |
 | `GESTURE_STOP_OPP_ACCEL_MIN_MS2` | 0.25 | 録音停止の逆向き a 下限（0.0.71） |
+| `GESTURE_STOP_OPP_ACCEL_SOFT` / `SOFT2` | 0.18 / 0.15 | 5 s / 10 s 後 peak（0.0.73） |
 | `GESTURE_STOP_OPP_IMPULSE_MIN_MS` | 0.10 | 録音停止の負インパルス下限 |
+| `GESTURE_STOP_OPP_IMPULSE_SOFT` / `SOFT2` | 0.08 / 0.07 | 5 s / 10 s 後 imp |
 | `GESTURE_STOP_OPP_IMPULSE_LIFT_RATIO` | 0.20 | 負インパルス ≥ ratio×lift（上限あり） |
 | `GESTURE_STOP_OPP_IMPULSE_LIFT_CAP_MS` | 0.35 | lift 相対閾値の上限 |
 | `GESTURE_STOP_OPP_PULSE_MIN_MS` / `MAX` | 60 / 2000 | パルス時間窓 |
-| `GESTURE_STOP_SETTLE_MS` | 80 ms | パルス後 quiet |
+| `GESTURE_STOP_OPP_PULSE_SLOW_MS` | 180 | slow-path 最短パルス（0.0.73） |
+| `GESTURE_STOP_PULSE_GAP_MS` | 50 | パルス終端ヒステリシス |
+| `GESTURE_STOP_SETTLE_MS` / soft / soft2 | 80 / 50 / 40 | パルス後 quiet |
+| `GESTURE_STOP_SOFTEN_AFTER_MS` / `2` | 5000 / 10000 | soft 閾値への経過 |
 | `GESTURE_HOLD_GYRO_INTEGRATE_RATE_DPS` | 10 dps | hold 回内の積分対象レート |
 | `GESTURE_HOLD_GYRO_ANGLE_MIN_DEG` | 30° | hold 回内の ∫ω_y 下限（0.0.70） |
 | `GESTURE_HOLD_GYRO_XY_PEAK_RATIO_MIN` | 0.42 | peak \|ω_x\| / peak \|ω_y\| |
@@ -330,11 +335,11 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 | `GESTURE_FINAL_QUIET_RATE_DPS` | 90 dps | hold 進入時のみ |
 | `GESTURE_LIFT_FINAL_TILT_MAX_DEG` | 15° | 静止開始時の重力方向からの保持中姿勢差上限 |
 | `GESTURE_FINAL_STILL_RMS_MS2` | 3.0 m/s² | 4サンプル静止RMS上限 |
-| `GESTURE_FINAL_HOLD_RMS_EXIT_MS2` | 3.5 m/s² | hold中のRMS中断閾値 |
-| `GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES` | 2 | hold中断に必要な連続超過数 |
+| `GESTURE_FINAL_HOLD_RMS_EXIT_MS2` | 4.0 m/s² | hold中のRMS中断閾値（0.0.74） |
+| `GESTURE_FINAL_HOLD_RMS_EXIT_SAMPLES` | 3 | hold中断に必要な連続超過数（0.0.74） |
 | `GESTURE_FINAL_HOLD_MS` | 500 ms | 最終静止保持時間（0.0.68） |
 | `GESTURE_GRAVITY_LP_TAU_S` | 0.30 s | 重力推定の低通時定数 |
-| `GESTURE_LIFT_START_TIMEOUT_MS` | 5000 ms | gyro起動後に挙上を開始するまでの期限 |
+| `GESTURE_LIFT_START_TIMEOUT_MS` | 8000 ms | gyro起動後に挙上を開始するまでの期限（0.0.74） |
 | `GESTURE_MOTION_COMPLETE_MAX_MS` | 4500 ms | 挙上開始から500 ms最終静止完了までの上限 |
 | `GESTURE_RETRIGGER_BLOCK_MS` | 3000 ms | 開始直後の停止抑制（基準再ロック）/ 停止後の再開始抑制 |
 | `GYRO_ODR_HZ` | 104 | オンデマンドジャイロ ODR |

@@ -89,6 +89,7 @@ DIAG_STAGE_NAMES = {
     0x08: "final_ready",
     0x09: "match",
     0x0A: "match_detail",
+    0x0B: "stop_near_miss",
     0x0C: "stop_hand_lower",
     0x0D: "gyro_enabled",
     0x0E: "gyro_disabled",
@@ -98,6 +99,7 @@ DIAG_STAGE_NAMES = {
     0x22: "hold_sample",
     0x23: "motion_complete",
     0x24: "palm_down_gate",
+    0x25: "lift_near_miss",
     0x10: "wait_reject",
     0x80: "reset",
 }
@@ -127,6 +129,12 @@ DIAG_REASON_NAMES = {
     0x29: "match_lift_impulse_low",
     0x2A: "match_pronation_low",
     0x2B: "match_gate_failed",
+    0x2C: "stop_impulse_low",
+    0x2D: "stop_peak_low",
+    0x2E: "stop_pulse_short",
+    0x2F: "stop_pulse_long",
+    0x30: "lift_pulse_weak",
+    0x31: "lift_start_timeout",
 }
 
 START_BOARD_FLAT_Z_MIN_RATIO = 0.75
@@ -136,6 +144,7 @@ START_QUIET_ACCEL_MAX_MS2 = 4.0
 SHAKE_PTP_MIN_MS2 = 5.0
 SHAKE_MEAN_RATIO_MAX = 0.4
 # Recording-stop hand-lower (0.0.69): reverse lift-axis pulse + settle.
+# 0.0.73: time-decay soft thresholds + slow-path peak waiver.
 PRONATION_ANGLE_MIN_DEG = 20.0
 PRONATION_TILT_MIN_DEG = 30.0
 PRONATION_START_DEG = 20.0
@@ -143,14 +152,25 @@ PRONATION_Z_RATIO_START = 0.50
 PRONATION_Z_RATIO_DONE = 0.50
 STOP_POST_START_INHIBIT_MS = 3000
 STOP_OPP_ACCEL_MIN_MS2 = 0.25
+STOP_OPP_ACCEL_SOFT_MS2 = 0.18
+STOP_OPP_ACCEL_SOFT2_MS2 = 0.15
 STOP_OPP_CONSECUTIVE_SAMPLES = 2
 STOP_OPP_IMPULSE_MIN_MS = 0.10
+STOP_OPP_IMPULSE_SOFT_MS = 0.08
+STOP_OPP_IMPULSE_SOFT2_MS = 0.07
 STOP_OPP_IMPULSE_LIFT_RATIO = 0.20
 STOP_OPP_IMPULSE_LIFT_CAP_MS = 0.35
 STOP_OPP_PULSE_MIN_MS = 60
+STOP_OPP_PULSE_SLOW_MS = 180
 STOP_OPP_PULSE_MAX_MS = 2000
+STOP_PULSE_GAP_MS = 50
 STOP_SETTLE_MS = 80
+STOP_SETTLE_SOFT_MS = 50
+STOP_SETTLE_SOFT2_MS = 40
 STOP_SETTLE_LINEAR_MS2 = 4.0
+STOP_SETTLE_LINEAR_SOFT_MS2 = 5.0
+STOP_SOFTEN_AFTER_MS = 5000
+STOP_SOFTEN2_AFTER_MS = 10000
 # Legacy aliases kept for older notes / self-test migration.
 STOP_HOLD_MS = STOP_SETTLE_MS
 HOLD_PRONATION_ANGLE_MIN_DEG = 15.0
@@ -169,10 +189,11 @@ FINAL_NEG_IMPULSE_MIN_MS = 0.015
 FINAL_BRAKE_RATIO_MIN = 0.05
 FINAL_TILT_MAX_DEG = 15.0
 FINAL_HOLD_MIN_MS = 500
+LIFT_START_TIMEOUT_MS = 8000
 MOTION_COMPLETE_MAX_MS = 4500
 FINAL_STILL_RMS_MS2 = 3.0
-FINAL_HOLD_RMS_EXIT_MS2 = 3.5
-FINAL_HOLD_RMS_EXIT_SAMPLES = 2
+FINAL_HOLD_RMS_EXIT_MS2 = 4.0
+FINAL_HOLD_RMS_EXIT_SAMPLES = 3
 FINAL_QUIET_RATE_DPS = 90.0
 OUTBOUND_GYRO_INTEGRATE_RATE_DPS = 20.0
 OUTBOUND_GYRO_ANGLE_MIN_DEG = 45.0
@@ -269,25 +290,61 @@ def gesture_gate_eligible(
     )
 
 
-def recording_stop_hand_lower_eligible(
-    opp_impulse_ms: float,
-    opp_peak_ms2: float = 0.0,
-    pulse_ms: float = 0.0,
-    lift_impulse_ms: float = 0.0,
-) -> bool:
-    """Mirror firmware recording-stop hand-lower pulse (0.0.71)."""
-    need_imp = min(
+def recording_stop_impulse_need(lift_impulse_ms: float = 0.0) -> float:
+    """Base impulse threshold before time-decay soften (0.0.71/0.0.73)."""
+    return min(
         STOP_OPP_IMPULSE_LIFT_CAP_MS,
         max(
             STOP_OPP_IMPULSE_MIN_MS,
             lift_impulse_ms * STOP_OPP_IMPULSE_LIFT_RATIO,
         ),
     )
-    return (
+
+
+def recording_stop_active_thresholds(
+    elapsed_ms: float = 0.0,
+    lift_impulse_ms: float = 0.0,
+) -> tuple[float, float, float, float]:
+    """Return (need_imp, peak_min, settle_ms, settle_linear_max) for elapsed."""
+    need = recording_stop_impulse_need(lift_impulse_ms)
+    peak = STOP_OPP_ACCEL_MIN_MS2
+    settle = float(STOP_SETTLE_MS)
+    linear_max = STOP_SETTLE_LINEAR_MS2
+    if elapsed_ms >= STOP_SOFTEN_AFTER_MS:
+        need = min(need, STOP_OPP_IMPULSE_SOFT_MS)
+        peak = STOP_OPP_ACCEL_SOFT_MS2
+        settle = float(STOP_SETTLE_SOFT_MS)
+        linear_max = STOP_SETTLE_LINEAR_SOFT_MS2
+    if elapsed_ms >= STOP_SOFTEN2_AFTER_MS:
+        need = min(need, STOP_OPP_IMPULSE_SOFT2_MS)
+        peak = STOP_OPP_ACCEL_SOFT2_MS2
+        settle = float(STOP_SETTLE_SOFT2_MS)
+    return need, peak, settle, linear_max
+
+
+def recording_stop_hand_lower_eligible(
+    opp_impulse_ms: float,
+    opp_peak_ms2: float = 0.0,
+    pulse_ms: float = 0.0,
+    lift_impulse_ms: float = 0.0,
+    elapsed_ms: float = 0.0,
+) -> bool:
+    """Mirror firmware recording-stop hand-lower pulse (0.0.73)."""
+    need_imp, peak_min, _settle, _linear = recording_stop_active_thresholds(
+        elapsed_ms, lift_impulse_ms
+    )
+    if not (
         opp_impulse_ms >= need_imp
-        and opp_peak_ms2 >= STOP_OPP_ACCEL_MIN_MS2
         and pulse_ms >= STOP_OPP_PULSE_MIN_MS
         and pulse_ms <= STOP_OPP_PULSE_MAX_MS
+    ):
+        return False
+    if opp_peak_ms2 >= peak_min:
+        return True
+    # Slow-path: longer soft pulse may pass with peak >= soft2 floor.
+    return (
+        pulse_ms >= STOP_OPP_PULSE_SLOW_MS
+        and opp_peak_ms2 >= STOP_OPP_ACCEL_SOFT2_MS2
     )
 
 
@@ -1066,6 +1123,22 @@ def format_event(event: GestureEvent) -> str:
                 f" opp_imp={v1:.3f}m/s peak={v2:.2f}m/s^2 "
                 f"pulse={v3:.0f}ms"
             )
+        elif stage == "stop_near_miss":
+            if reason in ("stop_pulse_short", "stop_pulse_long"):
+                suffix = (
+                    f" opp_imp={v1:.3f}m/s peak={v2:.2f}m/s^2 "
+                    f"pulse={v3:.0f}ms reason={reason}"
+                )
+            else:
+                suffix = (
+                    f" opp_imp={v1:.3f}m/s peak={v2:.2f}m/s^2 "
+                    f"need={v3:.3f}m/s reason={reason}"
+                )
+        elif stage == "lift_near_miss":
+            suffix = (
+                f" peak_a_up={v1:.2f}m/s^2 imp={v2:.3f}m/s "
+                f"elapsed={v3:.0f}ms reason={reason}"
+            )
         elif stage == "gyro_enabled":
             suffix = f" odr={v1:.0f}Hz bias_y={v2:+.2f} valid={v3:.0f}"
         elif stage == "gyro_disabled":
@@ -1199,6 +1272,7 @@ def format_event(event: GestureEvent) -> str:
 def diagnostic_record(event: GestureEvent) -> dict[str, Any]:
     record: dict[str, Any] = {
         "time": event.wall_time,
+        "t": event.monotonic_s,
         "stage": DIAG_STAGE_NAMES.get(event.diag_stage or 0, "unknown"),
         "reason": DIAG_REASON_NAMES.get(event.diag_reason or 0, "unknown"),
         "value1": event.value1,
@@ -1233,6 +1307,12 @@ def diagnostic_record(event: GestureEvent) -> dict[str, Any]:
             "pronation_angle_deg": event.value1,
             "tilt_3d_deg": event.value2,
             "z_ratio_delta": event.value3,
+        }
+    elif stage == "stop_near_miss":
+        record["metrics"] = {
+            "opp_impulse_ms": event.value1,
+            "opp_peak_ms2": event.value2,
+            "need_or_pulse": event.value3,
         }
     elif stage == "return_ready":
         record["metrics"] = {
@@ -1811,12 +1891,14 @@ class GestureValidator:
             pulse_ms = float(stop_diag.get("value3") or 0.0)
             match_diag = _latest_diagnostic(diagnostics, stage="match")
             lift_imp = float((match_diag or {}).get("value2") or 0.0)
+            stop_t = float(stop_diag.get("t") or 0.0)
+            match_t = float((match_diag or {}).get("t") or 0.0)
+            elapsed_ms = max(0.0, (stop_t - match_t) * 1000.0) if match_t else 0.0
             stop_ok = recording_stop_hand_lower_eligible(
-                opp_imp, opp_peak, pulse_ms, lift_imp
+                opp_imp, opp_peak, pulse_ms, lift_imp, elapsed_ms
             )
-            need_imp = max(
-                STOP_OPP_IMPULSE_MIN_MS,
-                lift_imp * STOP_OPP_IMPULSE_LIFT_RATIO,
+            need_imp, peak_min, settle_ms, _lin = recording_stop_active_thresholds(
+                elapsed_ms, lift_imp
             )
             conditions.append(
                 ConditionResult(
@@ -1827,10 +1909,11 @@ class GestureValidator:
                         else "FAIL"
                     ),
                     f"実測 opp_imp={opp_imp:.3f} peak={opp_peak:.2f} "
-                    f"pulse={pulse_ms:.0f}ms lift_imp={lift_imp:.3f} | "
-                    f"閾値 opp_imp≥{need_imp:.3f} peak≥{STOP_OPP_ACCEL_MIN_MS2:.2f} "
+                    f"pulse={pulse_ms:.0f}ms lift_imp={lift_imp:.3f} "
+                    f"elapsed={elapsed_ms:.0f}ms | "
+                    f"閾値 opp_imp≥{need_imp:.3f} peak≥{peak_min:.2f} "
                     f"pulse {STOP_OPP_PULSE_MIN_MS}-{STOP_OPP_PULSE_MAX_MS}ms "
-                    f"+ settle {STOP_SETTLE_MS}ms "
+                    f"+ settle {settle_ms:.0f}ms "
                     f"/ 開始後{STOP_POST_START_INHIBIT_MS}ms抑制"
                     + (" / STOP GO前に停止" if stop_before_cue else ""),
                 )
@@ -2032,9 +2115,14 @@ def run_self_test() -> int:
     assert motion_completed_in_time(3000.0)
     assert motion_completed_in_time(4499.0)
     assert not motion_completed_in_time(4500.0)
+    # 0.0.74: exit RMS 4.0, need 3 consecutive samples
+    assert FINAL_HOLD_RMS_EXIT_MS2 == 4.0
+    assert FINAL_HOLD_RMS_EXIT_SAMPLES == 3
+    assert LIFT_START_TIMEOUT_MS == 8000
     assert not hold_rms_interrupts([3.08])
-    assert not hold_rms_interrupts([3.6, 3.5, 3.6])
-    assert hold_rms_interrupts([3.6, 3.51])
+    assert not hold_rms_interrupts([4.1, 4.2])  # only 2 samples
+    assert not hold_rms_interrupts([3.6, 3.5, 3.6])  # below 4.0
+    assert hold_rms_interrupts([4.1, 4.2, 4.05])
 
     complete_packet = bytearray(
         [0x00, 0x55, EVT_GESTURE_DIAG, 0x23, 0x00]
@@ -2282,7 +2370,7 @@ def run_self_test() -> int:
     assert not gesture_gate_eligible(
         0.90, 4.0, 0.04, 0.015, 15.0, 400, palm_up_tilt_deg=29.9
     )
-    # 0.0.69 stop: reverse lift-axis pulse + settle; palm-up path removed.
+    # 0.0.69/0.0.73 stop: reverse lift-axis pulse + settle; soft time-decay.
     assert STOP_OPP_ACCEL_MIN_MS2 == 0.25
     assert STOP_OPP_IMPULSE_MIN_MS == 0.10
     assert STOP_OPP_IMPULSE_LIFT_RATIO == 0.20
@@ -2291,22 +2379,48 @@ def run_self_test() -> int:
     assert STOP_OPP_PULSE_MAX_MS == 2000
     assert STOP_SETTLE_MS == 80
     assert STOP_POST_START_INHIBIT_MS == 3000
+    assert STOP_SOFTEN_AFTER_MS == 5000
+    assert STOP_SOFTEN2_AFTER_MS == 10000
     assert recording_stop_hand_lower_eligible(0.12, 1.0, 200.0, 0.50)
     assert recording_stop_hand_lower_eligible(0.10, 0.25, 60.0, 0.0)
     # リンゴ log shape should pass after 0.0.71
     assert recording_stop_hand_lower_eligible(0.189, 0.57, 732.0, 0.356)
+    # 2026-08-28 リンゴ: soft stop that needed ~24s; eligible at t0 and soften.
+    assert recording_stop_hand_lower_eligible(0.181, 1.75, 157.0, 0.337)
+    assert recording_stop_hand_lower_eligible(
+        0.181, 1.75, 157.0, 0.337, elapsed_ms=6000.0
+    )
     assert not recording_stop_hand_lower_eligible(0.08, 1.0, 200.0, 0.0)
-    assert not recording_stop_hand_lower_eligible(0.12, 0.20, 200.0, 0.0)
+    # After soften2, impulse floor drops to 0.07 so 0.08 passes.
+    assert recording_stop_hand_lower_eligible(
+        0.08, 1.0, 200.0, 0.0, elapsed_ms=12000.0
+    )
+    # Short pulse still requires peak >= base min (no slow-path).
+    assert not recording_stop_hand_lower_eligible(0.12, 0.20, 100.0, 0.0)
+    # Slow-path: peak 0.16 with long pulse (soft2 floor 0.15).
+    assert recording_stop_hand_lower_eligible(0.12, 0.16, 200.0, 0.0)
+    assert not recording_stop_hand_lower_eligible(0.12, 0.14, 200.0, 0.0)
     assert not recording_stop_hand_lower_eligible(0.12, 1.0, 40.0, 0.0)
     assert not recording_stop_hand_lower_eligible(0.12, 1.0, 2100.0, 0.0)
     # Relative to lift, capped so strong lifts do not demand huge lowers
     assert recording_stop_hand_lower_eligible(0.35, 1.0, 200.0, 2.5)
     assert not recording_stop_hand_lower_eligible(0.30, 1.0, 200.0, 2.5)
+    need5, peak5, settle5, lin5 = recording_stop_active_thresholds(6000.0, 0.50)
+    assert math.isclose(need5, STOP_OPP_IMPULSE_SOFT_MS)
+    assert math.isclose(peak5, STOP_OPP_ACCEL_SOFT_MS2)
+    assert math.isclose(settle5, float(STOP_SETTLE_SOFT_MS))
+    assert math.isclose(lin5, STOP_SETTLE_LINEAR_SOFT_MS2)
     # Palm-up / gyro stop path removed.
     assert not recording_stop_palm_up_eligible(20.0, z_ratio_delta=0.50)
     assert not recording_stop_palm_up_eligible(
         0.0, gyro_roll_deg=45.0, gyro_peak_dps=30.0
     )
+    near_miss = bytearray([0x00, 0x55, EVT_GESTURE_DIAG, 0x0B, 0x2C])
+    near_miss.extend(struct.pack("<fff", 0.09, 0.40, 0.10))
+    near_evt = parse_event_packet(bytes(near_miss), now=20.0)
+    assert near_evt is not None
+    assert "stop_near_miss" in format_event(near_evt)
+    assert "stop_impulse_low" in format_event(near_evt)
 
     def outbound_gyro_condition_status(roll_deg: float, peak_dps: float) -> str:
         conditions = build_condition_results(
