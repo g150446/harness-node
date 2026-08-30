@@ -112,6 +112,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define EVT_DOUBLE_TAP                 0x12
 #define EVT_SINGLE_TAP                 0x14
 #define TAP_COOLDOWN_MS                 700
+#define TAP_SINGLE_CONFIRM_MS            330
 #define LSM6DS3TR_C_REG_INT1_CTRL      0x0D
 #define LSM6DS3TR_C_REG_TAP_SRC        0x1C
 #define LSM6DS3TR_C_REG_TAP_CFG        0x58
@@ -489,6 +490,9 @@ static const struct sensor_trigger tap_trigger = {
 };
 static atomic_t tap_irq_pending;
 static int64_t tap_last_event_ms;
+static bool tap_single_pending;
+static int64_t tap_single_deadline_ms;
+static uint8_t tap_single_src;
 
 /* Gesture state */
 typedef enum {
@@ -2079,40 +2083,8 @@ static void reset_gesture_sequence(void)
     }
 }
 
-static void process_tap_event(int64_t now)
+static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
 {
-    uint8_t tap_src;
-    bool is_double;
-    bool is_single;
-    int ret;
-
-    if (!atomic_cas(&tap_irq_pending, 1, 0)) {
-        return;
-    }
-
-    ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
-    if (ret < 0) {
-        LOG_ERR("Tap source read failed: %d", ret);
-        atomic_set(&tap_irq_pending, 1);
-        return;
-    }
-
-    is_double = (tap_src & LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH) ==
-                LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH;
-    is_single = (tap_src & LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH) ==
-                LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH;
-    if (!is_double && !is_single) {
-        LOG_DBG("Ignoring IMU INT1 source 0x%02x", tap_src);
-        return;
-    }
-    /* Prefer double when both bits are set. */
-    if (is_double) {
-        is_single = false;
-    }
-
-    if ((now - tap_last_event_ms) < TAP_COOLDOWN_MS) {
-        return;
-    }
     tap_last_event_ms = now;
 
     if (is_double && operation_mode == OPERATION_MODE_DRIVING) {
@@ -2168,6 +2140,63 @@ static void process_tap_event(int64_t now)
     } else {
         printk(">>> Single tap detected (TAP_SRC=0x%02x)\n", tap_src);
         send_event_packet(EVT_SINGLE_TAP);
+    }
+}
+
+static void process_tap_event(int64_t now)
+{
+    uint8_t tap_src;
+    bool is_double;
+    bool is_single;
+    int ret;
+
+    if (!atomic_cas(&tap_irq_pending, 1, 0)) {
+        if (tap_single_pending && now >= tap_single_deadline_ms) {
+            uint8_t pending_src = tap_single_src;
+
+            tap_single_pending = false;
+            if ((now - tap_last_event_ms) >= TAP_COOLDOWN_MS) {
+                emit_tap_event(now, false, pending_src);
+            }
+        }
+        return;
+    }
+
+    ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
+    if (ret < 0) {
+        LOG_ERR("Tap source read failed: %d", ret);
+        atomic_set(&tap_irq_pending, 1);
+        return;
+    }
+
+    is_double = (tap_src & LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH) ==
+                LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH;
+    is_single = (tap_src & LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH) ==
+                LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH;
+    if (!is_double && !is_single) {
+        LOG_DBG("Ignoring IMU INT1 source 0x%02x", tap_src);
+        return;
+    }
+    /* The sensor recognizes single and double independently.  Routing both to
+     * INT1 means the first strike can report SINGLE_TAP before a later
+     * DOUBLE_TAP.  Hold the single candidate through the hardware duration
+     * window so a double produces only EVT_DOUBLE_TAP. */
+    if (is_double) {
+        is_single = false;
+        tap_single_pending = false;
+        if ((now - tap_last_event_ms) >= TAP_COOLDOWN_MS) {
+            emit_tap_event(now, true, tap_src);
+        }
+        return;
+    }
+
+    if ((now - tap_last_event_ms) < TAP_COOLDOWN_MS) {
+        return;
+    }
+    if (is_single && !tap_single_pending) {
+        tap_single_pending = true;
+        tap_single_deadline_ms = now + TAP_SINGLE_CONFIRM_MS;
+        tap_single_src = tap_src;
     }
 }
 

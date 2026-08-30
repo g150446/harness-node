@@ -29,3 +29,8 @@
 - slot 0 の `active=true`、`confirmed=true` を確認する
 
 検証前にUSB抜去、電源断、別ファームウェアの上書きを行わない。
+
+## 更新履歴
+
+- 2026-08-30: 0.0.77（single候補遅延確定によるdouble回帰修正）をビルド・OTA。
+  slot 0で`active=true`、`confirmed=true`、version=`0.0.77`を確認済み。
