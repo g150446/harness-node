@@ -6,6 +6,7 @@ gesture_monitor.py — BLE接続して IMU イベントを表示する
   0x10  motion_active    動き検出開始（+xyz値 f32）
   0x11  motion_settled   動き収束（+xyz値 f32）
   0x12  double_tap       リストバンド表側からのダブルタップ
+  0x14  single_tap       同上のシングルタップ
   0x01  recording_start  録音開始
   0x02  recording_stop   録音停止
   0x20  sleep_enter      ライトスリープ開始（10秒無動作）
@@ -39,6 +40,8 @@ def on_notify(sender, data: bytes):
         print(f"[{ts}]  motion_settled  x={x:+.2f} y={y:+.2f} z={z:+.2f}")
     elif code == 0x12:
         print(f"[{ts}]  double_tap ★")
+    elif code == 0x14:
+        print(f"[{ts}]  single_tap ★")
     elif code == 0x01:
         print(f"[{ts}]  recording_start ★")
     elif code == 0x02:

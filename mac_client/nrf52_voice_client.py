@@ -11,6 +11,7 @@ Recording start/stop: controlled by gesture events from the device.
   0x10 motion_active   → displayed (z-value shown)
   0x11 motion_settled  → displayed (z-value shown)
   0x12 double_tap      → displayed (recording state unchanged)
+  0x14 single_tap      → displayed (recording state unchanged)
   0x20 sleep_enter     → displayed
   0x21 sleep_wake      → displayed
 """
@@ -261,6 +262,8 @@ class VoiceBridge52Client:
                     print(f"  [EVT] motion_settled z={z:+.2f}")
             elif code == 0x12:
                 print("  [EVT] double_tap")
+            elif code == 0x14:
+                print("  [EVT] single_tap")
             elif code == 0x20:
                 print("  [EVT] sleep_enter")
             elif code == 0x21:

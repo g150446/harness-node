@@ -101,14 +101,17 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define MOTION_DURATION_SAMPLES     2
 
 /*
- * LSM6DS3TR-C hardware double-tap detection.  Zephyr's NCS 2.9.2 LSM6DSL
- * driver only exposes DATA_READY triggers, so the application configures the
- * embedded-function registers directly and reuses the driver's INT1 plumbing.
- * At +/-2 g, TAP_THS=8 is 0.5 g.  At 416 Hz, INT_DUR2=0x4a gives about
- * 38 ms shock, 19 ms quiet, and 308 ms between taps.
+ * LSM6DS3TR-C hardware single/double-tap detection.  Zephyr's NCS 2.9.2
+ * LSM6DSL driver only exposes DATA_READY triggers, so the application
+ * configures the embedded-function registers directly and reuses the driver's
+ * INT1 plumbing.  At +/-2 g, TAP_THS=8 is 0.5 g.  At 416 Hz, INT_DUR2=0x4a
+ * gives about 38 ms shock, 19 ms quiet, and 308 ms between taps.  With
+ * double-tap enable set, a lone tap asserts single after that gap; a second
+ * tap inside the gap asserts double instead.
  */
 #define EVT_DOUBLE_TAP                 0x12
-#define DOUBLE_TAP_COOLDOWN_MS          700
+#define EVT_SINGLE_TAP                 0x14
+#define TAP_COOLDOWN_MS                 700
 #define LSM6DS3TR_C_REG_INT1_CTRL      0x0D
 #define LSM6DS3TR_C_REG_TAP_SRC        0x1C
 #define LSM6DS3TR_C_REG_TAP_CFG        0x58
@@ -124,8 +127,10 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define LSM6DS3TR_C_INT_DUR_BALANCED   0x4A
 #define LSM6DS3TR_C_DOUBLE_TAP_ENABLE  BIT(7)
 #define LSM6DS3TR_C_MD1_TAP_MASK       (BIT(6) | BIT(3))
+#define LSM6DS3TR_C_MD1_SINGLE_TAP     BIT(6)
 #define LSM6DS3TR_C_MD1_DOUBLE_TAP     BIT(3)
-#define LSM6DS3TR_C_TAP_SRC_MATCH      (BIT(6) | BIT(4) | BIT(0))
+#define LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH (BIT(6) | BIT(4) | BIT(0))
+#define LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH (BIT(6) | BIT(5) | BIT(0))
 
 /*
  * Dorsal-side gesture classifier (accel + on-demand gyro_y).
@@ -275,6 +280,15 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_DIAG_RESET                     0x80
 #define GESTURE_DEBUG_FINAL_PERIOD_MS           100
 
+/* Operation mode controlled by the Android companion.  NORMAL preserves the
+ * existing gesture behaviour; DRIVING disables gesture start/stop and makes
+ * the IMU double-tap a local recording toggle. */
+#define CMD_SET_OPERATION_MODE                  0x05
+#define OPERATION_MODE_NORMAL                   0x00
+#define OPERATION_MODE_DRIVING                 0x01
+#define OPERATION_MODE_PENDING_NONE             0xff
+#define EVT_OPERATION_MODE                     0x40
+
 /* History batch events (only when GESTURE_DEBUG_HISTORY=1). */
 #define EVT_GESTURE_HISTORY_BEGIN             0x33
 #define EVT_GESTURE_HISTORY_ENTRY             0x34
@@ -385,6 +399,8 @@ static volatile bool recording_requested;
 static volatile bool stop_requested;
 static volatile bool capture_enabled;
 static volatile bool capture_fatal;
+static volatile uint8_t operation_mode = OPERATION_MODE_NORMAL;
+static volatile uint8_t operation_mode_pending = OPERATION_MODE_PENDING_NONE;
 K_SEM_DEFINE(audio_notify_slots, AUDIO_NOTIFY_IN_FLIGHT, AUDIO_NOTIFY_IN_FLIGHT);
 
 struct audio_pcm_frame {
@@ -467,12 +483,12 @@ static void conn_param_work_handler(struct k_work *work)
 /* IMU device */
 static const struct device *const imu     = DEVICE_DT_GET(IMU_NODE);
 static const struct i2c_dt_spec imu_i2c = I2C_DT_SPEC_GET(IMU_NODE);
-static const struct sensor_trigger double_tap_trigger = {
+static const struct sensor_trigger tap_trigger = {
     .type = SENSOR_TRIG_DATA_READY,
     .chan = SENSOR_CHAN_ACCEL_XYZ,
 };
-static atomic_t double_tap_irq_pending;
-static int64_t double_tap_last_event_ms;
+static atomic_t tap_irq_pending;
+static int64_t tap_last_event_ms;
 
 /* Gesture state */
 typedef enum {
@@ -978,7 +994,9 @@ static void gyro_reset_phase_metrics(void);
 static void flush_gesture_history(void);
 static void flush_gesture_trajectory(void);
 static void flush_host_collection(void);
-static void process_double_tap_event(int64_t now);
+static void process_tap_event(int64_t now);
+static void apply_pending_operation_mode(void);
+static void send_operation_mode_status(void);
 
 /* ============================================================================
  * Motion Detection
@@ -1136,26 +1154,26 @@ static int configure_motion_detection(void)
     return 0;
 }
 
-static void double_tap_irq_handler(const struct device *dev,
-                                   const struct sensor_trigger *trig)
+static void tap_irq_handler(const struct device *dev,
+                            const struct sensor_trigger *trig)
 {
     ARG_UNUSED(dev);
     ARG_UNUSED(trig);
-    atomic_set(&double_tap_irq_pending, 1);
+    atomic_set(&tap_irq_pending, 1);
 }
 
-static int configure_double_tap_detection(void)
+static int configure_tap_detection(void)
 {
     uint8_t tap_src;
     int ret;
 
     if (!i2c_is_ready_dt(&imu_i2c)) {
-        LOG_ERR("IMU I2C bus not ready for double tap");
+        LOG_ERR("IMU I2C bus not ready for tap detection");
         return -ENODEV;
     }
 
     /* Stop the driver's default DRDY routing before repurposing INT1. */
-    ret = sensor_trigger_set(imu, &double_tap_trigger, NULL);
+    ret = sensor_trigger_set(imu, &tap_trigger, NULL);
     if (ret < 0) {
         LOG_ERR("Disabling IMU DRDY trigger failed: %d", ret);
         return ret;
@@ -1184,6 +1202,7 @@ static int configure_double_tap_detection(void)
     if (ret < 0) goto register_error;
     ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_MD1_CFG,
                                  LSM6DS3TR_C_MD1_TAP_MASK,
+                                 LSM6DS3TR_C_MD1_SINGLE_TAP |
                                  LSM6DS3TR_C_MD1_DOUBLE_TAP);
     if (ret < 0) goto register_error;
 
@@ -1191,19 +1210,18 @@ static int configure_double_tap_detection(void)
     ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
     if (ret < 0) goto register_error;
 
-    atomic_clear(&double_tap_irq_pending);
-    ret = sensor_trigger_set(imu, &double_tap_trigger,
-                             double_tap_irq_handler);
+    atomic_clear(&tap_irq_pending);
+    ret = sensor_trigger_set(imu, &tap_trigger, tap_irq_handler);
     if (ret < 0) {
-        LOG_ERR("Double-tap INT1 trigger setup failed: %d", ret);
+        LOG_ERR("Tap INT1 trigger setup failed: %d", ret);
         return ret;
     }
 
-    LOG_INF("Double tap ready: Z axis, threshold=0.5g, gap<=308ms");
+    LOG_INF("Tap ready: Z axis single+double, threshold=0.5g, gap<=308ms");
     return 0;
 
 register_error:
-    LOG_ERR("Double-tap register setup failed: %d", ret);
+    LOG_ERR("Tap register setup failed: %d", ret);
     return ret;
 }
 
@@ -2061,33 +2079,70 @@ static void reset_gesture_sequence(void)
     }
 }
 
-static void process_double_tap_event(int64_t now)
+static void process_tap_event(int64_t now)
 {
     uint8_t tap_src;
+    bool is_double;
+    bool is_single;
     int ret;
 
-    if (!atomic_cas(&double_tap_irq_pending, 1, 0)) {
+    if (!atomic_cas(&tap_irq_pending, 1, 0)) {
         return;
     }
 
     ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
     if (ret < 0) {
-        LOG_ERR("Double-tap source read failed: %d", ret);
-        atomic_set(&double_tap_irq_pending, 1);
+        LOG_ERR("Tap source read failed: %d", ret);
+        atomic_set(&tap_irq_pending, 1);
         return;
     }
-    if ((tap_src & LSM6DS3TR_C_TAP_SRC_MATCH) !=
-        LSM6DS3TR_C_TAP_SRC_MATCH) {
+
+    is_double = (tap_src & LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH) ==
+                LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH;
+    is_single = (tap_src & LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH) ==
+                LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH;
+    if (!is_double && !is_single) {
         LOG_DBG("Ignoring IMU INT1 source 0x%02x", tap_src);
         return;
     }
-    if ((now - double_tap_last_event_ms) < DOUBLE_TAP_COOLDOWN_MS) {
+    /* Prefer double when both bits are set. */
+    if (is_double) {
+        is_single = false;
+    }
+
+    if ((now - tap_last_event_ms) < TAP_COOLDOWN_MS) {
         return;
     }
-    double_tap_last_event_ms = now;
+    tap_last_event_ms = now;
 
-    /* A BLE-only tap must not become the dwell that starts recording. */
-    if (!is_recording && !recording_requested) {
+    if (is_double && operation_mode == OPERATION_MODE_DRIVING) {
+        /* Driving mode uses hardware double-tap as a local recording toggle.
+         * Require a primary BLE peer because an unconnected recording cannot
+         * be delivered to the Android voice client. */
+        if (!get_primary_conn()) {
+            printk(">>> Double tap ignored in driving mode: no primary connection\n");
+            return;
+        }
+        if (is_recording) {
+            stop_requested = true;
+            printk(">>> Driving double tap: recording stop\n");
+        } else if (recording_requested) {
+            recording_requested = false;
+            printk(">>> Driving double tap: pending start cancelled\n");
+        } else {
+            stop_requested = false;
+            recording_requested = true;
+            printk(">>> Driving double tap: recording start\n");
+        }
+        last_activity_ms = now;
+        send_event_packet(EVT_DOUBLE_TAP);
+        return;
+    }
+
+    /* BLE-only taps must not become the dwell that starts recording.
+     * Driving-mode single tap is notify-only (no recording toggle). */
+    if (operation_mode != OPERATION_MODE_DRIVING &&
+        !is_recording && !recording_requested) {
 #if GESTURE_DEBUG_HISTORY
         if (gesture_trajectory_committed) {
             gesture_trajectory_finish(2, GESTURE_DIAG_REASON_SEQUENCE_TIMEOUT);
@@ -2103,11 +2158,48 @@ static void process_double_tap_event(int64_t now)
     if (light_sleep_active) {
         light_sleep_active = false;
         send_event_packet(0x21);
-        printk(">>> Light sleep wake (double tap)\n");
+        printk(">>> Light sleep wake (%s tap)\n",
+               is_double ? "double" : "single");
     }
     last_activity_ms = now;
-    printk(">>> Double tap detected (TAP_SRC=0x%02x)\n", tap_src);
-    send_event_packet(EVT_DOUBLE_TAP);
+    if (is_double) {
+        printk(">>> Double tap detected (TAP_SRC=0x%02x)\n", tap_src);
+        send_event_packet(EVT_DOUBLE_TAP);
+    } else {
+        printk(">>> Single tap detected (TAP_SRC=0x%02x)\n", tap_src);
+        send_event_packet(EVT_SINGLE_TAP);
+    }
+}
+
+static void apply_pending_operation_mode(void)
+{
+    uint8_t requested = operation_mode_pending;
+
+    if (requested == OPERATION_MODE_PENDING_NONE ||
+        requested == operation_mode) {
+        if (requested == operation_mode) {
+            operation_mode_pending = OPERATION_MODE_PENDING_NONE;
+            send_operation_mode_status();
+        }
+        return;
+    }
+    if (requested != OPERATION_MODE_NORMAL &&
+        requested != OPERATION_MODE_DRIVING) {
+        operation_mode_pending = OPERATION_MODE_PENDING_NONE;
+        send_operation_mode_status();
+        return;
+    }
+    if (is_recording || recording_requested) {
+        return;
+    }
+
+    operation_mode = requested;
+    operation_mode_pending = OPERATION_MODE_PENDING_NONE;
+    reset_gesture_sequence();
+    gesture_quiet_since_ms = 0;
+    printk(">>> Operation mode: %s\n",
+           operation_mode == OPERATION_MODE_DRIVING ? "DRIVING" : "NORMAL");
+    send_operation_mode_status();
 }
 
 static void update_quiet_accel_reference(float x, float y, float z)
@@ -2230,6 +2322,13 @@ static void process_gesture_sample(float ax, float ay, float az,
                                    int64_t now)
 {
 
+    /* In driving mode the hardware double-tap is the only recording control.
+     * Keep the IMU sampler alive for that interrupt, but do not let ordinary
+     * motion samples arm or advance the gesture state machine. */
+    if (operation_mode == OPERATION_MODE_DRIVING && !is_recording) {
+        return;
+    }
+
     float accel_norm = vector_norm3(ax, ay, az);
     float z_gravity_ratio = accel_norm > 0.1f ? az / accel_norm : 0.0f;
     float palm_up_z_ratio = fabsf(z_gravity_ratio);
@@ -2253,7 +2352,7 @@ static void process_gesture_sample(float ax, float ay, float az,
                                     gx_raw_dps, gy_raw_dps, gz_raw_dps);
         }
 #endif
-        if (!stop_requested) {
+        if (operation_mode != OPERATION_MODE_DRIVING && !stop_requested) {
             process_recording_stop_sample(ax, ay, az, gy_dps, gyro_ok,
                                           dt_s, now);
         }
@@ -3147,6 +3246,17 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
             }
             /* Update connection params after yield */
             k_work_schedule(&conn_param_work, K_MSEC(200));
+        } else if (data[0] == CMD_SET_OPERATION_MODE && len >= 2) {
+            if (data[1] == OPERATION_MODE_NORMAL ||
+                data[1] == OPERATION_MODE_DRIVING) {
+                operation_mode_pending = data[1];
+                printk(">>> Operation mode request: %s%s\n",
+                       data[1] == OPERATION_MODE_DRIVING ? "DRIVING" : "NORMAL",
+                       (is_recording || recording_requested) ? " (pending)" : "");
+            } else {
+                printk(">>> Invalid operation mode: %u\n", data[1]);
+                send_operation_mode_status();
+            }
 #if GESTURE_DEBUG_HISTORY
         } else if (data[0] == 0x04) {
             if (!gesture_host_collection_start()) {
@@ -3169,6 +3279,17 @@ BT_GATT_SERVICE_DEFINE(audio_svc,
     BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(AUDIO_UUID_RX_CHAR),
         BT_GATT_CHRC_WRITE, BT_GATT_PERM_WRITE, NULL, audio_rx_write, NULL),
 );
+
+static void send_operation_mode_status(void)
+{
+    struct bt_conn *conn = get_primary_conn();
+    uint8_t pkt[5] = {0x00, 0x55, EVT_OPERATION_MODE,
+                      operation_mode, operation_mode_pending};
+
+    if (conn) {
+        (void)bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, sizeof(pkt));
+    }
+}
 
 /* Send event packet via TX characteristic: [0x00][0x55][event_code] */
 static void send_event_packet(uint8_t event_code)
@@ -3977,6 +4098,7 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     if (primary_idx < 0) {
         primary_idx = slot;
         printk(">>> conn[%d] is primary\n", slot);
+        send_operation_mode_status();
     } else {
         printk(">>> conn[%d] is secondary, notifying primary\n", slot);
         uint8_t pkt[3] = { 0x00, 0x55, 0x31 };
@@ -4094,8 +4216,8 @@ int main(void)
         ret = configure_motion_detection();
         if (ret < 0) LOG_WRN("Motion detection setup failed: %d", ret);
         else {
-            ret = configure_double_tap_detection();
-            if (ret < 0) LOG_WRN("Double-tap detection disabled: %d", ret);
+            ret = configure_tap_detection();
+            if (ret < 0) LOG_WRN("Tap detection disabled: %d", ret);
         }
     }
 
@@ -4169,6 +4291,8 @@ int main(void)
 
         int64_t now_ms = k_uptime_get();
 
+        apply_pending_operation_mode();
+
         /* IMU motion detection — poll faster when active, slower when sleeping */
         int64_t imu_poll_ms = light_sleep_active
                               ? SLEEP_POLL_INTERVAL_MS
@@ -4178,7 +4302,7 @@ int main(void)
             last_motion_sample_ms = now_ms;
             process_motion_sample();
         }
-        process_double_tap_event(now_ms);
+        process_tap_event(now_ms);
 
         led_tick();
 

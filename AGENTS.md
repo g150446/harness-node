@@ -35,6 +35,7 @@
 
 Primary firmware lives in `nordic-main/`. Full operational docs:
 `docs/nordic_main_guide.md`. Local agent notes: `nordic-main/AGENTS.md`.
+BLE OTAの必須注意事項は `docs/ota_update_notes.md` を参照すること。OTA実行時はこの文書の事前確認・macOS Terminal・完了検証を省略しない。
 
 ### Board target (do not guess)
 

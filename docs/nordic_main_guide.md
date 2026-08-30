@@ -16,6 +16,9 @@
 | IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 起動後は待機時消灯。録音ジェスチャー成立後の録音中のみ赤 |
+| 署名バージョン（目安） | `0.0.76+`（single_tap `0x14` 含む） |
+| OTA 手順 | [`ota_update_notes.md`](ota_update_notes.md) |
+| Android single_tap | **未実装** → [`Android未実装_シングルタップイベント対応.md`](Android未実装_シングルタップイベント対応.md) |
 
 ---
 
@@ -158,6 +161,8 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 | `0x10` | `motion_active` | x, y, z f32 LE（各 4 byte） | モーション検出開始、xyz 加速度値 |
 | `0x11` | `motion_settled` | x, y, z f32 LE + elapsed_ms u32 + avg/peak_speed/distance f32 LE（計 28 bytes） | モーション静定、詳細メトリクス |
 | `0x12` | `double_tap` | なし | リストバンド表側から基板面へ垂直に行ったダブルタップ |
+| `0x14` | `single_tap` | なし | 同上のシングルタップ（間隔窓を超えた単独衝撃） |
+| `0x40` | `operation_mode` | effective mode u8 + pending mode u8 | Android設定モードの同期状態（0=通常、1=運転、0xff=pendingなし） |
 | `0x20` | `sleep_enter` | なし | ライトスリープ移行（10 秒無動作） |
 | `0x21` | `sleep_wake` | なし | ライトスリープ復帰（モーション検出） |
 | `0x30` | `gesture_diag` | stage/reason u8 + value1/2/3 f32 LE | USBなしのジェスチャー内部診断 |
@@ -221,14 +226,24 @@ MATCH 時に挙上パルスの線形加速度方向を単位ベクトル `L` と
 
 BLE 接続はスリープ中も維持されます。録音停止後もタイマーはリセットされ、即座にスリープに入ることはありません。
 
-### ダブルタップ
+### シングル／ダブルタップ
 
 LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側にした装着状態で
-リストバンド表側から基板面へ垂直に行うダブルタップを Z 軸で検出する。
-閾値は約 0.5 g、2 回の最大間隔は約 308 ms、認識後のクールダウンは 700 ms。
-成立時は `0x12 double_tap` を BLE 通知するだけで、録音状態は変更しない。
-ライトスリープ中は復帰し、ダブルタップが掌上静止開始ジェスチャーとして
-扱われないよう、待機中の開始候補を破棄する。
+リストバンド表側から基板面へ垂直に行うタップを Z 軸で検出する。
+閾値は約 0.5 g、2 回の最大間隔は約 308 ms、認識後の共有クールダウンは 700 ms。
+`DOUBLE_TAP_EN` 有効時、単独タップは間隔窓経過後に single、窓内の 2 回目で double
+となる（single 通知は物理タップから最大約 308 ms 遅れる）。
+
+| モード | single (`0x14`) | double (`0x12`) |
+|--------|-----------------|-----------------|
+| 通常 | BLE 通知のみ。録音は変更しない。待機中の開始ジェスチャー候補を破棄し 3 s re-arm | 同左 |
+| 運転 | BLE 通知のみ（録音トグルなし） | primary 接続中に録音開始／停止を交互。掌上ジェスチャーは無効 |
+
+Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` 運転）を
+書き込み、Node は `0x40`（`[0x00,0x55,0x40,effective,pending]`）で応答する。
+録音中のモード変更は pending として保持し、録音停止後に適用する。
+ライトスリープ中は復帰し、タップが掌上静止開始ジェスチャーとして
+扱われないよう、待機中の開始候補を破棄する（通常モード）。
 
 #### ハードウェア割り込み構成
 
@@ -239,36 +254,39 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 ```
 リストバンド表側への衝撃
   → LSM6DS3TR-C内蔵判定（Z軸、閾値・Shock・Quiet・Duration）
-  → TAP_SRCにdouble-tap/Zを記録
+  → TAP_SRCに single-tap または double-tap / Z を記録
   → IMU INT1をassert
   → XIAO P0.11のGPIO割り込み
-  → メインループでTAP_SRCを確認
-  → BLE [0x00, 0x55, 0x12]
+  → メインループでTAP_SRCを確認（double 優先）
+  → BLE [0x00, 0x55, 0x12] または [0x00, 0x55, 0x14]
 ```
 
 - 基板DTSの `irq-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>` により、IMU INT1は
   nRF52840のP0.11へ接続される。
 - `INT1_CTRL` の加速度・ジャイロdata-ready割り込みを無効化し、`MD1_CFG` の
-  double-tapだけをINT1へ割り当てる。割り込み処理はフラグを立てるだけで、
+  single-tap と double-tap を INT1 へ割り当てる。割り込み処理はフラグを立てるだけで、
   I2C読み出しとBLE通知はメインループ側で行う。
 - NCS v2.9.2のLSM6DSLドライバはこのセンサーの`SENSOR_TRIG_DOUBLE_TAP`を
   実装していない。そのためtap関連レジスタをI2Cで直接設定し、ドライバの
   `SENSOR_TRIG_DATA_READY`用INT1配送経路をGPIO通知手段として再利用する。
-  実際の割り込み源はdata-readyではなく、IMUが判定したdouble-tapである。
-- 初期化に失敗した場合はdouble-tapだけを無効化してログへ理由を出し、既存の
+  実際の割り込み源はdata-readyではなく、IMUが判定したタップである。
+- 初期化に失敗した場合はタップ検出だけを無効化してログへ理由を出し、既存の
   IMUポーリング、録音ジェスチャー、BLE接続は継続する。
 
 #### 実機確認結果
 
 2026-08-24、ファームウェア`0.0.55`をXIAO nRF52840 SenseへOTA適用し、
-部品面を皮膚側にして装着した状態で確認した。
+部品面を皮膚側にして装着した状態で確認した（当時は double のみ有効）。
 
 | 試験 | 結果 |
 |------|------|
 | リストバンド表側をダブルタップ | 3 / 3 検出 |
-| 表側を1回だけタップ | 2 / 2 誤検出なし |
+| 表側を1回だけタップ | 2 / 2 誤検出なし（single 未実装時） |
 | タップせず腕を自然に上げ下げ | 2 / 2 誤検出なし |
 | 合計 | **7 / 7 PASS** |
+
+single (`0x14`) はファーム `0.0.76` で実装・OTA 済み。検出系の実機再確認は未実施。  
+Android 側の受信・UX は未実装（[`Android未実装_シングルタップイベント対応.md`](Android未実装_シングルタップイベント対応.md)）。
 
 ---
 
@@ -408,7 +426,7 @@ OTA verified: uploaded image is active and confirmed in slot 0 (version=...).
 
 ### xiao_voice_client.py — BLE 録音クライアント
 
-HarnessNode に接続し、`0x01` 受信で WAV 録音を自動開始、`0x02` 受信で自動停止します。motion_active / motion_settled / double_tap / sleep_enter / sleep_wake イベントも画面表示します。
+HarnessNode に接続し、`0x01` 受信で WAV 録音を自動開始、`0x02` 受信で自動停止します。motion_active / motion_settled / double_tap / single_tap / sleep_enter / sleep_wake イベントも画面表示します。
 
 ```bash
 cd mac_client
@@ -428,7 +446,7 @@ source venv/bin/activate
 python3 gesture_monitor.py
 ```
 
-表示イベント: `motion_active`（x/y/z）、`motion_settled`（x/y/z + elapsed/peak/dist）、`double_tap`、`recording_start`、`recording_stop`、`sleep_enter`、`sleep_wake`
+表示イベント: `motion_active`（x/y/z）、`motion_settled`（x/y/z + elapsed/peak/dist）、`double_tap`、`single_tap`、`recording_start`、`recording_stop`、`sleep_enter`、`sleep_wake`
 
 ### gesture_validator.py — 掌上0.5秒静止→挙上→掌下静止ジェスチャー検証
 

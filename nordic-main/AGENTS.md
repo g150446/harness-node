@@ -57,6 +57,7 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 - Outputs: `build/merged.hex`, `build/nordic-main/zephyr/zephyr.signed.bin`,
   script copies OTA payload to `ota_update.bin`
 - Repo-wide agent rules: `../AGENTS.md`
+- OTA実行前に `../docs/ota_update_notes.md` を必ず読む。特に署名バージョンの繰り上げ、macOS CoreBluetoothのTerminal実行、slot 0のactive/confirmed検証を省略しない。
 
 ## Code orientation
 
