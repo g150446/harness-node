@@ -16,7 +16,7 @@
 | IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 起動後は待機時消灯。録音ジェスチャー成立後の録音中のみ赤 |
-| 署名バージョン（目安） | `0.0.77+`（single_tap `0x14` とdouble回帰修正を含む） |
+| 署名バージョン（目安） | `0.0.87+`（TAP_SRC遅延読み出しによるタップ判定修正を含む） |
 | OTA 手順 | [`ota_update_notes.md`](ota_update_notes.md) |
 | Android single_tap | `0x14`を診断ログへ記録（Kindle/G2操作はdouble専用） |
 
@@ -135,6 +135,13 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 |---------|------|
 | `0x01` | 録音開始 |
 | `0x00` | 録音停止 |
+| `0x50 [reg] [val]` | IMUレジスタ書き込み（タップ関連のみ許可。`0xD2`で応答） |
+| `0x51 [reg]` | IMUレジスタ読み出し（`0xD2`で応答） |
+
+`0x50` / `0x51` はタップ調整用の診断コマンド。書き込みは `CTRL1_XL` `CTRL6_C`
+`CTRL10_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2` `WAKE_UP_THS` `MD1_CFG` に限定され、
+それ以外は `-EPERM` で拒否する。OTAなしで閾値・軸・Duration を実機で振れるので、
+タップ系の調査はまずこれを使う（`mac_client/tap_monitor.py --write 0x59:0x04` など）。
 
 ### TX パケット形式（ファームウェア → ホスト）
 
@@ -166,6 +173,9 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 | `0x20` | `sleep_enter` | なし | ライトスリープ移行（10 秒無動作） |
 | `0x21` | `sleep_wake` | なし | ライトスリープ復帰（モーション検出） |
 | `0x30` | `gesture_diag` | stage/reason u8 + value1/2/3 f32 LE | USBなしのジェスチャー内部診断 |
+| `0xD0` | `tap_diag` | read_ret i8 + CTRL1_XL/CTRL6_C/TAP_CFG/TAP_THS_6D/INT_DUR2/WAKE_UP_THS/MD1_CFG/INT1_CTRL u8 + nonzero_count u16 LE + int1_level i8 | タップ関連レジスタのスナップショット（2秒周期） |
+| `0xD1` | `tap_src_raw` | TAP_SRC u8 + read_ret i8 | 判定に使った生の `TAP_SRC`。タップ1回につき1パケット |
+| `0xD2` | `imu_reg_ack` | reg u8 + 読み戻し値 u8 + ret i8 | RX `0x50` / `0x51` への応答 |
 
 ---
 
@@ -230,9 +240,7 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 
 LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側にした装着状態で
 リストバンド表側から基板面へ垂直に行うタップを Z 軸で検出する。
-閾値は約 0.5 g、2 回の最大間隔は約 308 ms、認識後の共有クールダウンは 700 ms。
-`DOUBLE_TAP_EN` 有効時、ファームウェアは1打目のsingle候補を約330ms保留し、窓内の2回目をdoubleとして確定する。
-窓内に2回目がなければsingleを送信する。確定後の連続イベントには700msのクールダウンを適用する。
+閾値は約 0.5 g、2 打の最大間隔（Duration）は約 308 ms、確定後のクールダウンは 700 ms。
 
 | モード | single (`0x14`) | double (`0x12`) |
 |--------|-----------------|-----------------|
@@ -254,24 +262,96 @@ Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` �
 ```
 リストバンド表側への衝撃
   → LSM6DS3TR-C内蔵判定（Z軸、閾値・Shock・Quiet・Duration）
-  → TAP_SRCに single-tap または double-tap / Z を記録
-  → IMU INT1をassert
-  → XIAO P0.11のGPIO割り込み
-  → メインループでTAP_SRCを確認（double 優先）
+  → 1打目の時点で IMU INT1 をassert（MD1_CFGにsingleも割り当てているため）
+  → XIAO P0.11のGPIO割り込み／メインループでのINT1レベル監視
+  → TAP_SRCには触れずに 350 ms 待つ（TAP_SRC_SETTLE_MS）
+  → HWのDurationが閉じた後に TAP_SRC を1回だけ読む
+  → TAP_IA|DOUBLE|Z なら double、それ以外は single
   → BLE [0x00, 0x55, 0x12] または [0x00, 0x55, 0x14]
 ```
 
 - 基板DTSの `irq-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>` により、IMU INT1は
   nRF52840のP0.11へ接続される。
 - `INT1_CTRL` の加速度・ジャイロdata-ready割り込みを無効化し、`MD1_CFG` の
-  single-tap と double-tap を INT1 へ割り当てる。割り込み処理はフラグを立てるだけで、
-  I2C読み出しとBLE通知はメインループ側で行う。
+  single-tap と double-tap を INT1 へ割り当てる。INT1に載るのはタップだけなので、
+  **INT1のassertは常に「打撃があった」ことを意味する**。
 - NCS v2.9.2のLSM6DSLドライバはこのセンサーの`SENSOR_TRIG_DOUBLE_TAP`を
   実装していない。そのためtap関連レジスタをI2Cで直接設定し、ドライバの
   `SENSOR_TRIG_DATA_READY`用INT1配送経路をGPIO通知手段として再利用する。
   実際の割り込み源はdata-readyではなく、IMUが判定したタップである。
+- 同ドライバは初期化時に `CTRL6_C.XL_HM_MODE` を無条件でセットし、加速度計を
+  high-performance モードから外す。ST のタップ手順（AN5040）はこれがONである前提
+  なので、`configure_tap_detection()` で明示的にクリアする。
+- ドライバの `lsm6dsl_thread_cb()` は INT1 がラッチでhighのまま
+  `GPIO_INT_EDGE_TO_ACTIVE` を再武装し、`lsm6dsl_trigger_set` と違ってピンレベルを
+  再確認しない。立ち上がりエッジを取りこぼすことがあるため、ファームウェアは
+  **エッジではなくINT1のレベル**もメインループで見る。
 - 初期化に失敗した場合はタップ検出だけを無効化してログへ理由を出し、既存の
   IMUポーリング、録音ジェスチャー、BLE接続は継続する。
+
+#### TAP_SRC を1打目で読んではいけない（0.0.76〜0.0.86 回帰の真因）
+
+`TAP_CFG` は LIR（latched interrupt request）を有効にしている。この状態で
+**Duration の窓が閉じる前に `TAP_SRC` を読むと、ラッチが解除されて進行中の
+ダブルタップ判定が中断される**。
+
+`0.0.76` が `MD1_CFG` に `INT1_SINGLE_TAP`(BIT6) を追加したことで、INT1は
+1打目の時点でassertされるようになった。従来どおりINT1を見て即座に`TAP_SRC`を
+読むと、上記のとおり2打目の判定が壊れる。実測では、ダブルタップが
+`TAP_SRC=0x21`（`SINGLE|Z`、`TAP_IA`は立たない）2発に分解され、
+**`0x12` は一度も送信されなくなった**。`0.0.55`（double専用、`MD1_CFG=0x08`）が
+7/7 PASS していたのは、INT1がダブル確定後にしか上がらず、読み出しが必ず
+事後だったからである。
+
+対策は「INT1が上がってから `TAP_SRC_SETTLE_MS`（350 ms＝HW Duration 308 ms＋
+メインループ25 ms＋余裕）待ってから1回だけ読む」。窓が閉じた後なので、
+レジスタは最終判定を持っている。
+
+実測した `TAP_SRC` の値（FW `0.0.85`〜`0.0.87`、Z軸・0.5 g）:
+
+| 操作 | 350 ms後の `TAP_SRC` | 判定 |
+|------|---------------------|------|
+| ダブルタップ | `0x51` / `0x59`（`TAP_IA\|DOUBLE\|Z`） | double → `0x12` |
+| シングルタップ | `0x00` | single → `0x14` |
+
+このセンサーは `SINGLE_DOUBLE_TAP=1` のとき **`TAP_IA` をダブル確定時にしか
+立てない**。単打では窓が閉じた時点で `TAP_SRC` が `0x00` までクリアされるため、
+シングルを `TAP_IA` でマッチさせることはできない。INT1にタップ以外が載っていない
+ことを利用し、**「INT1が上がった、かつダブルが確定しなかった」＝シングル**と
+推定する。
+
+過去に修正した派生バグも記録しておく（いずれも実在したが、上記が本体）:
+
+- **クールダウン共有（`0.0.76`〜`0.0.80`）**: single と double が1つの
+  タイムスタンプを共有していたため、仮にsingleが先に出ると700 ms間doubleが
+  無言で捨てられた。`0.0.81` で `tap_last_single_ms` / `tap_last_double_ms` に分離。
+  確定タップはすべてsingleのクールダウンを刻むが、doubleのクールダウンを
+  刻めるのはdoubleだけ。クールダウンで捨てたタップは必ず printk する。
+- **毎ループの無条件 `TAP_SRC` ポーリング（`0.0.80`〜`0.0.83`、未リリース）**:
+  ドライバのエッジ取りこぼし対策として入れたものだが、25 ms ごとにラッチを
+  解除するため上記の中断を最悪化させていた。INT1レベル監視＋遅延読み出しに置換。
+
+#### タップ系の診断
+
+USBシリアルなしで実機を追えるよう、タップ経路はBLEへ計装済み。
+
+- `0xD0`（2秒周期）: `CTRL1_XL` `CTRL6_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2`
+  `WAKE_UP_THS` `MD1_CFG` `INT1_CTRL` の実値、`TAP_SRC`読み出しの戻り値、
+  非ゼロ検出回数、INT1のレベル。レジスタが期待どおりかを一目で確認できる。
+- `0xD1`: 判定に使った生の `TAP_SRC`。どの軸が立ったか、`TAP_IA` / `DOUBLE` /
+  `SINGLE` のどれが立ったかがそのまま読める。
+- RX `0x50` / `0x51`: OTAなしで閾値・軸・Durationを実機で振る。
+
+正常時の期待値: `CTRL1_XL=0x60` `CTRL6_C=0x00` `TAP_CFG=0x83` `TAP_THS_6D=0x08`
+`INT_DUR2=0x4a` `WAKE_UP_THS=0x80` `MD1_CFG=0x48` `INT1_CTRL=0x00`。
+
+Mac から `mac_client/tap_monitor.py` で観測する（macOSのBluetooth権限の都合で
+Terminal.appから実行すること。詳細は [`ota_update_notes.md`](ota_update_notes.md)）。
+
+```bash
+mac_client/venv/bin/python3 mac_client/tap_monitor.py --duration 60
+mac_client/venv/bin/python3 mac_client/tap_monitor.py --duration 45 --write 0x59:0x04
+```
 
 #### 実機確認結果
 
@@ -285,8 +365,15 @@ Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` �
 | タップせず腕を自然に上げ下げ | 2 / 2 誤検出なし |
 | 合計 | **7 / 7 PASS** |
 
-single (`0x14`) はファーム `0.0.76` で実装・OTA 済み。検出系の実機再確認は未実施。  
-Android 側の受信・UX は未実装（[`Android未実装_シングルタップイベント対応.md`](Android未実装_シングルタップイベント対応.md)）。
+2026-08-31、ファームウェア`0.0.87`で single / double 同時運用を再確認した
+（Mac直結の `tap_monitor.py` で観測、その後 Android アプリでも受信を確認）。
+
+| 試験 | 結果 |
+|------|------|
+| シングルタップ | 5 / 5 → `0x14` のみ（`TAP_SRC=0x00`） |
+| ダブルタップ | 5 / 5 → `0x12` のみ（`TAP_SRC=0x51`/`0x59`） |
+| 取り違え・誤検出 | 0 件 |
+| 合計 | **10 / 10 PASS** |
 
 ---
 

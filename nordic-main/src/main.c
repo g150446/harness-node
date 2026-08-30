@@ -108,12 +108,30 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
  * gives about 38 ms shock, 19 ms quiet, and 308 ms between taps.  With
  * double-tap enable set, a lone tap asserts single after that gap; a second
  * tap inside the gap asserts double instead.
+ *
+ * Single and double keep SEPARATE cooldowns.  process_tap_event() now emits at
+ * most one event per strike, so they can no longer collide, but a shared
+ * timestamp was a real defect in 0.0.76-0.0.80: a single stamped the cooldown
+ * and blacked out any double for the next 700 ms.  Keep them apart.
  */
 #define EVT_DOUBLE_TAP                 0x12
 #define EVT_SINGLE_TAP                 0x14
 #define TAP_COOLDOWN_MS                 700
-#define TAP_SINGLE_CONFIRM_MS            330
+/*
+ * INT1 asserts on the FIRST strike because MD1_CFG routes single tap as well as
+ * double.  TAP_SRC must not be read yet: with LIR=1 the read clears the latch
+ * and aborts the double-tap evaluation still in flight, which is what turned
+ * every double tap into two half-classified singles from 0.0.76 on.
+ *
+ * So let the hardware Duration window close first, then read once.  The
+ * register then reports the final verdict -- TAP_IA|DOUBLE or TAP_IA|SINGLE --
+ * and no software hold is needed.  INT_DUR2=0x4a -> DUR=4 -> 4*32/416 Hz
+ * ~= 308 ms, plus a MAIN_LOOP_INTERVAL_MS tick of jitter, plus margin.
+ */
+#define TAP_SRC_SETTLE_MS                350
 #define LSM6DS3TR_C_REG_INT1_CTRL      0x0D
+#define LSM6DS3TR_C_REG_CTRL1_XL       0x10
+#define LSM6DS3TR_C_REG_CTRL6_C        0x15
 #define LSM6DS3TR_C_REG_TAP_SRC        0x1C
 #define LSM6DS3TR_C_REG_TAP_CFG        0x58
 #define LSM6DS3TR_C_REG_TAP_THS_6D     0x59
@@ -121,6 +139,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define LSM6DS3TR_C_REG_WAKE_UP_THS    0x5B
 #define LSM6DS3TR_C_REG_MD1_CFG        0x5E
 #define LSM6DS3TR_C_INT1_DRDY_MASK     (BIT(1) | BIT(0))
+#define LSM6DS3TR_C_CTRL6_XL_HM_MODE   BIT(4)
 #define LSM6DS3TR_C_TAP_CFG_MASK       (BIT(7) | BIT(3) | BIT(2) | BIT(1) | BIT(0))
 #define LSM6DS3TR_C_TAP_CFG_Z_LATCHED  (BIT(7) | BIT(1) | BIT(0))
 #define LSM6DS3TR_C_TAP_THS_MASK       0x1F
@@ -130,8 +149,37 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define LSM6DS3TR_C_MD1_TAP_MASK       (BIT(6) | BIT(3))
 #define LSM6DS3TR_C_MD1_SINGLE_TAP     BIT(6)
 #define LSM6DS3TR_C_MD1_DOUBLE_TAP     BIT(3)
+/* TAP_IA + DOUBLE + Z_TAP.  Staying Z-only keeps ordinary arm motion from
+ * manufacturing spurious taps.
+ *
+ * Measured on FW 0.0.85/0.0.86: with SINGLE_DOUBLE_TAP=1 this part raises
+ * TAP_IA only for a confirmed double (TAP_SRC=0x51/0x59).  After a lone tap it
+ * clears TAP_SRC to 0x00 once the Duration window closes, so there is nothing
+ * left to match a single against.
+ *
+ * Only tap is routed to INT1 (INT1_CTRL=0x00, MD1_CFG=0x48), so an INT1
+ * assertion always means a strike happened.  That makes the classification
+ * simply: double if TAP_SRC says so, single otherwise. */
 #define LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH (BIT(6) | BIT(4) | BIT(0))
-#define LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH (BIT(6) | BIT(5) | BIT(0))
+
+/*
+ * Tap instrumentation.  A silent TAP_SRC read failure or a mis-programmed
+ * embedded-function register is indistinguishable from "no tap happened" from
+ * the host side, so publish both over BLE.
+ *   0xD0 register snapshot, every TAP_DIAG_INTERVAL_MS
+ *   0xD1 the raw TAP_SRC each classification was made from (one per strike)
+ *   0xD2 reply to the host register poke commands below
+ */
+#define EVT_TAP_DIAG                   0xD0
+#define EVT_TAP_SRC_RAW                0xD1
+#define EVT_TAP_REG_ACK                0xD2
+#define TAP_DIAG_INTERVAL_MS           2000
+
+/* Host-driven IMU register poke, so tap tuning does not need an OTA per try.
+ * Writes are restricted to the tap/ODR registers listed in tap_reg_writable(). */
+#define CMD_IMU_REG_WRITE              0x50
+#define CMD_IMU_REG_READ               0x51
+#define LSM6DS3TR_C_REG_CTRL10_C       0x19
 
 /*
  * Dorsal-side gesture classifier (accel + on-demand gyro_y).
@@ -484,15 +532,23 @@ static void conn_param_work_handler(struct k_work *work)
 /* IMU device */
 static const struct device *const imu     = DEVICE_DT_GET(IMU_NODE);
 static const struct i2c_dt_spec imu_i2c = I2C_DT_SPEC_GET(IMU_NODE);
+/* INT1, already configured as an input by the LSM6DSL driver.  Polling its
+ * level is how we recover from the driver's edge-only re-arm without touching
+ * TAP_SRC, which must not be read before the hardware asserts TAP_IA. */
+static const struct gpio_dt_spec imu_int1 = GPIO_DT_SPEC_GET(IMU_NODE, irq_gpios);
 static const struct sensor_trigger tap_trigger = {
     .type = SENSOR_TRIG_DATA_READY,
     .chan = SENSOR_CHAN_ACCEL_XYZ,
 };
 static atomic_t tap_irq_pending;
-static int64_t tap_last_event_ms;
-static bool tap_single_pending;
-static int64_t tap_single_deadline_ms;
-static uint8_t tap_single_src;
+/* Separate cooldowns: a single must never gate a double that follows it. */
+static int64_t tap_last_single_ms;
+static int64_t tap_last_double_ms;
+static int tap_last_read_ret;
+static int tap_int1_level;
+static uint16_t tap_nonzero_count;
+static int64_t tap_diag_last_ms;
+static int64_t tap_read_deadline_ms;
 
 /* Gesture state */
 typedef enum {
@@ -999,6 +1055,9 @@ static void flush_gesture_history(void);
 static void flush_gesture_trajectory(void);
 static void flush_host_collection(void);
 static void process_tap_event(int64_t now);
+static void send_tap_diag(void);
+static void send_tap_src_raw(uint8_t tap_src, int ret);
+static void send_tap_reg_ack(uint8_t reg, uint8_t value, int ret);
 static void apply_pending_operation_mode(void);
 static void send_operation_mode_status(void);
 
@@ -1166,6 +1225,26 @@ static void tap_irq_handler(const struct device *dev,
     atomic_set(&tap_irq_pending, 1);
 }
 
+/* Only the accelerometer/tap configuration registers may be poked from the
+ * host.  Anything else stays off limits so a stray write cannot brick the IMU
+ * state the gesture pipeline depends on. */
+static bool tap_reg_writable(uint8_t reg)
+{
+    switch (reg) {
+    case LSM6DS3TR_C_REG_CTRL1_XL:
+    case LSM6DS3TR_C_REG_CTRL6_C:
+    case LSM6DS3TR_C_REG_CTRL10_C:
+    case LSM6DS3TR_C_REG_TAP_CFG:
+    case LSM6DS3TR_C_REG_TAP_THS_6D:
+    case LSM6DS3TR_C_REG_INT_DUR2:
+    case LSM6DS3TR_C_REG_WAKE_UP_THS:
+    case LSM6DS3TR_C_REG_MD1_CFG:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static int configure_tap_detection(void)
 {
     uint8_t tap_src;
@@ -1188,6 +1267,13 @@ static int configure_tap_detection(void)
         LOG_ERR("Clearing IMU DRDY routing failed: %d", ret);
         return ret;
     }
+
+    /* The NCS LSM6DSL driver unconditionally sets XL_HM_MODE at init, which
+     * takes the accelerometer out of high-performance mode.  ST's tap
+     * procedure (AN5040) assumes it stays on. */
+    ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_CTRL6_C,
+                                 LSM6DS3TR_C_CTRL6_XL_HM_MODE, 0);
+    if (ret < 0) goto register_error;
 
     ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_CFG,
                                  LSM6DS3TR_C_TAP_CFG_MASK,
@@ -2085,7 +2171,13 @@ static void reset_gesture_sequence(void)
 
 static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
 {
-    tap_last_event_ms = now;
+    /* Any confirmed tap gates further singles, but only a double gates further
+     * doubles.  This asymmetry is what keeps the leading single of a double tap
+     * from swallowing the double. */
+    tap_last_single_ms = now;
+    if (is_double) {
+        tap_last_double_ms = now;
+    }
 
     if (is_double && operation_mode == OPERATION_MODE_DRIVING) {
         /* Driving mode uses hardware double-tap as a local recording toggle.
@@ -2145,58 +2237,68 @@ static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
 
 static void process_tap_event(int64_t now)
 {
-    uint8_t tap_src;
+    uint8_t tap_src = 0;
     bool is_double;
     bool is_single;
     int ret;
+    bool irq_pending = atomic_cas(&tap_irq_pending, 1, 0);
+    int int1_level = gpio_pin_get_dt(&imu_int1);
 
-    if (!atomic_cas(&tap_irq_pending, 1, 0)) {
-        if (tap_single_pending && now >= tap_single_deadline_ms) {
-            uint8_t pending_src = tap_single_src;
+    tap_int1_level = int1_level;
 
-            tap_single_pending = false;
-            if ((now - tap_last_event_ms) >= TAP_COOLDOWN_MS) {
-                emit_tap_event(now, false, pending_src);
-            }
+    /* Phase 1: notice that the sensor raised INT1 and start the settle timer.
+     * INT1 is latched (LIR=1), so polling its level -- not just catching the
+     * rising edge -- also covers the NCS LSM6DSL driver re-arming
+     * GPIO_INT_EDGE_TO_ACTIVE while the line is still high. */
+    if (tap_read_deadline_ms == 0) {
+        if (irq_pending || int1_level > 0) {
+            tap_read_deadline_ms = now + TAP_SRC_SETTLE_MS;
         }
         return;
     }
 
-    ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
-    if (ret < 0) {
-        LOG_ERR("Tap source read failed: %d", ret);
-        atomic_set(&tap_irq_pending, 1);
+    /* Phase 2: wait out the hardware Duration window without touching
+     * TAP_SRC, so a second strike can still be classified as a double. */
+    if (now < tap_read_deadline_ms) {
         return;
     }
+    tap_read_deadline_ms = 0;
+
+    /* Phase 3: one read, after the verdict is final.  This also clears the
+     * latch and releases INT1. */
+    ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
+    tap_last_read_ret = ret;
+    if (ret < 0) {
+        LOG_ERR("Tap source read failed: %d", ret);
+        send_tap_src_raw(0, ret);
+        return;
+    }
+    tap_nonzero_count++;
+    send_tap_src_raw(tap_src, ret);
 
     is_double = (tap_src & LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH) ==
                 LSM6DS3TR_C_TAP_SRC_DOUBLE_MATCH;
-    is_single = (tap_src & LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH) ==
-                LSM6DS3TR_C_TAP_SRC_SINGLE_MATCH;
-    if (!is_double && !is_single) {
-        LOG_DBG("Ignoring IMU INT1 source 0x%02x", tap_src);
-        return;
-    }
-    /* The sensor recognizes single and double independently.  Routing both to
-     * INT1 means the first strike can report SINGLE_TAP before a later
-     * DOUBLE_TAP.  Hold the single candidate through the hardware duration
-     * window so a double produces only EVT_DOUBLE_TAP. */
+    /* INT1 fired and the hardware did not confirm a double: a single. */
+    is_single = !is_double;
+
+    /* A double also sets SINGLE_TAP, so double wins. */
     if (is_double) {
-        is_single = false;
-        tap_single_pending = false;
-        if ((now - tap_last_event_ms) >= TAP_COOLDOWN_MS) {
+        if ((now - tap_last_double_ms) >= TAP_COOLDOWN_MS) {
             emit_tap_event(now, true, tap_src);
+        } else {
+            printk(">>> Double tap dropped: cooldown %lld ms (TAP_SRC=0x%02x)\n",
+                   (long long)(now - tap_last_double_ms), tap_src);
         }
         return;
     }
 
-    if ((now - tap_last_event_ms) < TAP_COOLDOWN_MS) {
-        return;
-    }
-    if (is_single && !tap_single_pending) {
-        tap_single_pending = true;
-        tap_single_deadline_ms = now + TAP_SINGLE_CONFIRM_MS;
-        tap_single_src = tap_src;
+    if (is_single) {
+        if ((now - tap_last_single_ms) >= TAP_COOLDOWN_MS) {
+            emit_tap_event(now, false, tap_src);
+        } else {
+            printk(">>> Single tap dropped: cooldown %lld ms (TAP_SRC=0x%02x)\n",
+                   (long long)(now - tap_last_single_ms), tap_src);
+        }
     }
 }
 
@@ -3270,8 +3372,17 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
                 }
             }
             if (!found) {
-                primary_idx = -1;
-                printk(">>> Primary yielded but no peer present; primary cleared\n");
+                /* Keep the yielding connection as primary — clearing would
+                 * drop all event/audio delivery until the next claim. */
+                int self = conn_index(conn);
+                if (self >= 0) {
+                    primary_idx = self;
+                    printk(">>> Primary yield ignored (no peer); conn[%d] stays primary\n",
+                           self);
+                } else {
+                    primary_idx = -1;
+                    printk(">>> Primary yielded but no peer present; primary cleared\n");
+                }
             }
             /* Update connection params after yield */
             k_work_schedule(&conn_param_work, K_MSEC(200));
@@ -3286,6 +3397,28 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
                 printk(">>> Invalid operation mode: %u\n", data[1]);
                 send_operation_mode_status();
             }
+        } else if (data[0] == CMD_IMU_REG_WRITE && len >= 3) {
+            uint8_t reg = data[1];
+            uint8_t val = data[2];
+            uint8_t readback = 0;
+            int ret;
+
+            if (!tap_reg_writable(reg)) {
+                printk(">>> IMU reg write rejected: 0x%02x\n", reg);
+                send_tap_reg_ack(reg, 0, -EPERM);
+            } else {
+                ret = i2c_reg_write_byte_dt(&imu_i2c, reg, val);
+                if (ret == 0) {
+                    ret = i2c_reg_read_byte_dt(&imu_i2c, reg, &readback);
+                }
+                send_tap_reg_ack(reg, readback, ret);
+            }
+        } else if (data[0] == CMD_IMU_REG_READ && len >= 2) {
+            uint8_t reg = data[1];
+            uint8_t val = 0;
+            int ret = i2c_reg_read_byte_dt(&imu_i2c, reg, &val);
+
+            send_tap_reg_ack(reg, val, ret);
 #if GESTURE_DEBUG_HISTORY
         } else if (data[0] == 0x04) {
             if (!gesture_host_collection_start()) {
@@ -3320,16 +3453,93 @@ static void send_operation_mode_status(void)
     }
 }
 
+/* Notify every active BLE client. Tap/diagnostic events must reach Android even
+ * when Mac Handy holds the primary (audio) role. */
+static void notify_all_conns(const void *data, uint16_t len)
+{
+    int n = 0;
+
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (!connections[i]) {
+            continue;
+        }
+        if (bt_gatt_notify(connections[i], &audio_svc.attrs[2], data, len) == 0) {
+            n++;
+        }
+    }
+    if (n == 0) {
+        printk(">>> notify_all: no active conn\n");
+    }
+}
+
 /* Send event packet via TX characteristic: [0x00][0x55][event_code] */
 static void send_event_packet(uint8_t event_code)
 {
+    uint8_t pkt[3] = { 0x00, 0x55, event_code };
+
+    /* Tap events are diagnostic / control UI signals for every host. */
+    if (event_code == EVT_DOUBLE_TAP || event_code == EVT_SINGLE_TAP ||
+        event_code == 0x20 || event_code == 0x21) {
+        printk(">>> send_event 0x%02x -> all conns (primary[%d])\n",
+               event_code, primary_idx);
+        notify_all_conns(pkt, sizeof(pkt));
+        return;
+    }
+
     if (!get_primary_conn()) {
         printk(">>> send_event 0x%02x: no primary conn\n", event_code);
         return;
     }
     printk(">>> send_event 0x%02x -> primary[%d]\n", event_code, primary_idx);
-    uint8_t pkt[3] = { 0x00, 0x55, event_code };
     bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
+}
+
+/* Tap register snapshot: [0x00][0x55][0xD0][ret][CTRL1_XL][CTRL6_C][TAP_CFG]
+ * [TAP_THS_6D][INT_DUR2][WAKE_UP_THS][MD1_CFG][INT1_CTRL][nonzero_lo][nonzero_hi]
+ * [int1_level] */
+static void send_tap_diag(void)
+{
+    static const uint8_t regs[] = {
+        LSM6DS3TR_C_REG_CTRL1_XL, LSM6DS3TR_C_REG_CTRL6_C,
+        LSM6DS3TR_C_REG_TAP_CFG,  LSM6DS3TR_C_REG_TAP_THS_6D,
+        LSM6DS3TR_C_REG_INT_DUR2, LSM6DS3TR_C_REG_WAKE_UP_THS,
+        LSM6DS3TR_C_REG_MD1_CFG,  LSM6DS3TR_C_REG_INT1_CTRL,
+    };
+    uint8_t pkt[15] = { 0x00, 0x55, EVT_TAP_DIAG,
+                        (uint8_t)(int8_t)tap_last_read_ret };
+
+    for (size_t i = 0; i < ARRAY_SIZE(regs); i++) {
+        uint8_t val = 0xFF;
+
+        if (i2c_reg_read_byte_dt(&imu_i2c, regs[i], &val) < 0) {
+            val = 0xEE;
+        }
+        pkt[4 + i] = val;
+    }
+    pkt[12] = (uint8_t)(tap_nonzero_count & 0xFF);
+    pkt[13] = (uint8_t)(tap_nonzero_count >> 8);
+    pkt[14] = (uint8_t)(int8_t)tap_int1_level;
+    notify_all_conns(pkt, sizeof(pkt));
+}
+
+/* Register poke ack: [0x00][0x55][0xD2][reg][value_read_back][ret] */
+static void send_tap_reg_ack(uint8_t reg, uint8_t value, int ret)
+{
+    uint8_t pkt[6] = { 0x00, 0x55, EVT_TAP_REG_ACK, reg, value,
+                       (uint8_t)(int8_t)ret };
+
+    printk(">>> IMU reg 0x%02x = 0x%02x (ret=%d)\n", reg, value, ret);
+    notify_all_conns(pkt, sizeof(pkt));
+}
+
+/* Raw TAP_SRC: [0x00][0x55][0xD1][tap_src][read_ret] */
+static void send_tap_src_raw(uint8_t tap_src, int ret)
+{
+    uint8_t pkt[5] = { 0x00, 0x55, EVT_TAP_SRC_RAW, tap_src,
+                       (uint8_t)(int8_t)ret };
+
+    printk(">>> TAP_SRC raw 0x%02x (ret=%d)\n", tap_src, ret);
+    notify_all_conns(pkt, sizeof(pkt));
 }
 
 /* motion_active/xyz packet: [0x00][0x55][code][f32_x][f32_y][f32_z] = 15 bytes */
@@ -4332,6 +4542,11 @@ int main(void)
             process_motion_sample();
         }
         process_tap_event(now_ms);
+
+        if ((now_ms - tap_diag_last_ms) >= TAP_DIAG_INTERVAL_MS) {
+            tap_diag_last_ms = now_ms;
+            send_tap_diag();
+        }
 
         led_tick();
 

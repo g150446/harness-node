@@ -16,7 +16,12 @@
 
 ## macOSでのOTA実行
 
-- `mac_client/ota_updater.py` のBleak/CoreBluetoothスキャンは、非対話のバックグラウンド実行でmacOSプロセスが `SIGABRT` になることがある。OTAはユーザーセッションのTerminalで実行する。
+- `mac_client/ota_updater.py` のBleak/CoreBluetoothスキャンは、非対話のバックグラウンド実行でmacOSプロセスが `SIGABRT` になることがある。原因はmacOSのTCC（プライバシー）で、`NSBluetoothAlwaysUsageDescription` を持たないプロセスからのBluetooth利用が拒否されるため。OTAはユーザーセッションのTerminalで実行する。同じ理由で `mac_client/tap_monitor.py` や `mac_client/image_state.py` などBLEを使うスクリプトはすべて同様に扱う。
+- エージェントから実行する場合は、TerminalのBluetooth許可を継承させるためAppleScript経由で起動する。
+
+  ```bash
+  osascript -e 'tell application "Terminal" to do script "cd /path/to/harness-node && mac_client/venv/bin/python3 mac_client/ota_updater.py --device HarnessNode nordic-main/ota_update.bin > /tmp/ota.log 2>&1; exit"'
+  ```
 - Terminalをエージェントが開いた場合は、ウィンドウまたはタブIDを記録し、アップロードと検証が終わったら必ず閉じる。既存のユーザーTerminalは閉じない。
 - 失敗時に同じイメージを無条件で再送しない。まず対象名、接続状態、slot 0/slot 1のversion・hashを読み直す。
 
@@ -34,3 +39,18 @@
 
 - 2026-08-30: 0.0.77（single候補遅延確定によるdouble回帰修正）をビルド・OTA。
   slot 0で`active=true`、`confirmed=true`、version=`0.0.77`を確認済み。
+- 2026-08-31: 0.0.81（single/doubleのクールダウン分離）をビルド・OTA。confirmed確認済み。
+  ただしタップは復旧せず、実機は0.0.80が載っていたことも判明した。
+- 2026-08-31: 0.0.82〜0.0.84 をOTA。タップ経路の診断イベント（`0xD0`/`0xD1`/`0xD2`）と
+  RXレジスタポーク（`0x50`/`0x51`）を追加し、実機のレジスタ値と生 `TAP_SRC` を可視化。
+  これで真因（1打目での `TAP_SRC` 読み出しによるLIRラッチ解除）を特定した。
+- 2026-08-31: 0.0.85〜0.0.87 をOTA。INT1レベル監視＋350ms遅延読み出しへ変更し、
+  single 5/5・double 5/5・誤検出0でPASS。slot 0 `active=true` / `confirmed=true` /
+  version=`0.0.87` を確認済み。詳細は
+  [`nordic_main_guide.md`](nordic_main_guide.md) の「シングル／ダブルタップ」。
+
+### 調査のコツ
+
+タップ系の不具合は、`RX 0x50` のレジスタポークでOTAなしに実機で条件を振れる。
+1回のOTAあたり約2分かかるので、まず `tap_monitor.py --write` で当たりを付けてから
+ファームへ反映すると回数を大幅に減らせる。
