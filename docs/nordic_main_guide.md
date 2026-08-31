@@ -16,7 +16,7 @@
 | IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 起動後は待機時消灯。録音ジェスチャー成立後の録音中のみ赤 |
-| 署名バージョン（目安） | `0.0.88+`（TAP_SRC遅延読み出しによるタップ判定修正、`0xD0`定期配信の停止、`0x40`の全接続配信を含む） |
+| 署名バージョン（目安） | `0.0.90+`（TAP_SRC遅延読み出しによるタップ判定修正、`0xD0`定期配信の停止、`0x40`の全接続配信、接続時通知の購読待ちを含む） |
 | OTA 手順 | [`ota_update_notes.md`](ota_update_notes.md) |
 | Android single_tap | `0x14`を診断ログへ記録（Kindle/G2操作はdouble専用） |
 
@@ -261,7 +261,9 @@ Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` �
 - `notify_all_conns()` で**全接続へ**送る。Mac Handy が primary を握っている間も
   Android がモードを追えるようにするため（`0.0.87` までは primary 1本にしか飛ばず、
   secondary の Android には届かなかった）。
-- 接続確立時は primary / secondary のどちらでも現在のモードを1回送る。
+- 接続確立時は primary / secondary のどちらでも現在のモードを1回送る。ただし送信は
+  `ble_connected()` ではなく **メインループが `bt_gatt_is_subscribed()` を見て**行う。
+  詳細は下の「接続時通知は購読完了を待つ」を参照。
 
 #### ハードウェア割り込み構成
 
@@ -345,7 +347,7 @@ Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` �
 
 USBシリアルなしで実機を追えるよう、タップ経路はBLEへ計装済み。
 
-- `0xD0`（接続確立時に1回、`0.0.88+`）: `CTRL1_XL` `CTRL6_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2`
+- `0xD0`（接続確立時に1回、`0.0.88+`。実際の送信は購読完了後、`0.0.90+`）: `CTRL1_XL` `CTRL6_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2`
   `WAKE_UP_THS` `MD1_CFG` `INT1_CTRL` の実値、`TAP_SRC`読み出しの戻り値、
   非ゼロ検出回数、INT1のレベル。レジスタが期待どおりかを一目で確認できる。
 - `0xD1`: 判定に使った生の `TAP_SRC`。どの軸が立ったか、`TAP_IA` / `DOUBLE` /
@@ -357,6 +359,43 @@ USBシリアルなしで実機を追えるよう、タップ経路はBLEへ計�
 帯域は無視できるが、Android の `BleManager` が高レート系以外を全部hexダンプするため
 logcat が2秒ごとに埋まり、Node も2秒ごとにI2Cを8回叩いていた。`0.0.88` で
 接続時1回に変更。
+
+#### 接続時通知は購読完了を待つ（`0.0.90` で修正）
+
+**`ble_connected()` で `bt_gatt_notify()` を呼んでも、その接続した本人には届かない。**
+接続確立からクライアントがTX characteristicのCCCDを書くまで約1秒あり、その間は
+購読者がいないので通知は捨てられる。実測（Android、FW `0.0.88`）:
+
+```
+17:33:49.854  GATT connected            <- ble_connected() はここ
+17:33:51.072  TX notifications enabled  <- CCCD有効化は1.2秒後
+```
+
+`0.0.88` ではこのせいで接続時の `0xD0` と `0x40` がAndroid自身には1件も届かず、
+**別のクライアントが後から接続したときだけ**（既に購読済みなので）現れるという
+紛らわしい挙動になっていた。`0.0.87` までは `0xD0` の2秒周期タイマーが再送していたため
+表面化せず、`send_operation_mode_status()` の方は元から同じ欠陥を抱えていた。
+
+**`BT_GATT_CCC` の `cfg_changed` はこの用途に使えない**（`0.0.89` で試して失敗した）。
+Zephyr の `gatt_ccc_changed()` は全クライアントの**集約値が変化したときだけ**
+コールバックを呼ぶ:
+
+```c
+for (i = 0; i < ARRAY_SIZE(ccc->cfg); i++)
+    if (ccc->cfg[i].value > value) value = ccc->cfg[i].value;
+if (value != ccc->value) { ccc->value = value; ccc->cfg_changed(attr, value); }
+```
+
+つまり既に誰かが購読している状態で2台目が購読しても発火しない。接続ごとの処理には
+使えない。
+
+`0.0.90` の実装: `ble_connected()` は `conn_needs_greeting[slot]` を立てるだけにし、
+メインループ（25 ms周期）の `send_pending_greetings()` が
+**接続ごとに `bt_gatt_is_subscribed(conn, &audio_svc.attrs[2], BT_GATT_CCC_NOTIFY)`**
+を見て、trueになった接続にだけ送る。時間待ちではないので取りこぼしも早すぎる送信もない。
+
+**接続直後に何かを通知したくなったら、`ble_connected()` でもCCCDコールバックでもなく、
+`bt_gatt_is_subscribed()` を接続ごとにポーリングすること。**
 
 正常時の期待値: `CTRL1_XL=0x60` `CTRL6_C=0x00` `TAP_CFG=0x83` `TAP_THS_6D=0x08`
 `INT_DUR2=0x4a` `WAKE_UP_THS=0x80` `MD1_CFG=0x48` `INT1_CTRL=0x00`。

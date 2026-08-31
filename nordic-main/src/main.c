@@ -546,8 +546,18 @@ static int64_t tap_last_double_ms;
 static int tap_last_read_ret;
 static int tap_int1_level;
 static uint16_t tap_nonzero_count;
-/* Set from ble_connected(); the main loop owns the I2C reads send_tap_diag()
- * needs, so the BT callback must not call it directly. */
+/* Per-connection greeting (mode status + one tap-register snapshot).
+ *
+ * It cannot be sent from ble_connected(): that runs about a second before the
+ * client writes the TX CCCD, so there is no subscriber yet and the notification
+ * is dropped.  BT_GATT_CCC's cfg_changed is not a usable hook either -- Zephyr
+ * only calls it when the aggregate value across all clients changes, so a second
+ * client subscribing while the first is already subscribed never triggers it.
+ *
+ * So mark the connection here and let the main loop poll bt_gatt_is_subscribed()
+ * for that specific connection.  The main loop also owns send_tap_diag(), which
+ * blocks on eight I2C reads and must not run on the BT callback thread. */
+static bool conn_needs_greeting[MAX_CONNS];
 static bool tap_diag_once_pending;
 static int64_t tap_read_deadline_ms;
 
@@ -3539,6 +3549,32 @@ static void send_tap_reg_ack(uint8_t reg, uint8_t value, int ret)
     notify_all_conns(pkt, sizeof(pkt));
 }
 
+/* Deliver the per-connection greeting once that client has subscribed.  Polled
+ * from the main loop; see conn_needs_greeting for why this cannot be event
+ * driven. */
+static void send_pending_greetings(void)
+{
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (!conn_needs_greeting[i] || !connections[i]) {
+            continue;
+        }
+        if (!bt_gatt_is_subscribed(connections[i], &audio_svc.attrs[2],
+                                   BT_GATT_CCC_NOTIFY)) {
+            continue;
+        }
+        conn_needs_greeting[i] = false;
+
+        uint8_t pkt[5] = {0x00, 0x55, EVT_OPERATION_MODE,
+                          operation_mode, operation_mode_pending};
+        bt_gatt_notify(connections[i], &audio_svc.attrs[2], pkt, sizeof(pkt));
+        printk(">>> Greeted conn[%d]: mode=%u\n", i, operation_mode);
+
+        /* send_tap_diag() notifies every client; an extra copy for an already
+         * connected peer is harmless and keeps the I2C reads in one place. */
+        tap_diag_once_pending = true;
+    }
+}
+
 /* Raw TAP_SRC: [0x00][0x55][0xD1][tap_src][read_ret] */
 static void send_tap_src_raw(uint8_t tap_src, int ret)
 {
@@ -4350,14 +4386,10 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
         bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
     }
 
-    /* Both roles need the current mode; a secondary Android otherwise starts
-     * with no idea what the node is running. */
-    send_operation_mode_status();
-
-    /* One tap-register snapshot per connection, so a mis-programmed embedded
-     * function is still visible without the old 2 s stream. The main loop does
-     * the I2C reads — see tap_diag_once_pending. */
-    tap_diag_once_pending = true;
+    /* Notifying here would reach nobody: the client subscribes about a second
+     * from now. The main loop sends the greeting once it has -- see
+     * send_pending_greetings(). */
+    conn_needs_greeting[slot] = true;
 
     led_sync_runtime_state();
 
@@ -4398,6 +4430,7 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
 
     bt_conn_unref(connections[idx]);
     connections[idx] = NULL;
+    conn_needs_greeting[idx] = false;
 
     if (primary_idx == idx) {
         primary_idx = -1;
@@ -4557,6 +4590,8 @@ int main(void)
             process_motion_sample();
         }
         process_tap_event(now_ms);
+
+        send_pending_greetings();
 
         if (tap_diag_once_pending) {
             tap_diag_once_pending = false;

@@ -52,8 +52,23 @@
   をビルド・OTA。251064 B を50.3秒でアップロード。slot 0 `active=true` /
   `confirmed=true` / version=`0.0.88` / hash=`c65303ff50c6a52e` を確認済み
   （直前のslot 0は`0.0.87` / `3553b743a35377e5`、これはslot 1へ退避）。
-  BLEイベントの実機検証（`0xD0`が接続時1回のみ、`0x40`の保留ack、secondary接続時の
-  ack到達、タップ非退行）は未実施。
+  実機検証: `0xD0` の2秒周期配信が消え（12秒で0件、`0.0.87`なら約6件）、`0x40` の
+  受理時ack（`pending`付き）と適用時ackが primary / secondary の両方へ届くことを確認。
+  ただし**接続時の `0xD0` / `0x40` が接続した本人に届かない**欠陥が判明（下記 `0.0.89`）。
+- 2026-08-31: 0.0.89 をビルド・OTA。接続時通知の起点を `audio_tx_ccc_cfg_changed()` へ
+  移したが**効果なし**。Zephyr の `gatt_ccc_changed()` は全クライアントの集約値が
+  変化したときだけコールバックを呼ぶため、接続ごとの処理には使えない。
+- 2026-08-31: 0.0.90 をビルド・OTA。`ble_connected()` は `conn_needs_greeting[slot]` を
+  立てるだけにし、メインループが接続ごとに `bt_gatt_is_subscribed()` を見て送る方式へ。
+  slot 0 `active=true` / `confirmed=true` / version=`0.0.90` /
+  hash=`dc8741b31f8dfb0c` を確認。実機検証: 購読直後に `0x40`（`00554000ff`）と
+  `0xD0`（レジスタ値は期待値と完全一致）が1件ずつ届き、以降 `0xD0` の再送なし。
+
+  **OTA中は他のBLEクライアントを必ず切ること。** Androidアプリは `ServiceWatchdog` で
+  force-stop から自動復活してNodeへ再接続し、`0.0.90` の初回OTAは 0.2 KB/s まで落ちた
+  （通常 7〜9 KB/s）。`pm disable-user` で復活を止め、OTAを張り直したら回復した。
+  競合接続がある状態で確立したコネクションはパラメータが劣化したまま戻らないので、
+  アプリを止めるだけでなくOTA自体をやり直すこと。
 
 ### 調査のコツ
 
