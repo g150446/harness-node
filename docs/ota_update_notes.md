@@ -48,9 +48,12 @@
   single 5/5・double 5/5・誤検出0でPASS。slot 0 `active=true` / `confirmed=true` /
   version=`0.0.87` を確認済み。詳細は
   [`nordic_main_guide.md`](nordic_main_guide.md) の「シングル／ダブルタップ」。
-- 2026-08-31: 0.0.88 をビルド（`nordic-main/ota_update.bin`、251064 B）。`0xD0` の
-  2秒周期配信を接続時1回へ、`0x40`（運転モードack）を受理時にも全接続へ送るよう変更。
-  **OTA・実機検証は未実施。**
+- 2026-08-31: 0.0.88（`0xD0` の2秒周期配信を接続時1回へ、`0x40` を受理時にも全接続へ）
+  をビルド・OTA。251064 B を50.3秒でアップロード。slot 0 `active=true` /
+  `confirmed=true` / version=`0.0.88` / hash=`c65303ff50c6a52e` を確認済み
+  （直前のslot 0は`0.0.87` / `3553b743a35377e5`、これはslot 1へ退避）。
+  BLEイベントの実機検証（`0xD0`が接続時1回のみ、`0x40`の保留ack、secondary接続時の
+  ack到達、タップ非退行）は未実施。
 
 ### 調査のコツ
 
