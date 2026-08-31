@@ -3778,6 +3778,10 @@ static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
     pkt[6] = reason;
     memcpy(&pkt[7], &sample_count, 2);
     {
+        /* Nominal only.  The IMU poll drops to SLEEP_POLL_INTERVAL_MS while
+         * light sleep is active, so real spacing is 25 or 50 ms depending on
+         * when each sample was taken.  Consumers must use each sample's t_ms
+         * rather than assuming a uniform rate. */
         uint16_t period_ms = MOTION_SAMPLE_INTERVAL_MS;
         memcpy(&pkt[9], &period_ms, 2);
     }

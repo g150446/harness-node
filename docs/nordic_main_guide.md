@@ -651,6 +651,11 @@ push / finish / flush がすべて no-op になる。分岐1つ以外のコス�
 このとき ack は**常に OFF を報告する**（`gesture_capture_effective()`）ので、
 ホストが「オンにしたつもり」で空振りすることはない。
 
+`0x36` の `period_ms` は `MOTION_SAMPLE_INTERVAL_MS`（25）を載せるだけの**公称値**で、
+実サンプル間隔とは一致しない。IMUポーリングはライトスリープ中 `SLEEP_POLL_INTERVAL_MS`
+（50 ms）に落ちるため（`imu_poll_ms`）、静止状態では約51 ms間隔になる。
+解析側は各サンプルの `t_ms` を使い、一定レートを仮定してはいけない。
+
 コスト: 静的バッファ 22.5 KB（`gesture_trajectory` / `gesture_host_collection`
 各 10752 B、`gesture_history` 1536 B）。`0.0.91` の実測で RAM 171 KB / 256 KB、
 署名イメージ 253799 B（slot 上限 335872 B）。
