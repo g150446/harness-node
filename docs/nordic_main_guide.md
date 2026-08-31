@@ -16,7 +16,7 @@
 | IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 起動後は待機時消灯。録音ジェスチャー成立後の録音中のみ赤 |
-| 署名バージョン（目安） | `0.0.87+`（TAP_SRC遅延読み出しによるタップ判定修正を含む） |
+| 署名バージョン（目安） | `0.0.88+`（TAP_SRC遅延読み出しによるタップ判定修正、`0xD0`定期配信の停止、`0x40`の全接続配信を含む） |
 | OTA 手順 | [`ota_update_notes.md`](ota_update_notes.md) |
 | Android single_tap | `0x14`を診断ログへ記録（Kindle/G2操作はdouble専用） |
 
@@ -169,11 +169,11 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 | `0x11` | `motion_settled` | x, y, z f32 LE + elapsed_ms u32 + avg/peak_speed/distance f32 LE（計 28 bytes） | モーション静定、詳細メトリクス |
 | `0x12` | `double_tap` | なし | リストバンド表側から基板面へ垂直に行ったダブルタップ |
 | `0x14` | `single_tap` | なし | 同上のシングルタップ（間隔窓を超えた単独衝撃） |
-| `0x40` | `operation_mode` | effective mode u8 + pending mode u8 | Android設定モードの同期状態（0=通常、1=運転、0xff=pendingなし） |
+| `0x40` | `operation_mode` | effective mode u8 + pending mode u8 | Android設定モードの同期状態（0=通常、1=運転、0xff=pendingなし）。要求受理時と適用時の2回、**全接続へ**送る |
 | `0x20` | `sleep_enter` | なし | ライトスリープ移行（10 秒無動作） |
 | `0x21` | `sleep_wake` | なし | ライトスリープ復帰（モーション検出） |
 | `0x30` | `gesture_diag` | stage/reason u8 + value1/2/3 f32 LE | USBなしのジェスチャー内部診断 |
-| `0xD0` | `tap_diag` | read_ret i8 + CTRL1_XL/CTRL6_C/TAP_CFG/TAP_THS_6D/INT_DUR2/WAKE_UP_THS/MD1_CFG/INT1_CTRL u8 + nonzero_count u16 LE + int1_level i8 | タップ関連レジスタのスナップショット（2秒周期） |
+| `0xD0` | `tap_diag` | read_ret i8 + CTRL1_XL/CTRL6_C/TAP_CFG/TAP_THS_6D/INT_DUR2/WAKE_UP_THS/MD1_CFG/INT1_CTRL u8 + nonzero_count u16 LE + int1_level i8 | タップ関連レジスタのスナップショット（接続確立時に1回。任意タイミングの個別読み出しは RX `0x51` → `0xD2`） |
 | `0xD1` | `tap_src_raw` | TAP_SRC u8 + read_ret i8 | 判定に使った生の `TAP_SRC`。タップ1回につき1パケット |
 | `0xD2` | `imu_reg_ack` | reg u8 + 読み戻し値 u8 + ret i8 | RX `0x50` / `0x51` への応答 |
 
@@ -252,6 +252,16 @@ Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` �
 録音中のモード変更は pending として保持し、録音停止後に適用する。
 ライトスリープ中は復帰し、タップが掌上静止開始ジェスチャーとして
 扱われないよう、待機中の開始候補を破棄する（通常モード）。
+
+`0x40` の送信タイミング（`0.0.88+`）:
+
+- **要求を受理した時点**と**実際に適用した時点**の2回送る。受理時のackがないと、
+  録音中に保留された切替をホストが観測できない（`apply_pending_operation_mode()` は
+  録音中に早期returnするため、適用まで何も飛ばなかった）。
+- `notify_all_conns()` で**全接続へ**送る。Mac Handy が primary を握っている間も
+  Android がモードを追えるようにするため（`0.0.87` までは primary 1本にしか飛ばず、
+  secondary の Android には届かなかった）。
+- 接続確立時は primary / secondary のどちらでも現在のモードを1回送る。
 
 #### ハードウェア割り込み構成
 
@@ -335,12 +345,18 @@ Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` �
 
 USBシリアルなしで実機を追えるよう、タップ経路はBLEへ計装済み。
 
-- `0xD0`（2秒周期）: `CTRL1_XL` `CTRL6_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2`
+- `0xD0`（接続確立時に1回、`0.0.88+`）: `CTRL1_XL` `CTRL6_C` `TAP_CFG` `TAP_THS_6D` `INT_DUR2`
   `WAKE_UP_THS` `MD1_CFG` `INT1_CTRL` の実値、`TAP_SRC`読み出しの戻り値、
   非ゼロ検出回数、INT1のレベル。レジスタが期待どおりかを一目で確認できる。
 - `0xD1`: 判定に使った生の `TAP_SRC`。どの軸が立ったか、`TAP_IA` / `DOUBLE` /
   `SINGLE` のどれが立ったかがそのまま読める。
-- RX `0x50` / `0x51`: OTAなしで閾値・軸・Durationを実機で振る。
+- RX `0x50` / `0x51`: OTAなしで閾値・軸・Durationを実機で振る。個別レジスタは
+  `0x51` → `0xD2` で任意のタイミングで読めるので、`0xD0` の定期配信は不要。
+
+`0.0.87` までは `0xD0` を2秒周期で全接続へ流していた（真因特定用の計装）。
+帯域は無視できるが、Android の `BleManager` が高レート系以外を全部hexダンプするため
+logcat が2秒ごとに埋まり、Node も2秒ごとにI2Cを8回叩いていた。`0.0.88` で
+接続時1回に変更。
 
 正常時の期待値: `CTRL1_XL=0x60` `CTRL6_C=0x00` `TAP_CFG=0x83` `TAP_THS_6D=0x08`
 `INT_DUR2=0x4a` `WAKE_UP_THS=0x80` `MD1_CFG=0x48` `INT1_CTRL=0x00`。

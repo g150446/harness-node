@@ -48,6 +48,9 @@
   single 5/5・double 5/5・誤検出0でPASS。slot 0 `active=true` / `confirmed=true` /
   version=`0.0.87` を確認済み。詳細は
   [`nordic_main_guide.md`](nordic_main_guide.md) の「シングル／ダブルタップ」。
+- 2026-08-31: 0.0.88 をビルド（`nordic-main/ota_update.bin`、251064 B）。`0xD0` の
+  2秒周期配信を接続時1回へ、`0x40`（運転モードack）を受理時にも全接続へ送るよう変更。
+  **OTA・実機検証は未実施。**
 
 ### 調査のコツ
 

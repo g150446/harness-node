@@ -166,14 +166,13 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
  * Tap instrumentation.  A silent TAP_SRC read failure or a mis-programmed
  * embedded-function register is indistinguishable from "no tap happened" from
  * the host side, so publish both over BLE.
- *   0xD0 register snapshot, every TAP_DIAG_INTERVAL_MS
+ *   0xD0 register snapshot, once per connection (and on demand via RX 0x51)
  *   0xD1 the raw TAP_SRC each classification was made from (one per strike)
  *   0xD2 reply to the host register poke commands below
  */
 #define EVT_TAP_DIAG                   0xD0
 #define EVT_TAP_SRC_RAW                0xD1
 #define EVT_TAP_REG_ACK                0xD2
-#define TAP_DIAG_INTERVAL_MS           2000
 
 /* Host-driven IMU register poke, so tap tuning does not need an OTA per try.
  * Writes are restricted to the tap/ODR registers listed in tap_reg_writable(). */
@@ -547,7 +546,9 @@ static int64_t tap_last_double_ms;
 static int tap_last_read_ret;
 static int tap_int1_level;
 static uint16_t tap_nonzero_count;
-static int64_t tap_diag_last_ms;
+/* Set from ble_connected(); the main loop owns the I2C reads send_tap_diag()
+ * needs, so the BT callback must not call it directly. */
+static bool tap_diag_once_pending;
 static int64_t tap_read_deadline_ms;
 
 /* Gesture state */
@@ -1060,6 +1061,7 @@ static void send_tap_src_raw(uint8_t tap_src, int ret);
 static void send_tap_reg_ack(uint8_t reg, uint8_t value, int ret);
 static void apply_pending_operation_mode(void);
 static void send_operation_mode_status(void);
+static void notify_all_conns(const void *data, uint16_t len);
 
 /* ============================================================================
  * Motion Detection
@@ -3393,6 +3395,10 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
                 printk(">>> Operation mode request: %s%s\n",
                        data[1] == OPERATION_MODE_DRIVING ? "DRIVING" : "NORMAL",
                        (is_recording || recording_requested) ? " (pending)" : "");
+                /* Ack on accept too. While recording, apply_pending_operation_mode()
+                 * returns early and would otherwise notify nothing, so the host
+                 * could never observe a non-none pending. */
+                send_operation_mode_status();
             } else {
                 printk(">>> Invalid operation mode: %u\n", data[1]);
                 send_operation_mode_status();
@@ -3442,15 +3448,16 @@ BT_GATT_SERVICE_DEFINE(audio_svc,
         BT_GATT_CHRC_WRITE, BT_GATT_PERM_WRITE, NULL, audio_rx_write, NULL),
 );
 
+/* Operation mode ack: [0x00][0x55][0x40][effective][pending].
+ * pending == OPERATION_MODE_PENDING_NONE means nothing is deferred.  Sent to
+ * every connection, not just the primary: Android yields primary to Mac Handy
+ * under ConnectionPriority.MAC_HANDY and still needs to track the mode. */
 static void send_operation_mode_status(void)
 {
-    struct bt_conn *conn = get_primary_conn();
     uint8_t pkt[5] = {0x00, 0x55, EVT_OPERATION_MODE,
                       operation_mode, operation_mode_pending};
 
-    if (conn) {
-        (void)bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, sizeof(pkt));
-    }
+    notify_all_conns(pkt, sizeof(pkt));
 }
 
 /* Notify every active BLE client. Tap/diagnostic events must reach Android even
@@ -4337,12 +4344,20 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
     if (primary_idx < 0) {
         primary_idx = slot;
         printk(">>> conn[%d] is primary\n", slot);
-        send_operation_mode_status();
     } else {
         printk(">>> conn[%d] is secondary, notifying primary\n", slot);
         uint8_t pkt[3] = { 0x00, 0x55, 0x31 };
         bt_gatt_notify(get_primary_conn(), &audio_svc.attrs[2], pkt, sizeof(pkt));
     }
+
+    /* Both roles need the current mode; a secondary Android otherwise starts
+     * with no idea what the node is running. */
+    send_operation_mode_status();
+
+    /* One tap-register snapshot per connection, so a mis-programmed embedded
+     * function is still visible without the old 2 s stream. The main loop does
+     * the I2C reads — see tap_diag_once_pending. */
+    tap_diag_once_pending = true;
 
     led_sync_runtime_state();
 
@@ -4543,8 +4558,8 @@ int main(void)
         }
         process_tap_event(now_ms);
 
-        if ((now_ms - tap_diag_last_ms) >= TAP_DIAG_INTERVAL_MS) {
-            tap_diag_last_ms = now_ms;
+        if (tap_diag_once_pending) {
+            tap_diag_once_pending = false;
             send_tap_diag();
         }
 
