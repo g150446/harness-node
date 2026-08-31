@@ -52,6 +52,10 @@ harness-node/
 │   ├── build_and_flash.sh     # Build + USB flash + OTA payload helper
 │   ├── build_and_package_ota.sh # Build + OTA payload helper (no USB flash)
 │   └── flash.sh               # Compatibility wrapper to build_and_flash.sh
+├── pdm_power_test/            # nRF54L15: IMU継続中のPDMマイク省電力実測
+│   ├── README.md              # 目的、状態シーケンス、判定基準
+│   ├── MEASURE.md             # 測定器別の接続・記録手順
+│   └── build_and_flash.sh     # NCS v2.9.2 build + CMSIS-DAP flash
 ├── boards/seeed/xiao_nrf54l15/ # Custom XIAO nRF54L15 board definition
 ├── mac_client/                # Mac Python client (shared)
 │   ├── nrf52_voice_client.py  # HarnessNode BLE クライアント（自動録音、ジェスチャーイベント表示）
@@ -223,8 +227,8 @@ cd nrf54l15
 XIAO nRF54L15 は CMSIS-DAP インターフェースのため、pyocd でフラッシュします。
 
 ```bash
-# 前提: NCS v2.9.2, pyocd がインストール済み
-pip install pyocd  # 未インストールの場合
+# 前提: NCS v2.9.2, nRF54L対応のpyOCD 0.37.0以降
+python3 -m pip install 'pyocd>=0.37'  # 未インストールの場合
 
 # ビルド
 export PATH="/opt/nordic/ncs/toolchains/b8efef2ad5/bin:$PATH"
@@ -268,6 +272,12 @@ The working nRF54L15 path now uses a custom XIAO board definition imported from 
 The Seeed XIAO nRF54L15 Sense board shares a single fixed regulator (`pdm_imu_pwr`, GPIO0.1) between the onboard PDM microphone and the LSM6DS3TR-C IMU. Because of this design, **the microphone cannot be powered on or off independently**—whenever the IMU is needed for gesture detection, the microphone is also powered.
 
 This is why the `nrf54-handy/` firmware keeps `pdm_imu_pwr` ON for the entire BLE session (enabling both IMU gesture detection and PDM recording) and turns it OFF only when BLE is disconnected. By contrast, the `nordic-main/` firmware for nRF52840 Sense can toggle microphone power individually via the dedicated `msm261d3526hicpm-c-en` regulator (P1.10), achieving better battery life for gesture-triggered recording use cases.
+
+The standalone [`pdm_power_test/`](pdm_power_test/README.md) app measures whether
+stopping PDM returns current to the IMU-only baseline while keeping the
+accelerometer active at 416 Hz. It compares ordinary STOP, disconnected sleep
+pinctrl, forced-low PDM clock, and device suspend. This is an effective-sleep
+test; it does not claim that microphone VDD can be switched independently.
 
 For details, see `docs/nrf54_power_management.md`.
 
