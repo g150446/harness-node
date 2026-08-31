@@ -155,7 +155,7 @@ MATCH → recording (gyro stays ON) → stop hand-lower → gyro OFF
 | `reset` reason `palm_down_gate_failed` | 4500 ms時点で掌下の重力＋gyro連動条件が未成立。録音停止動作を開始時間へ含めず別分類する |
 | `wait_reject` / `reset` reason `match_*` | 500 ms静止後の最終発火ゲート不足。実測インパルス・phiと閾値を通知する |
 
-### 履歴バッチ（`GESTURE_DEBUG_HISTORY=1` のときのみ）
+### 履歴バッチ（IMU収集スイッチがONのときのみ）
 
 録音終了またはシーケンス失敗後にまとめて送信（録音中は送らない）:
 
@@ -309,7 +309,7 @@ Mac 試行で dwell 後に挙上せず `final_accel_missing`（5 s）、Android 
 
 ### 6軸グラフの読み方
 
-履歴有効ファーム（`GESTURE_DEBUG_HISTORY=1`）では、試行終了時に同じサンプル列からCSVとPNGを
+IMU収集をONにすると（RX `0x06`、FW `0.0.91+`）、試行終了時に同じサンプル列からCSVとPNGを
 生成する。上段は加速度XYZ、下段はgyro XYZで、横軸はGOからの経過時間である。
 
 - 灰色のgyro未取得区間は、掌上0.5秒静止が成立する前の正常な期間。

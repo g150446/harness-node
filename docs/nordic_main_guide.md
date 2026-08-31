@@ -629,18 +629,31 @@ python3 gesture_classifier.py
 
 ---
 
-## ジェスチャ履歴デバッグビルド
+## ジェスチャ履歴と IMU 軌跡の収集
 
-本番は `GESTURE_DEBUG_HISTORY=0`（既定）。判定履歴と6軸履歴バッチを有効にするには:
+`0.0.91` から `GESTURE_DEBUG_HISTORY` は**既定 1**（本番ビルドに含む）で、
+実際の収集は**実行時スイッチ**で切り替える。以前のように収集のたびに
+デバッグビルドを OTA する必要はない。
 
-```bash
-# sysbuild の west configure 引数に C フラグを足す
-west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
-  /path/to/harness-node/nordic-main --build-dir /tmp/harness-node-debug \
-  -- -DEXTRA_CFLAGS=-DGESTURE_DEBUG_HISTORY=1
-```
+| | |
+|---|---|
+| RX | `CMD_SET_GESTURE_CAPTURE`（`0x06`）＋ `0x00`/`0x01` |
+| TX ack | `EVT_GESTURE_CAPTURE`（`0x39`）、`notify_all_conns()` で全接続へ |
+| 既定 | **OFF**。RAM のみに保持し、リセットで OFF に戻る |
 
-または `nordic-main/src/main.c` の `#ifndef GESTURE_DEBUG_HISTORY` 既定を一時的に `1` にする。
+**RAM にしか持たないので、接続時 greeting でも現在値を送る。**
+アプリ側も接続のたびに再送する。UI にはアプリの意図ではなく Node の報告値を出すこと。
+
+収集 OFF のときは `gesture_trajectory_clear()` が `active` を立てないため、
+push / finish / flush がすべて no-op になる。分岐1つ以外のコストは掛からない。
+
+痩せたビルドが要るときは `-DEXTRA_CFLAGS=-DGESTURE_DEBUG_HISTORY=0`。
+このとき ack は**常に OFF を報告する**（`gesture_capture_effective()`）ので、
+ホストが「オンにしたつもり」で空振りすることはない。
+
+コスト: 静的バッファ 22.5 KB（`gesture_trajectory` / `gesture_host_collection`
+各 10752 B、`gesture_history` 1536 B）。`0.0.91` の実測で RAM 171 KB / 256 KB、
+署名イメージ 253799 B（slot 上限 335872 B）。
 
 履歴有効時は従来の判定履歴 `0x33–0x35` に加え、40 Hzの加速度XYZ・ジャイロXYZを
 `0x36 trajectory_begin`、`0x37 trajectory_chunk`、`0x38 trajectory_end` でバッチ送信する。

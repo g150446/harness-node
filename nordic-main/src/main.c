@@ -290,9 +290,13 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_RETRIGGER_BLOCK_MS               3000
 #define GESTURE_GRAVITY_LP_TAU_S                 0.30f
 #define GESTURE_QUIET_ACCEL_MS2                  3.0f
-/* Compile-time gesture history dump (0=off production, 1=debug OTA). */
+/* Compiles in the gesture history and 6-axis trajectory dump.  On since
+ * 0.0.91: the dump is now switched at runtime by CMD_SET_GESTURE_CAPTURE
+ * (off at boot), so carrying it costs ~21 KB of RAM and nothing on the air
+ * until the host asks.  Set to 0 for a lean build; the capture ack then
+ * always reports off. */
 #ifndef GESTURE_DEBUG_HISTORY
-#define GESTURE_DEBUG_HISTORY                     0
+#define GESTURE_DEBUG_HISTORY                     1
 #endif
 #define GESTURE_HISTORY_CAP                         96
 #define GESTURE_HISTORY_FLUSH_GAP_MS                 5
@@ -332,10 +336,12 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
  * existing gesture behaviour; DRIVING disables gesture start/stop and makes
  * the IMU double-tap a local recording toggle. */
 #define CMD_SET_OPERATION_MODE                  0x05
+#define CMD_SET_GESTURE_CAPTURE                 0x06
 #define OPERATION_MODE_NORMAL                   0x00
 #define OPERATION_MODE_DRIVING                 0x01
 #define OPERATION_MODE_PENDING_NONE             0xff
 #define EVT_OPERATION_MODE                     0x40
+#define EVT_GESTURE_CAPTURE                    0x39
 
 /* History batch events (only when GESTURE_DEBUG_HISTORY=1). */
 #define EVT_GESTURE_HISTORY_BEGIN             0x33
@@ -660,6 +666,13 @@ static float gesture_gyro_roll_deg;
 static float gesture_gyro_peak_abs_dps;
 static float gesture_gyro_x_peak_abs_dps;
 static float gesture_outbound_gyro_sign;
+
+/* Runtime switch for the IMU trajectory dump (0x36/0x37/0x38) and the
+ * milestone batch (0x33/0x34/0x35). Off at boot: one gesture attempt costs
+ * about 10 KB of notifications, so it is only worth paying while collecting
+ * training data. The phone re-sends it on every connect, like the operation
+ * mode, because this lives in RAM and a reset clears it. */
+static bool gesture_capture_enabled;
 
 #if GESTURE_DEBUG_HISTORY
 typedef struct {
@@ -1071,6 +1084,8 @@ static void send_tap_src_raw(uint8_t tap_src, int ret);
 static void send_tap_reg_ack(uint8_t reg, uint8_t value, int ret);
 static void apply_pending_operation_mode(void);
 static void send_operation_mode_status(void);
+static bool gesture_capture_effective(void);
+static void send_gesture_capture_status(void);
 static void notify_all_conns(const void *data, uint16_t len);
 
 /* ============================================================================
@@ -1467,6 +1482,9 @@ static void gesture_history_push(uint8_t stage, uint8_t reason,
 {
     gesture_history_entry_t *e;
 
+    if (!gesture_capture_enabled) {
+        return;
+    }
     if (gesture_history_count == 0) {
         gesture_history_t0_ms = k_uptime_get();
     }
@@ -1500,7 +1518,9 @@ static void gesture_trajectory_clear(void)
     gesture_trajectory_t0_ms = k_uptime_get();
     gesture_trajectory_result = 0;
     gesture_trajectory_reason = GESTURE_DIAG_REASON_NONE;
-    gesture_trajectory_active = true;
+    /* Staying inactive makes every push, finish and flush a no-op, so the
+     * capture switch costs nothing but this branch while it is off. */
+    gesture_trajectory_active = gesture_capture_enabled;
     gesture_trajectory_committed = false;
     gesture_trajectory_overflow = false;
     gesture_trajectory_flush_pending = false;
@@ -3413,6 +3433,19 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
                 printk(">>> Invalid operation mode: %u\n", data[1]);
                 send_operation_mode_status();
             }
+        } else if (data[0] == CMD_SET_GESTURE_CAPTURE && len >= 2) {
+#if GESTURE_DEBUG_HISTORY
+            gesture_capture_enabled = (data[1] != 0);
+            if (!gesture_capture_enabled) {
+                /* Drop a sequence already being recorded rather than flushing
+                 * a half window the host did not ask for. */
+                gesture_trajectory_discard();
+                gesture_history_clear();
+            }
+#endif
+            printk(">>> Gesture capture: %s\n",
+                   gesture_capture_effective() ? "ON" : "OFF");
+            send_gesture_capture_status();
         } else if (data[0] == CMD_IMU_REG_WRITE && len >= 3) {
             uint8_t reg = data[1];
             uint8_t val = data[2];
@@ -3466,6 +3499,27 @@ static void send_operation_mode_status(void)
 {
     uint8_t pkt[5] = {0x00, 0x55, EVT_OPERATION_MODE,
                       operation_mode, operation_mode_pending};
+
+    notify_all_conns(pkt, sizeof(pkt));
+}
+
+/* True only when capture is both compiled in and switched on, so the ack never
+ * claims a lean build is collecting. */
+static bool gesture_capture_effective(void)
+{
+#if GESTURE_DEBUG_HISTORY
+    return gesture_capture_enabled;
+#else
+    return false;
+#endif
+}
+
+/* Capture switch ack: [0x00][0x55][0x39][enabled].  All connections, for the
+ * same reason as the operation mode ack. */
+static void send_gesture_capture_status(void)
+{
+    uint8_t pkt[4] = {0x00, 0x55, EVT_GESTURE_CAPTURE,
+                      gesture_capture_effective() ? 1 : 0};
 
     notify_all_conns(pkt, sizeof(pkt));
 }
@@ -3567,7 +3621,14 @@ static void send_pending_greetings(void)
         uint8_t pkt[5] = {0x00, 0x55, EVT_OPERATION_MODE,
                           operation_mode, operation_mode_pending};
         bt_gatt_notify(connections[i], &audio_svc.attrs[2], pkt, sizeof(pkt));
-        printk(">>> Greeted conn[%d]: mode=%u\n", i, operation_mode);
+
+        /* Capture lives in RAM and a reset clears it, so state the truth here
+         * rather than leaving the host to assume its last request survived. */
+        uint8_t cap[4] = {0x00, 0x55, EVT_GESTURE_CAPTURE,
+                          gesture_capture_effective() ? 1 : 0};
+        bt_gatt_notify(connections[i], &audio_svc.attrs[2], cap, sizeof(cap));
+        printk(">>> Greeted conn[%d]: mode=%u capture=%u\n", i, operation_mode,
+               cap[3]);
 
         /* send_tap_diag() notifies every client; an extra copy for an already
          * connected peer is harmless and keeps the I2C reads in one place. */
