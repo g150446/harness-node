@@ -656,6 +656,15 @@ push / finish / flush がすべて no-op になる。分岐1つ以外のコス�
 （50 ms）に落ちるため（`imu_poll_ms`）、静止状態では約51 ms間隔になる。
 解析側は各サンプルの `t_ms` を使い、一定レートを仮定してはいけない。
 
+**軌跡 flush は2スレッドから呼ばれる。** `process_motion_sample()`（main スレッド）と
+録音停止処理（`audio_thread()`）の両方が `flush_gesture_trajectory()` に到達する。
+`flush_trajectory_batch()` はチャンク間で `k_msleep()` するため、`0.0.91` では
+同一ウィンドウが2セッションとして交互に送信された。`0.0.92` で `atomic_cas` の
+実行中ガードを入れた。ここに新しい呼び出し元を足すときは同じ罠に注意すること。
+
+**録音成功時の flush は `send_event_packet(0x02)` の後**（`main.c` の停止処理）。
+ホストは停止イベントを受けた時点ではまだ軌跡を持っていない。約250ms後に届く。
+
 コスト: 静的バッファ 22.5 KB（`gesture_trajectory` / `gesture_host_collection`
 各 10752 B、`gesture_history` 1536 B）。`0.0.91` の実測で RAM 171 KB / 256 KB、
 署名イメージ 253799 B（slot 上限 335872 B）。

@@ -3748,6 +3748,14 @@ static void flush_gesture_history(void)
 #endif
 
 #if GESTURE_DEBUG_HISTORY
+/* Held for the whole of flush_trajectory_batch(), which sleeps between chunks.
+ *
+ * Two threads reach a flush: audio_thread() on recording stop and the main
+ * thread from process_motion_sample().  Both parked in the 5 ms gap, they sent
+ * one 377-sample window as two interleaved sessions on 0.0.91.  Atomic because
+ * the test and the set must not straddle a preemption. */
+static atomic_t trajectory_flush_busy;
+
 static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
                                    uint16_t sample_count, uint8_t result,
                                    uint8_t reason, bool overflow,
@@ -3763,8 +3771,13 @@ static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
     if (sample_count == 0) {
         return true;
     }
+    if (!atomic_cas(&trajectory_flush_busy, 0, 1)) {
+        printk(">>> %s skipped: a batch is already in flight\n", label);
+        return false;
+    }
     if (!conn) {
         printk(">>> %s discarded: no primary connection\n", label);
+        atomic_set(&trajectory_flush_busy, 0);
         return false;
     }
 
@@ -3832,6 +3845,7 @@ static bool flush_trajectory_batch(const gesture_trajectory_sample_t *samples,
     pkt[6] = (overflow ? BIT(0) : 0) |
              (notify_error ? BIT(1) : 0);
     (void)bt_gatt_notify(conn, &audio_svc.attrs[2], pkt, 7);
+    atomic_set(&trajectory_flush_busy, 0);
     printk(">>> %s flushed session=%u count=%u sent=%u flags=0x%02x\n",
            label, session, sample_count, sent, pkt[6]);
     return true;
@@ -3842,6 +3856,8 @@ static void flush_gesture_trajectory(void)
     if (!gesture_trajectory_flush_pending || gesture_trajectory_count == 0) {
         return;
     }
+    /* Discard even when the batch was skipped as busy: being busy means this
+     * same window is already on the air, so retrying would only duplicate it. */
     (void)flush_trajectory_batch(gesture_trajectory, gesture_trajectory_count,
                                  gesture_trajectory_result,
                                  gesture_trajectory_reason,
