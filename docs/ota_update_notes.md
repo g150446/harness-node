@@ -63,6 +63,8 @@
   slot 0 `active=true` / `confirmed=true` / version=`0.0.90` /
   hash=`dc8741b31f8dfb0c` を確認。実機検証: 購読直後に `0x40`（`00554000ff`）と
   `0xD0`（レジスタ値は期待値と完全一致）が1件ずつ届き、以降 `0xD0` の再送なし。
+  タップ非退行 single 5/5・double 5/5・誤分類0（10/10 PASS）、録音中のモード切替も
+  保留→停止20ms後に適用を確認。
 
   **OTA中は他のBLEクライアントを必ず切ること。** Androidアプリは `ServiceWatchdog` で
   force-stop から自動復活してNodeへ再接続し、`0.0.90` の初回OTAは 0.2 KB/s まで落ちた
