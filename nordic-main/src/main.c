@@ -333,8 +333,8 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_DEBUG_FINAL_PERIOD_MS           100
 
 /* Operation mode controlled by the Android companion.  NORMAL preserves the
- * existing gesture behaviour; DRIVING disables gesture start/stop and makes
- * the IMU double-tap a local recording toggle. */
+ * existing gesture behaviour; DRIVING disables gesture start/stop.  Single
+ * tap toggles recording in both modes; double tap is notify-only. */
 #define CMD_SET_OPERATION_MODE                  0x05
 #define CMD_SET_GESTURE_CAPTURE                 0x06
 #define OPERATION_MODE_NORMAL                   0x00
@@ -2211,32 +2211,37 @@ static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
         tap_last_double_ms = now;
     }
 
-    if (is_double && operation_mode == OPERATION_MODE_DRIVING) {
-        /* Driving mode uses hardware double-tap as a local recording toggle.
-         * Require a primary BLE peer because an unconnected recording cannot
-         * be delivered to the Android voice client. */
+    /* Single tap toggles recording in every operation mode.  Double tap is
+     * notify-only (Kindle / G2 / host control).  Require a primary BLE peer so
+     * an unconnected recording cannot start with nowhere to deliver PCM. */
+    if (!is_double) {
         if (!get_primary_conn()) {
-            printk(">>> Double tap ignored in driving mode: no primary connection\n");
+            printk(">>> Single tap ignored: no primary connection\n");
             return;
         }
         if (is_recording) {
             stop_requested = true;
-            printk(">>> Driving double tap: recording stop\n");
+            printk(">>> Single tap: recording stop\n");
         } else if (recording_requested) {
             recording_requested = false;
-            printk(">>> Driving double tap: pending start cancelled\n");
+            printk(">>> Single tap: pending start cancelled\n");
         } else {
             stop_requested = false;
             recording_requested = true;
-            printk(">>> Driving double tap: recording start\n");
+            printk(">>> Single tap: recording start\n");
         }
         last_activity_ms = now;
-        send_event_packet(EVT_DOUBLE_TAP);
+        if (light_sleep_active) {
+            light_sleep_active = false;
+            send_event_packet(0x21);
+            printk(">>> Light sleep wake (single tap)\n");
+        }
+        send_event_packet(EVT_SINGLE_TAP);
         return;
     }
 
-    /* BLE-only taps must not become the dwell that starts recording.
-     * Driving-mode single tap is notify-only (no recording toggle). */
+    /* Double tap: discard any in-progress start-gesture dwell so a tap does
+     * not become palm-up still.  No recording toggle. */
     if (operation_mode != OPERATION_MODE_DRIVING &&
         !is_recording && !recording_requested) {
 #if GESTURE_DEBUG_HISTORY
@@ -2254,17 +2259,11 @@ static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
     if (light_sleep_active) {
         light_sleep_active = false;
         send_event_packet(0x21);
-        printk(">>> Light sleep wake (%s tap)\n",
-               is_double ? "double" : "single");
+        printk(">>> Light sleep wake (double tap)\n");
     }
     last_activity_ms = now;
-    if (is_double) {
-        printk(">>> Double tap detected (TAP_SRC=0x%02x)\n", tap_src);
-        send_event_packet(EVT_DOUBLE_TAP);
-    } else {
-        printk(">>> Single tap detected (TAP_SRC=0x%02x)\n", tap_src);
-        send_event_packet(EVT_SINGLE_TAP);
-    }
+    printk(">>> Double tap detected (TAP_SRC=0x%02x)\n", tap_src);
+    send_event_packet(EVT_DOUBLE_TAP);
 }
 
 static void process_tap_event(int64_t now)
