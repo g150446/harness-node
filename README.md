@@ -10,11 +10,16 @@ Supports:
 - **XIAO ESP32S3 Sense** (ESP-IDF)
 - **XIAO nRF52840 Sense** (Zephyr/NCS) — `nordic-main`（現行: ジェスチャー録音 + OTA + Battery Service）
 - **XIAO nRF54L15 Sense** (Zephyr/NCS) - Latest!
+- **M5StickC Plus2** (ESP-IDF) — `stickc_plus2/` BLE name `HarnessNode-Plus2`（BtnA single で録音トグル）
+- **M5 Atom Echo S3R** (ESP-IDF, reserved) — `atom_echo_s3r/`
 
 ## Project Structure
 
 ```
 harness-node/
+├── stickc_plus2/              # ESP-IDF: M5StickC Plus2 (HarnessNode-Plus2)
+├── atom_echo_s3r/             # ESP-IDF: Atom Echo S3R (reserved)
+├── docs/stickc_plus2_guide.md # Plus2 build/flash notes
 ├── esp32s3/                   # ESP-IDF firmware (ESP32S3)
 │   ├── main.c                 # Main application
 │   ├── adpcm.c/h              # IMA ADPCM codec
@@ -83,6 +88,25 @@ harness-node/
 ### For XIAO ESP32S3 Sense
 
 See `esp32s3/` or the ESP-IDF section below.
+
+### For M5StickC Plus2 — HarnessNode-Plus2 (`stickc_plus2`)
+
+```bash
+source ~/esp/esp-idf/export.sh
+cd harness-node
+idf.py -DHN_BOARD=stickc_plus2 set-target esp32
+idf.py -DHN_BOARD=stickc_plus2 build
+idf.py -DHN_BOARD=stickc_plus2 -p /dev/cu.usbserial-XXXX flash monitor
+```
+
+- BLE name: `HarnessNode-Plus2`（Handy 互換 UUID）
+- BtnA single = 録音トグル、double = `0x12` のみ
+- BLE OTA: `./stickc_plus2/build_and_package_ota.sh` のあと  
+  `python3 mac_client/ota_updater.py --device HarnessNode-Plus2 stickc_plus2/ota_update.bin`
+- 詳細: [`docs/stickc_plus2_guide.md`](docs/stickc_plus2_guide.md)
+
+Atom Echo S3R（保留）: `HN_BOARD=atom_echo_s3r` + `esp32s3`。  
+[`docs/atom_echo_s3r_guide.md`](docs/atom_echo_s3r_guide.md)
 
 ### For XIAO nRF52840 Sense — HarnessNode (`nordic-main`)
 
@@ -458,17 +482,22 @@ python3 serial_monitor.py --list
 python3 serial_monitor.py --reset
 ```
 
-On the Atom Echo S3R firmware, the USB serial console at `115200` baud also accepts
-simple control commands:
+### M5 StickC Plus2 / Atom Echo S3R serial (115200)
 
-- `r` / `R`: request recording start
-- `s` / `S`: request recording stop
-- `c` / `C` / `1`: emulate a **single-click**
-- `d` / `D` / `2`: emulate a **double-click**
-- `h` / `H`: print command help
+Same Handy-compatible click semantics on both M5 firmwares:
 
-This is useful for reproducing Handy-side BLE button handling without physically
-pressing the device button.
+- `r` / `s`: recording start / stop
+- `c` / `1`: single-click (`0x14`; toggles recording while connected)
+- `d` / `2`: double-click (`0x12`; notify only)
+- `h`: help
+
+| BLE name | Board |
+|----------|--------|
+| `HarnessNode-Plus2` | M5StickC Plus2 (`stickc_plus2/`) |
+| `HarnessNode-Echo` | Atom Echo S3R (`atom_echo_s3r/`, reserved) |
+
+Mode via RX `[0x05, mode]` (`0`=normal, `1`=driving); TX  
+`[0x00, 0x55, 0x40, effective, pending]` (`pending=0xff` = none).
 
 ## Technical Specifications
 

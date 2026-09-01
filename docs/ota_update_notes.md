@@ -2,6 +2,19 @@
 
 この手順は、XIAO nRF52840 Sense の MCUboot + MCUmgr/SMP over BLE OTA を実行するエージェント向けの必須注意事項です。
 
+## M5StickC Plus2 (`HarnessNode-Plus2`)
+
+ESP-IDF dual-OTA + **同じ SMP BLE UUID / `ota_updater.py`** で更新できる。
+
+1. `stickc_plus2/VERSION` を上げる。
+2. `./stickc_plus2/build_and_package_ota.sh` → `stickc_plus2/ota_update.bin`
+3. パーティションを初めて dual-OTA にした直後は **USB `idf.py flash` 一回**が必要。
+4. Terminal で:
+   `python3 mac_client/ota_updater.py --device HarnessNode-Plus2 stickc_plus2/ota_update.bin`
+5. 完了条件は nRF と同じ: slot 0 `active` + `confirmed`、version 一致。
+
+イメージ形式は ESP app bin（MCUboot signed ではない）だが、SMP の upload/state/reset はホスト互換。
+
 ## 事前確認
 
 1. 対象は `HarnessNode` であることを確認する。別のBLEデバイスへ書き込まない。
