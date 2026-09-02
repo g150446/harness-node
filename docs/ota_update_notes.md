@@ -50,6 +50,14 @@ ESP-IDF dual-OTA + **同じ SMP BLE UUID / `ota_updater.py`** で更新できる
 
 ## 更新履歴
 
+- 2026-09-02: StickC Plus2 `0.1.3` をビルド・OTA（635728 B）。slot 0 `active=true` /
+  `confirmed=true` / version=`0.1.3` / hash=`1c675e46d9df677b9a…` を確認済み。
+  その後の実機スイープで **PDM の音は LEFT スロット**（IDF クロック使用時）と判明し、
+  `MIC_PDM_DEFAULT` を `I2S_PDM_SLOT_LEFT` + gain ×4 に変更して USB フラッシュした。
+  この LEFT 版は `VERSION` を上げないまま焼いたため、**実機は 0.1.4 相当のコードを
+  `0.1.3` というラベルで載せている**。リポジトリ側は `0.1.4`。次回の OTA は
+  `0.1.4` 以降で行うこと（同じ 0.1.3 に別バイナリが 2 つ存在する状態を解消する）。
+  詳細は [`stickc_plus2_guide.md`](stickc_plus2_guide.md) の「マイク処理」。
 - 2026-08-30: 0.0.77（single候補遅延確定によるdouble回帰修正）をビルド・OTA。
   slot 0で`active=true`、`confirmed=true`、version=`0.0.77`を確認済み。
 - 2026-08-31: 0.0.81（single/doubleのクールダウン分離）をビルド・OTA。confirmed確認済み。
