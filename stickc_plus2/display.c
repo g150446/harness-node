@@ -133,6 +133,7 @@ static const uint8_t bmp_recording[] = {
 static esp_lcd_panel_handle_t s_panel;
 static bool s_ready;
 static display_status_t s_status = DISPLAY_STATUS_NOT_CONNECTED;
+static bool s_parked;
 
 static void bl_set(bool on)
 {
@@ -320,6 +321,17 @@ static void park_pad_low(int gpio_num)
     rtc_gpio_pulldown_en((gpio_num_t)gpio_num);
 }
 
+static void unpark_pad(int gpio_num)
+{
+    if (!rtc_gpio_is_valid_gpio((gpio_num_t)gpio_num)) {
+        return;
+    }
+    /* Drop the RTC pulls before handing the pad back to the GPIO matrix. */
+    rtc_gpio_pulldown_dis((gpio_num_t)gpio_num);
+    rtc_gpio_pullup_dis((gpio_num_t)gpio_num);
+    rtc_gpio_deinit((gpio_num_t)gpio_num);
+}
+
 void display_prepare_deep_sleep(void)
 {
     display_sleep();
@@ -332,4 +344,33 @@ void display_prepare_deep_sleep(void)
      */
     park_pad_low(PIN_LCD_BL);
     park_pad_low(PIN_LCD_RST);
+    s_parked = true;
+}
+
+esp_err_t display_resume(void)
+{
+    if (!s_ready) {
+        return display_init();
+    }
+
+    if (s_parked) {
+        /*
+         * park_pad_low() moved both pads onto the RTC mux, so the digital
+         * writes behind bl_set() stop reaching the pin. Hand them back before
+         * touching the panel again, or the backlight can never come on.
+         */
+        unpark_pad(PIN_LCD_RST);
+        unpark_pad(PIN_LCD_BL);
+        s_parked = false;
+    }
+
+    /* The digital OUT/OE latches survived, so this is enough to drive it. */
+    bl_set(false);
+
+    esp_err_t ret = ESP_OK;
+    if (s_panel != NULL) {
+        ret = esp_lcd_panel_disp_on_off(s_panel, true);
+    }
+    /* Caller redraws (and turns the backlight back on) via display_set_status(). */
+    return ret;
 }

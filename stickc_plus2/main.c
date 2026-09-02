@@ -353,9 +353,10 @@ static void enter_deep_sleep(const char *source)
         /* Sleeping now would be unwakeable; stay up instead. */
         ESP_LOGE(TAG, "ext0 wake enable failed (%s); staying awake",
                  esp_err_to_name(wr));
-        rtc_gpio_hold_dis((gpio_num_t)POWER_HOLD_GPIO);
+        /* Same handover order as the wake path: drive first, release last. */
         power_hold_on();
-        (void)display_init();
+        rtc_gpio_hold_dis((gpio_num_t)POWER_HOLD_GPIO);
+        (void)display_resume();
         refresh_status_display();
         ble_app_advertise();
         return;

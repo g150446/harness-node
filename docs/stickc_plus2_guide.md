@@ -155,6 +155,14 @@ USB 接続中は 5 V 側から給電され続けるため、G4 が LOW に落ち
 - `button_task` は開始時に押されているボタンを無視する（`press_active = false` で開始）。
   `press_start_tick = 0` のまま開始すると `now - 0 >= 1000 ms` が即成立して寝直す。
 
+#### 落とし穴: 入眠を中止したら LCD のパッドを戻す
+
+`display_prepare_deep_sleep()` は G27 / G12 を **RTC mux に移す**ので、以降
+`gpio_set_level()` 系の digital 書き込みはパッドに届かない。`ext0` の設定失敗などで
+入眠を取りやめる場合は `display_resume()` で `rtc_gpio_deinit()` して digital に
+戻すこと。ここで `display_init()` を呼んでも `s_ready` により即 return するだけで、
+**バックライトが二度と点かない**（ファームは動いているのに画面だけ真っ黒になる）。
+
 #### 落とし穴: G12（LCD RST）は MTDI ストラップ
 
 deep sleep 中は Hi-Z になる。起床リセット時に HIGH で読まれると VDD_SDIO が 1.8 V に

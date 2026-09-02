@@ -14,3 +14,7 @@ void display_sleep(void);
 
 /* Blank the panel and park its pads so nothing floats through deep sleep. */
 void display_prepare_deep_sleep(void);
+
+/* Undo display_prepare_deep_sleep() when a planned sleep was abandoned.
+ * The caller must follow with display_set_status() to redraw and relight. */
+esp_err_t display_resume(void);
