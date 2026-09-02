@@ -175,17 +175,6 @@ USB 接続中は 5 V 側から給電され続けるため、G4 が LOW に落ち
 `recording`=`0xF800` は青に見えていた。BGR に変えたところ赤は正しくなったが
 緑と青の対応が入れ替わり、推測では追えないことが判明した。）
 
-#### 落とし穴: NimBLE の notify ログが音声を殺す
-
-NimBLE は既定で `GATT procedure initiated: notify` を **INFO** で出す。
-音声通知ごとに出るので短い録音 1 回で **約 600 行・55 kB**。`esp_log` は
-コンソール UART へ同期書き込みするため、115200 baud では **4.8 秒ぶん**の
-送信待ちが BLE ホストタスクに乗り、音声ストリームが枯れて STT が失敗する。
-
-`app_main` で `esp_log_level_set("NimBLE", ESP_LOG_WARN)` を入れて抑止している。
-警告・エラーは残る。切断テストのログで `procedure initiated: notify` が
-0 件であることを確認できる。
-
 #### 落とし穴: LCD は 1 タスクからしか触らない
 
 `display_set_status()` は **button_task / audio_stream_task / uart_task /
@@ -242,6 +231,81 @@ BL の G27 も同様に pulldown（浮かせるとバックライトが薄く光
 | HOLD=0 完全オフ | ほぼ 0 | 今回の UX では不採用 |
 
 実測は電池経路に直列電流計（0.1 mA 分解能以上）を入れ、USB 非接続で (1) 起動中アイドル (2) deep sleep を比較すること。USB 給電中の値は電池駆動と一致しない。
+
+### 音声帯域（Handy へのストリーミング）
+
+16 kHz mono の生 PCM を `[seq][0xAA][i16 LE…]` で送る。必要帯域は
+**32000 B/s**、パケットは 200 B なので **160 pkt/s** 必要。
+実際は 256 サンプル読むごとに 100/100/56 に割るため 187 pkt/s 出る。
+
+**ADPCM は使っていない。** `adpcm.c` は Plus2 にも `nordic-main` にも入っているが
+どちらも未使用で、Handy は生 PCM を期待している。圧縮すれば帯域は 1/4 になるが
+**Handy 側の対応が必要**なので勝手に変えないこと。
+
+#### 落とし穴: 接続パラメータを要求しないと音声が 3 割落ちる
+
+セントラルの既定接続間隔（多くは 30 ms）だと **131 pkt/s / 26.3 kB/s** しか出ず、
+必要な 160 pkt/s に届かない。溢れた分は `ble_hs_mbuf_from_flat()` が NULL を返して
+**送信前に捨てられる**（ログに `os_memblock_get failed`）。BLE の通知自体は
+一度も失敗しないので `notify failed` は 0 のまま、音声だけが虫食いになり
+STT が通らない。
+
+`nordic-main` は同じ理由で 7.5–15 ms を要求している
+（`nordic-main/src/main.c` の `conn_param_work_handler`）。Plus2 も接続 500 ms 後に
+`ble_gap_update_params()` で同じ値を要求する。**GAP コールバック内で呼ばない** —
+リンクが落ち着く前の要求はセントラルに無視されやすい。
+
+実測（10 秒録音、シリアル `r` → `s`）:
+
+| | 要求なし | 7.5–15 ms 要求 + プール 48 |
+|---|---|---|
+| 送信 | 1314 | **1863** |
+| 欠落 `nomem` | **555（29.7%）** | **6（0.3%）** |
+| `os_memblock_get failed` | 14 回 | **0 回** |
+| 確定した接続間隔 | 未計測 | **15.00 ms** |
+
+#### 落とし穴: `sdkconfig.defaults` は既存の `sdkconfig` を上書きしない
+
+`CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT` を `sdkconfig.defaults.esp32` で
+12 → 48 にしても、**生成済みの `sdkconfig`（git 管理外）が古い値を保持**していると
+反映されない。`build/config/sdkconfig.h` を grep して実際の値を確認すること。
+反映されていなければ `sdkconfig` も直すか消して `reconfigure` する。
+
+#### 落とし穴: `pdMS_TO_TICKS(2)` は 0 tick に丸められる
+
+`CONFIG_FREERTOS_HZ=100`（1 tick = 10 ms）なので `pdMS_TO_TICKS(1)` も
+`pdMS_TO_TICKS(2)` も **0**。通知リトライの「短いバックオフ」は
+まったく待っていなかった。10 ms 未満を待ちたいなら tick を上げるしかない。
+
+#### 送信状況の計測方法
+
+録音停止時に `TX summary` が出る。BLE 接続中にシリアル `r` → 10 秒 → `s` で取れる
+（喋る必要はない。測るのは送信レート）。
+
+```
+TX summary: sent=1863 failed=0 nomem=6 over 9991 ms (187 pkt/s, ...)
+Conn params (at stop): interval=15.00 ms latency=0 timeout=4000 ms
+```
+
+- `failed` … `ble_gattc_notify_custom()` が失敗した数
+- `nomem` … mbuf を確保できず捨てた数 ← **帯域不足はここに出る**
+- `B/s` 表示は全パケットを 200 B と仮定した概算で、末尾の端数パケットぶん過大。
+  正確に見るなら `sent` と `nomem` の比を使うこと。
+
+接続相手の BD アドレス（`Peer (connect): …`）と切断理由
+（`BLE disconnected (reason=0x…)`）も出る。Stick が `connected` のままなのに
+アプリ側が未接続、という状況では**誰がリンクを掴んでいるか**がこれで分かる。
+
+#### 落とし穴: NimBLE の notify ログが音声を殺す
+
+NimBLE は既定で `GATT procedure initiated: notify` を **INFO** で出す。
+音声通知ごとに出るので短い録音 1 回で **約 600 行・55 kB**。`esp_log` は
+コンソール UART へ同期書き込みするため、115200 baud では **4.8 秒ぶん**の
+送信待ちが BLE ホストタスクに乗り、音声ストリームが枯れて STT が失敗する。
+
+`app_main` で `esp_log_level_set("NimBLE", ESP_LOG_WARN)` を入れて抑止している。
+警告・エラーは残る。切断テストのログで `procedure initiated: notify` が
+0 件であることを確認できる。
 
 ### マイク処理（Handy STT 用）
 
@@ -425,6 +489,7 @@ Echo は別コンポーネント `atom_echo_s3r/`（保留中のデスクノー�
 | パス | 役割 |
 |------|------|
 | `stickc_plus2/main.c` | HOLD, PDM, BtnA, long-press sleep, NimBLE audio, LED |
+| `sdkconfig.defaults.esp32` | MSYS プール等（**生成済み `sdkconfig` を上書きしない**） |
 | `stickc_plus2/display.c` | ST7789 状態表示 / deep sleep 前のパッド待避 |
 | `stickc_plus2/smp_ota.c` | MCUmgr 互換 SMP OTA |
 | `stickc_plus2/partitions_ota.csv` | dual OTA |

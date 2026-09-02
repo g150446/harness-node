@@ -104,6 +104,12 @@ static const ble_uuid128_t gatt_svr_rx_uuid =
                      0x00, 0x10, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00);
 
 static uint16_t audio_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+/* Streaming instrumentation: how much of the audio actually reaches the peer. */
+static uint32_t tx_sent;
+static uint32_t tx_failed;
+static uint32_t tx_nomem;
+static int64_t tx_started_us;
+static esp_timer_handle_t conn_param_timer;
 static uint16_t audio_tx_char_handle;
 static uint16_t audio_rx_char_handle;
 
@@ -173,6 +179,8 @@ static void ble_app_on_reset(int reason);
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg);
 static void request_recording_stop(const char *source);
 static void refresh_status_display(void);
+static void log_conn_params(const char *when);
+static void request_fast_conn_params(void *arg);
 static void on_ota_busy(bool busy);
 static esp_err_t set_microphone_enabled(bool enabled);
 static esp_err_t init_audio(const mic_pdm_cfg_t *cfg);
@@ -287,6 +295,57 @@ static void emulate_double_click(const char *source)
 {
     ESP_LOGI(TAG, "%s: Double-click (notify only)", source);
     send_status_event(EVENT_DOUBLE_CLICK, "double_click");
+}
+
+/*
+ * Centrals typically settle on a ~30 ms interval, which tops out around
+ * 130 notifications/s - below the ~160/s that 16 kHz mono PCM needs, so the
+ * mbuf pool drains and audio is dropped. nordic-main asks for 7.5-15 ms for
+ * the same reason (see nordic-main/src/main.c conn_param_work_handler).
+ * Deferred off the GAP callback: centrals commonly ignore a request made
+ * before the link has settled.
+ */
+static void request_fast_conn_params(void *arg)
+{
+    (void)arg;
+    if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+    struct ble_gap_upd_params p = {
+        .itvl_min = 6,               /* 7.5 ms */
+        .itvl_max = 12,              /* 15 ms  */
+        .latency = 0,
+        .supervision_timeout = 400,  /* 4 s, in 10 ms units */
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
+    int rc = ble_gap_update_params(audio_conn_handle, &p);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "conn param update request failed rc=%d", rc);
+    } else {
+        ESP_LOGI(TAG, "conn param update requested (7.5-15 ms)");
+    }
+}
+
+static void log_conn_params(const char *when)
+{
+    struct ble_gap_conn_desc desc;
+    if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE ||
+        ble_gap_conn_find(audio_conn_handle, &desc) != 0) {
+        return;
+    }
+    /* Who actually holds the link: we advertise only while disconnected, so a
+     * stray central (a paired Mac, an old phone) locks Handy out entirely. */
+    const uint8_t *a = desc.peer_id_addr.val;
+    ESP_LOGI(TAG, "Peer (%s): %02x:%02x:%02x:%02x:%02x:%02x type=%u",
+             when, a[5], a[4], a[3], a[2], a[1], a[0],
+             (unsigned)desc.peer_id_addr.type);
+    /* conn_itvl is in 1.25 ms units. 16 kHz mono needs ~160 notifications/s. */
+    const unsigned itvl_us = (unsigned)desc.conn_itvl * 1250u;
+    ESP_LOGI(TAG, "Conn params (%s): interval=%u.%02u ms latency=%u timeout=%u ms",
+             when, itvl_us / 1000u, (itvl_us % 1000u) / 10u,
+             (unsigned)desc.conn_latency,
+             (unsigned)desc.supervision_timeout * 10u);
 }
 
 static void refresh_status_display(void)
@@ -653,11 +712,16 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         audio_conn_handle = event->connect.conn_handle;
         ble_att_set_preferred_mtu(BLE_MTU_SIZE);
         ble_gattc_exchange_mtu(audio_conn_handle, NULL, NULL);
+        log_conn_params("connect");
+        if (conn_param_timer != NULL) {
+            (void)esp_timer_stop(conn_param_timer);
+            (void)esp_timer_start_once(conn_param_timer, 500 * 1000);
+        }
         refresh_status_display();
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "BLE disconnected");
+        ESP_LOGI(TAG, "BLE disconnected (reason=0x%04x)", event->disconnect.reason);
         audio_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         is_recording = false;
         recording_requested = false;
@@ -672,6 +736,10 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "MTU exchange: mtu=%d", event->mtu.value);
+        break;
+
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        log_conn_params("conn update");
         break;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -1251,6 +1319,10 @@ static void audio_stream_task(void *pvParameters)
             is_recording = true;
             recording_requested = false;
             seq_num = 0;
+            tx_sent = 0;
+            tx_failed = 0;
+            tx_nomem = 0;
+            tx_started_us = esp_timer_get_time();
             led_set(true);
             refresh_status_display();
             send_status_event(EVENT_RECORDING_STARTED, "recording_started");
@@ -1259,6 +1331,18 @@ static void audio_stream_task(void *pvParameters)
         if (stop_requested) {
             if (stop_event_pending) {
                 ESP_LOGI(TAG, "Stopping recording...");
+                const uint32_t ms = tx_started_us
+                    ? (uint32_t)((esp_timer_get_time() - tx_started_us) / 1000) : 0;
+                const uint32_t total = tx_sent + tx_failed + tx_nomem;
+                ESP_LOGI(TAG,
+                         "TX summary: sent=%u failed=%u nomem=%u over %u ms "
+                         "(%u pkt/s, %u B/s; 16 kHz mono needs 160 pkt/s, 32000 B/s)",
+                         (unsigned)tx_sent, (unsigned)tx_failed, (unsigned)tx_nomem,
+                         (unsigned)ms,
+                         (unsigned)(ms ? total * 1000u / ms : 0),
+                         (unsigned)(ms ? (uint32_t)((uint64_t)tx_sent * RECORDING_PACKET_SIZE
+                                                    * 1000u / ms) : 0));
+                log_conn_params("at stop");
                 send_status_event(EVENT_RECORDING_STOPPED, "recording_stopped");
             }
             (void)set_microphone_enabled(false);
@@ -1353,16 +1437,35 @@ static void audio_stream_task(void *pvParameters)
             size_t packet_size = 2 + (samples_to_send * 2);
 
             struct os_mbuf *om = ble_hs_mbuf_from_flat(tx_packet, packet_size);
-            if (om != NULL) {
+            if (om == NULL) {
+                /* Pool drained by the link, not a permanent failure - give the
+                 * controller a tick to drain before giving up on the frame. */
+                vTaskDelay(1);
+                om = ble_hs_mbuf_from_flat(tx_packet, packet_size);
+            }
+            if (om == NULL) {
+                tx_nomem++;
+            } else {
                 int nrc = ble_gattc_notify_custom(audio_conn_handle, audio_tx_char_handle, om);
-                if (nrc != 0) {
-                    /* Retry once after a short backoff; drop frame if still failing. */
-                    vTaskDelay(pdMS_TO_TICKS(2));
+                if (nrc == 0) {
+                    tx_sent++;
+                } else {
+                    /* One tick is the shortest real wait at CONFIG_FREERTOS_HZ=100;
+                     * pdMS_TO_TICKS(2) rounds to 0 and does not back off at all. */
+                    vTaskDelay(1);
                     om = ble_hs_mbuf_from_flat(tx_packet, packet_size);
-                    if (om != NULL) {
+                    if (om == NULL) {
+                        tx_nomem++;
+                    } else {
                         nrc = ble_gattc_notify_custom(audio_conn_handle, audio_tx_char_handle, om);
-                        if (nrc != 0) {
-                            ESP_LOGW(TAG, "notify failed rc=%d (drop)", nrc);
+                        if (nrc == 0) {
+                            tx_sent++;
+                        } else {
+                            tx_failed++;
+                            if (tx_failed <= 5 || (tx_failed % 100) == 0) {
+                                ESP_LOGW(TAG, "notify failed rc=%d (drop #%u)",
+                                         nrc, (unsigned)tx_failed);
+                            }
                         }
                     }
                 }
@@ -1542,6 +1645,12 @@ void app_main(void)
      * still come through.
      */
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
+
+    const esp_timer_create_args_t cp_args = {
+        .callback = request_fast_conn_params,
+        .name = "conn_param",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&cp_args, &conn_param_timer));
 
     ESP_LOGI(TAG, "Initializing NimBLE...");
     ble_hs_cfg.sync_cb = ble_app_on_sync;
