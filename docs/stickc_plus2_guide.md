@@ -17,8 +17,9 @@ Handy / Android は `HarnessNode` 接頭辞で接続可能。
 | Flash / PSRAM | 8 MB / 2 MB |
 | USB-UART | CH9102 → `/dev/cu.usbserial-…` |
 | Mic | SPM1423 **PDM** CLK=**G0**, DIN=**G34** |
-| BtnA | **G37** active-low（single / double） |
-| POWER_HOLD | **G4 = HIGH 必須**（起動直後に保持） |
+| BtnA | **G37** active-low（single / double / **long ≥1 s**） |
+| POWER_HOLD | **G4 = HIGH 必須**（起動直後に保持。deep sleep 中も RTC hold で維持） |
+| LCD | ST7789V2 135×240（MOSI=G15 CLK=G13 DC=G14 RST=G12 CS=G5 BL=G27） |
 | Status LED | G19（IR と共有、active-high） |
 | 電池 | 200 mAh（ADC G38、v1 では BAS 未実装） |
 
@@ -40,7 +41,7 @@ idf.py -DHN_BOARD=stickc_plus2 -p /dev/cu.usbserial-XXXX flash monitor
 |-----------------|------|
 | `-DHN_BOARD=stickc_plus2` | コンポーネント `stickc_plus2/` をリンク |
 | `sdkconfig.defaults.esp32` | Flash 8MB、dual OTA、NimBLE、UART コンソール |
-| `stickc_plus2/VERSION` | `esp_app_desc.version`（例 `0.1.3`） |
+| `stickc_plus2/VERSION` | `esp_app_desc.version`（現在 `0.1.5`） |
 
 **注意:** 以前 `esp32s3` でビルドした `build/` がある場合は退避してから `set-target esp32` する。
 
@@ -79,9 +80,108 @@ python3 mac_client/ota_updater.py --device HarnessNode-Plus2 stickc_plus2/ota_up
 |------|------|
 | BtnA **single** / serial `c` | BLE 接続中に録音トグル。TX `0x14` のあと `0x01` or `0x02` |
 | BtnA **double** / serial `d` | TX `0x12` のみ（録音しない） |
+| BtnA **≥1 s 長押し** / serial `l` | deep sleep 入眠（LCD 消灯・BLE 切断）。**同じ BtnA を押すだけで起床**（電源ボタン不要） |
 | RX `0x01` / `0x00` | ホスト start / stop |
 | RX `0x05 mode` | モード（0=NORMAL, 1=DRIVING）。TX `0x40` |
 | 音声 | 16 kHz mono PCM `[seq][0xAA][i16 LE…]`、ペイロード最大 200 B |
+
+### 起動表示 / スリープ
+
+**LCD 状態**（中央寄せ・黒地、`stickc_plus2/display.c`）:
+
+| 表示 | 色 | 条件 |
+|------|-----|------|
+| `not connected` | 白 | BLE 未接続 |
+| `connected` | 緑 | BLE 接続中・非録音 |
+| `recording` | 赤 | 録音中（または開始要求中） |
+
+**入眠**（`enter_deep_sleep()`, `stickc_plus2/main.c`）:
+
+1. 録音停止 → LED off
+2. BLE 切断（`ble_gap_terminate`）+ 広告停止。**NimBLE は落とさない**
+3. **BtnA 解放待ち（無期限）** — 押したままだと ext0 が即発火して寝られない
+4. `POWER_HOLD`(G4) を digital → RTC へグリッチなしで受け渡し、`rtc_gpio_hold_en()`
+5. LCD 消灯 + G12 / G27 を pulldown で待避（`display_prepare_deep_sleep()`）
+6. `esp_sleep_enable_ext0_wakeup(G37, 0)` → `esp_deep_sleep_start()`
+
+**起床**: `rst:0x5 (DEEPSLEEP_RESET)` の cold boot 相当。`app_main` 冒頭で HOLD を
+digital に戻してから hold 解除 → BtnA 解放待ち → 通常初期化 → 状態表示を再描画。
+
+- **mic は触らない**。`i2s_channel_disable()` は `i2s_channel_read` 中のミューテックス
+  待ちでブロックしうるうえ、deep sleep でどうせリセットされる。
+- **MPU6886**: 本 FW では未使用のため sleep 入出でも触らない（常時通電のまま）。
+- **完全電源オフ**（HOLD=0）は未使用。ほぼ 0 mA だが復帰は電源ボタン BtnC ≥2 s（公式仕様）。
+
+#### 落とし穴: `nimble_port_stop()` は必ず panic する
+
+`nimble_port_run()` は stop イベントを処理すると **return する**
+（`components/bt/host/nimble/nimble/porting/nimble/src/nimble_port.c`）。
+ESP-IDF の `vPortTaskWrapper` はタスク関数の return を `abort()` にするため、
+ホストタスクが即クラッシュする:
+
+```
+E FreeRTOS: FreeRTOS Task "nimble_host" should not return, Aborting now!
+```
+
+deep sleep は BT コントローラごと電源を落とすので**解体は不要**。切断と広告停止だけ行う。
+`ble_host_task()` は保険として `nimble_port_run()` の後に
+`nimble_port_freertos_deinit()` を呼んでおくこと。
+
+#### 落とし穴: `POWER_HOLD`(G4) を一瞬でも LOW にすると電源が落ちる
+
+G4 LOW ＝ Plus2 の電源オフ操作そのもの。数 µs でも駆動すると board ごと落ちる。
+
+- **入眠**: `rtc_gpio_set_level(1)` → `rtc_gpio_set_direction(OUTPUT_ONLY)` →
+  `rtc_gpio_init()` → `rtc_gpio_hold_en()`。**この順序が必須**。
+  ESP-IDF の例どおり `init → direction → level` にすると、RTC 出力データが初期値 0 の
+  まま driver が有効化され G4 が LOW に駆動される。
+- **起床**: `power_hold_on()`（digital で HIGH 出力）→ **その後に**
+  `rtc_gpio_hold_dis()`。`gpio_config()` は内部で `rtc_gpio_deinit()` を呼んだ直後に
+  output を有効化するので、hold を先に外すと `GPIO_OUT`=0 のまま G4 が LOW になる。
+- `power_hold_on()` 自体も `gpio_config()` の前に `gpio_set_level(1)` で
+  出力ラッチを先込めしてある。単体で呼んでも LOW を出さない。
+
+#### 落とし穴: USB 給電中は HOLD のバグが見えない
+
+USB 接続中は 5 V 側から給電され続けるため、G4 が LOW に落ちても board は動き続ける。
+**HOLD 周りの検証は必ず USB を抜いて電池駆動で行うこと。**
+シリアルログが取れないので LCD の点灯／消灯で判定する。
+
+#### 落とし穴: 起床直後に寝直す
+
+起こすのも寝かせるのも同じ BtnA なので、起床時に指が残っていると長押し判定に化ける。
+
+- `wait_button_a_release()` は**タイムアウトなし**で離すまで待つ。
+- `button_task` は開始時に押されているボタンを無視する（`press_active = false` で開始）。
+  `press_start_tick = 0` のまま開始すると `now - 0 >= 1000 ms` が即成立して寝直す。
+
+#### 落とし穴: G12（LCD RST）は MTDI ストラップ
+
+deep sleep 中は Hi-Z になる。起床リセット時に HIGH で読まれると VDD_SDIO が 1.8 V に
+なり内蔵 flash が起動しない。`display_prepare_deep_sleep()` で pulldown して LOW に固定する。
+BL の G27 も同様に pulldown（浮かせるとバックライトが薄く光る）。
+
+#### 検証手順
+
+1. **USB 接続 + `idf.py monitor`**: シリアル `l` を送る →
+   `entering deep sleep` → `deep sleep now (wake on BtnA)` の後**ログが止まり、
+   panic も reset も出ない**こと。panic が出るなら NimBLE の解体が残っている。
+2. BtnA を押す → `rst:0x5 (DEEPSLEEP_RESET)` と
+   `Woke from deep sleep (BtnA); waiting for release` が出て通常起動すること。
+3. 実機で BtnA を 1 秒以上長押し → `Button A: Long-press -> sleep`。
+   単発クリック（録音トグル）が混ざらないこと。
+4. **USB を抜いて電池駆動**（本命）: 長押し → LCD 消灯 → BtnA をもう一度押す →
+   **電源ボタンを使わずに** LCD が復帰すること。ここが通れば HOLD のグリッチは無い。
+
+### スリープ消費電力（調査）
+
+| 状態 | 目安 | 備考 |
+|------|------|------|
+| 起動中（LCD ON + BLE 広告） | 数十 mA | BL + RF が支配 |
+| deep sleep（本実装） | **数十 µA〜1 mA 未満（要実測）** | ESP32 単体 ~10 µA だが Plus2 は AXP 無しで LDO / BM8563 / MPU6886 等が常時通電 |
+| HOLD=0 完全オフ | ほぼ 0 | 今回の UX では不採用 |
+
+実測は電池経路に直列電流計（0.1 mA 分解能以上）を入れ、USB 非接続で (1) 起動中アイドル (2) deep sleep を比較すること。USB 給電中の値は電池駆動と一致しない。
 
 ### マイク処理（Handy STT 用）
 
@@ -241,6 +341,7 @@ XIAO の電源を切ること。
 | `s` | 録音停止 |
 | `c` / `1` | single-click 相当 |
 | `d` / `2` | double-click 相当 |
+| `l` | long-press 相当（deep sleep） |
 | `m` | PDM 設定スイープ 9 構成（録音中は不可） |
 | `g` | mic gain 巡回 1→2→4→8→16 |
 | `h` | ヘルプ |
@@ -262,7 +363,8 @@ Echo は別コンポーネント `atom_echo_s3r/`（保留中のデスクノー�
 
 | パス | 役割 |
 |------|------|
-| `stickc_plus2/main.c` | HOLD, PDM, BtnA, NimBLE audio, LED |
+| `stickc_plus2/main.c` | HOLD, PDM, BtnA, long-press sleep, NimBLE audio, LED |
+| `stickc_plus2/display.c` | ST7789 状態表示 / deep sleep 前のパッド待避 |
 | `stickc_plus2/smp_ota.c` | MCUmgr 互換 SMP OTA |
 | `stickc_plus2/partitions_ota.csv` | dual OTA |
 | `stickc_plus2/build_and_package_ota.sh` | OTA bin 生成 |

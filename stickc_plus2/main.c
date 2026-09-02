@@ -9,12 +9,14 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "driver/i2s_pdm.h"
+#include "driver/rtc_io.h"
 #include "soc/i2s_struct.h"
 
 #include "host/ble_hs.h"
@@ -27,6 +29,7 @@
 #include "nimble/nimble_port_freertos.h"
 
 #include "adpcm.h"
+#include "display.h"
 #include "smp_ota.h"
 
 static const char *TAG = "hn_plus2";
@@ -41,6 +44,7 @@ static const char *TAG = "hn_plus2";
 #define BUTTON_POLL_MS          10
 #define BUTTON_DEBOUNCE_MS      30
 #define BUTTON_DOUBLE_CLICK_MS  500
+#define BUTTON_LONG_PRESS_MS    1000
 
 #define I2S_PORT_NUM      I2S_NUM_0
 #define I2S_SAMPLE_RATE   16000
@@ -168,6 +172,7 @@ static void ble_app_on_sync(void);
 static void ble_app_on_reset(int reason);
 static int ble_app_gap_event(struct ble_gap_event *event, void *arg);
 static void request_recording_stop(const char *source);
+static void refresh_status_display(void);
 static void on_ota_busy(bool busy);
 static esp_err_t set_microphone_enabled(bool enabled);
 static esp_err_t init_audio(const mic_pdm_cfg_t *cfg);
@@ -183,6 +188,13 @@ static void apply_pending_operation_mode(void);
 
 static void power_hold_on(void)
 {
+    /*
+     * Preload the output latch first: gpio_config() enables the driver before
+     * anyone writes GPIO_OUT, so configuring first would drive HOLD low for a
+     * few microseconds and cut the board's own power.
+     */
+    gpio_set_level(POWER_HOLD_GPIO, 1);
+
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << POWER_HOLD_GPIO,
         .mode = GPIO_MODE_OUTPUT,
@@ -222,6 +234,7 @@ static void request_recording_start(const char *source)
     ESP_LOGI(TAG, "%s: Start recording requested", source);
     stop_requested = false;
     recording_requested = true;
+    refresh_status_display();
 }
 
 static void request_recording_stop(const char *source)
@@ -236,6 +249,7 @@ static void request_recording_stop(const char *source)
     stop_requested = true;
     stop_event_pending = was_recording;
     led_set(false);
+    refresh_status_display();
 }
 
 static void on_ota_busy(bool busy)
@@ -261,6 +275,7 @@ static void emulate_single_click(const char *source)
         recording_requested = false;
         ESP_LOGI(TAG, "%s: Pending recording start cancelled", source);
         apply_pending_operation_mode();
+        refresh_status_display();
     } else {
         request_recording_start(source);
     }
@@ -274,6 +289,97 @@ static void emulate_double_click(const char *source)
     send_status_event(EVENT_DOUBLE_CLICK, "double_click");
 }
 
+static void refresh_status_display(void)
+{
+    if (is_recording || recording_requested) {
+        display_set_status(DISPLAY_STATUS_RECORDING);
+    } else if (audio_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        display_set_status(DISPLAY_STATUS_CONNECTED);
+    } else {
+        display_set_status(DISPLAY_STATUS_NOT_CONNECTED);
+    }
+}
+
+static void enter_deep_sleep(const char *source)
+{
+    ESP_LOGI(TAG, "%s: entering deep sleep", source);
+
+    request_recording_stop(source);
+    led_set(false);
+
+    /*
+     * Tell the peer we are going away, but do NOT tear NimBLE down:
+     * nimble_port_stop() makes nimble_port_run() return, and an ESP-IDF task
+     * function that returns hits abort() in vPortTaskWrapper. Deep sleep
+     * powers the controller down anyway.
+     */
+    if (audio_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(audio_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    (void)ble_gap_adv_stop();
+
+    /*
+     * Long-press is still held (active-low). ext0 wake-on-low would fire
+     * immediately, so wait for release + debounce before arming sleep.
+     */
+    ESP_LOGI(TAG, "wait BtnA release before sleep");
+    while (gpio_get_level(BUTTON_A_GPIO) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS + 50));
+    while (gpio_get_level(BUTTON_A_GPIO) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    /*
+     * Hand POWER_HOLD from the digital driver to the RTC driver without ever
+     * releasing it: RTC output data and enable are set while the pad is still
+     * on the digital mux, so rtc_gpio_init() switches over an already-high
+     * pad. Doing it in the documented order (init -> direction -> level)
+     * drives the pad low in between and powers the board off.
+     */
+    rtc_gpio_set_level((gpio_num_t)POWER_HOLD_GPIO, 1);
+    rtc_gpio_set_direction((gpio_num_t)POWER_HOLD_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_init((gpio_num_t)POWER_HOLD_GPIO);
+    rtc_gpio_hold_en((gpio_num_t)POWER_HOLD_GPIO);
+
+    /* Park the LCD pads so they do not float through deep sleep. */
+    display_prepare_deep_sleep();
+
+    /* BtnA (G37) is input-only: no internal pulls exist, the board pulls it up. */
+    esp_err_t wr = esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_A_GPIO, 0);
+    if (wr != ESP_OK) {
+        /* Sleeping now would be unwakeable; stay up instead. */
+        ESP_LOGE(TAG, "ext0 wake enable failed (%s); staying awake",
+                 esp_err_to_name(wr));
+        rtc_gpio_hold_dis((gpio_num_t)POWER_HOLD_GPIO);
+        power_hold_on();
+        (void)display_init();
+        refresh_status_display();
+        ble_app_advertise();
+        return;
+    }
+
+    ESP_LOGI(TAG, "deep sleep now (wake on BtnA)");
+    esp_deep_sleep_start();
+}
+
+static void emulate_long_press(const char *source)
+{
+    ESP_LOGI(TAG, "%s: Long-press -> sleep", source);
+    enter_deep_sleep(source);
+}
+
+static void wait_button_a_release(void)
+{
+    while (gpio_get_level(BUTTON_A_GPIO) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    /* Settle after release so the wake press is not treated as a click. */
+    vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS + 20));
+}
+
 static void handle_serial_command(uint8_t command, const char *source)
 {
     if (command == 'r' || command == 'R') {
@@ -284,6 +390,8 @@ static void handle_serial_command(uint8_t command, const char *source)
         emulate_single_click(source);
     } else if (command == 'd' || command == 'D' || command == '2') {
         emulate_double_click(source);
+    } else if (command == 'l' || command == 'L') {
+        emulate_long_press(source);
     } else if (command == 'm' || command == 'M') {
         if (is_recording || recording_requested) {
             ESP_LOGW(TAG, "%s: mic sweep ignored while recording", source);
@@ -304,6 +412,7 @@ static void handle_serial_command(uint8_t command, const char *source)
         ESP_LOGI(TAG,
                  "%s commands: 'r'=start, 's'=stop, "
                  "'c'/'1'=single-click, 'd'/'2'=double-click, "
+                 "'l'=long-press sleep, "
                  "'m'=mic PDM sweep, 'g'=cycle mic gain (1..16), 'h'=help",
                  source);
     }
@@ -539,6 +648,7 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         audio_conn_handle = event->connect.conn_handle;
         ble_att_set_preferred_mtu(BLE_MTU_SIZE);
         ble_gattc_exchange_mtu(audio_conn_handle, NULL, NULL);
+        refresh_status_display();
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
@@ -551,6 +661,7 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         led_set(false);
         (void)set_microphone_enabled(false);
         apply_pending_operation_mode();
+        refresh_status_display();
         ble_app_advertise();
         break;
 
@@ -1136,6 +1247,7 @@ static void audio_stream_task(void *pvParameters)
             recording_requested = false;
             seq_num = 0;
             led_set(true);
+            refresh_status_display();
             send_status_event(EVENT_RECORDING_STARTED, "recording_started");
         }
 
@@ -1149,6 +1261,7 @@ static void audio_stream_task(void *pvParameters)
             stop_event_pending = false;
             led_set(false);
             apply_pending_operation_mode();
+            refresh_status_display();
         }
 
         if (!is_recording || audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
@@ -1265,7 +1378,13 @@ static void button_task(void *pvParameters)
     int last_level = stable_level;
     TickType_t last_change_tick = xTaskGetTickCount();
     TickType_t first_click_tick = 0;
+    TickType_t press_start_tick = last_change_tick;
     uint8_t click_count = 0;
+    bool long_press_fired = false;
+    /* Ignore a press that is already down here (e.g. the wake press): a stale
+     * press_start_tick would fire long-press immediately and sleep again. */
+    bool press_active = false;
+    bool awaiting_single = false;
 
     while (1) {
         int level = gpio_get_level(BUTTON_A_GPIO);
@@ -1280,6 +1399,10 @@ static void button_task(void *pvParameters)
             (now - last_change_tick) >= pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
             stable_level = level;
             if (stable_level == 0) {
+                press_active = true;
+                press_start_tick = now;
+                long_press_fired = false;
+                awaiting_single = false;
                 if (click_count == 0) {
                     click_count = 1;
                     first_click_tick = now;
@@ -1294,13 +1417,34 @@ static void button_task(void *pvParameters)
                         first_click_tick = now;
                     }
                 }
+            } else {
+                press_active = false;
+                if (long_press_fired) {
+                    click_count = 0;
+                    first_click_tick = 0;
+                    long_press_fired = false;
+                    awaiting_single = false;
+                } else if (click_count == 1) {
+                    /* Defer single until double-click window ends after release. */
+                    awaiting_single = true;
+                }
             }
         }
 
-        if (click_count == 1 &&
+        if (press_active && !long_press_fired && stable_level == 0 &&
+            (now - press_start_tick) >= pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS)) {
+            long_press_fired = true;
+            click_count = 0;
+            first_click_tick = 0;
+            awaiting_single = false;
+            emulate_long_press("Button A");
+        }
+
+        if (awaiting_single && click_count == 1 && !long_press_fired &&
             (now - first_click_tick) > pdMS_TO_TICKS(BUTTON_DOUBLE_CLICK_MS)) {
             click_count = 0;
             first_click_tick = 0;
+            awaiting_single = false;
             emulate_single_click("Button A");
         }
 
@@ -1330,11 +1474,20 @@ static void ble_host_task(void *pvParameters)
     (void)pvParameters;
     ESP_LOGI(TAG, "BLE host task started");
     nimble_port_run();
+    /* nimble_port_run() returns on stop; returning from a task aborts. */
+    nimble_port_freertos_deinit();
 }
 
 void app_main(void)
 {
-    /* Must hold power immediately on StickC Plus2. */
+    /*
+     * Must hold power immediately on StickC Plus2. After a deep-sleep wake the
+     * pad is still latched high by the RTC hold, so drive the digital output
+     * high first and release the hold last - the other order lets gpio_config()
+     * drive HOLD low and the board powers itself off.
+     */
+    power_hold_on();
+    rtc_gpio_hold_dis((gpio_num_t)POWER_HOLD_GPIO);
     power_hold_on();
     ESP_LOGI(TAG, "HarnessNode Plus2 (M5StickC Plus2) - Starting");
 
@@ -1351,6 +1504,12 @@ void app_main(void)
     adpcm_init_state(&adpcm_enc_state);
     led_init();
 
+    if (display_init() == ESP_OK) {
+        refresh_status_display();
+    } else {
+        ESP_LOGW(TAG, "Display init failed; continuing without LCD");
+    }
+
     const uart_config_t uart_config = {
         .baud_rate = UART_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
@@ -1365,6 +1524,10 @@ void app_main(void)
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
     ESP_ERROR_CHECK(init_button());
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+        ESP_LOGI(TAG, "Woke from deep sleep (BtnA); waiting for release");
+        wait_button_a_release();
+    }
 
     ESP_LOGI(TAG, "Initializing NimBLE...");
     ble_hs_cfg.sync_cb = ble_app_on_sync;
@@ -1387,9 +1550,10 @@ void app_main(void)
     xTaskCreate(button_task, "button_task", 3072, NULL, 4, &button_task_handle);
     xTaskCreate(uart_task, "uart_task", 4096, NULL, 4, NULL);
 
-    ESP_LOGI(TAG, "Init complete. Adv name %s; BtnA single toggles recording; SMP OTA enabled",
+    ESP_LOGI(TAG,
+             "Init complete. Adv name %s; BtnA single=record, long=sleep; SMP OTA enabled",
              BLE_ADV_NAME);
     ESP_LOGI(TAG,
-             "Serial: 'r'=start 's'=stop 'c'=single 'd'=double 'm'=mic-sweep "
-             "'g'=gain 'h'=help");
+             "Serial: 'r'=start 's'=stop 'c'=single 'd'=double 'l'=sleep "
+             "'m'=mic-sweep 'g'=gain 'h'=help");
 }
