@@ -92,7 +92,7 @@ python3 mac_client/ota_updater.py --device HarnessNode-Plus2 stickc_plus2/ota_up
 | 表示 | 色 | 条件 |
 |------|-----|------|
 | `not connected` | 白 | BLE 未接続 |
-| `connected` | 緑 | BLE 接続中・非録音 |
+| `connected` | 青 | BLE 接続中・非録音 |
 | `recording` | 赤 | 録音中（または開始要求中） |
 
 **入眠**（`enter_deep_sleep()`, `stickc_plus2/main.c`）:
@@ -154,6 +154,37 @@ USB 接続中は 5 V 側から給電され続けるため、G4 が LOW に落ち
 - `wait_button_a_release()` は**タイムアウトなし**で離すまで待つ。
 - `button_task` は開始時に押されているボタンを無視する（`press_active = false` で開始）。
   `press_start_tick = 0` のまま開始すると `now - 0 >= 1000 ms` が即成立して寝直す。
+
+#### 落とし穴: LCD の色は数値から推測しない（必ず `p` で実測）
+
+このパネルは **RGB565 の素直な読みと一致しない**。実測（シリアル `p` で
+`0xF800` / `0x07E0` / `0x001F` / `0xFFFF` の 4 帯を上から描画）した結果:
+
+| 送る値 | 実際に見える色 |
+|--------|----------------|
+| `0xF800` | **赤** |
+| `0x07E0` | **青** |
+| `0x001F` | 緑 |
+| `0xFFFF` | 白 |
+
+したがって `display.c` の `COLOR_BLUE` は `0x07E0`、`COLOR_RED` は `0xF800`。
+**数値だけ見て「間違っている」と直すと逆に壊れる。** `rgb_ele_order` を
+変えるとこの対応表も変わるので、いじったら必ず `p` で測り直すこと。
+
+（経緯: 当初 `rgb_ele_order = RGB` で `connected`=`0x07E0` は緑、
+`recording`=`0xF800` は青に見えていた。BGR に変えたところ赤は正しくなったが
+緑と青の対応が入れ替わり、推測では追えないことが判明した。）
+
+#### 落とし穴: NimBLE の notify ログが音声を殺す
+
+NimBLE は既定で `GATT procedure initiated: notify` を **INFO** で出す。
+音声通知ごとに出るので短い録音 1 回で **約 600 行・55 kB**。`esp_log` は
+コンソール UART へ同期書き込みするため、115200 baud では **4.8 秒ぶん**の
+送信待ちが BLE ホストタスクに乗り、音声ストリームが枯れて STT が失敗する。
+
+`app_main` で `esp_log_level_set("NimBLE", ESP_LOG_WARN)` を入れて抑止している。
+警告・エラーは残る。切断テストのログで `procedure initiated: notify` が
+0 件であることを確認できる。
 
 #### 落とし穴: LCD は 1 タスクからしか触らない
 
@@ -373,6 +404,7 @@ XIAO の電源を切ること。
 | `l` | long-press 相当（deep sleep） |
 | `m` | PDM 設定スイープ 9 構成（録音中は不可） |
 | `g` | mic gain 巡回 1→2→4→8→16 |
+| `p` | LCD カラーバー（色順の実測用、下記） |
 | `h` | ヘルプ |
 
 ---

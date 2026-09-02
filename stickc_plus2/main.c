@@ -391,6 +391,10 @@ static void handle_serial_command(uint8_t command, const char *source)
         emulate_single_click(source);
     } else if (command == 'd' || command == 'D' || command == '2') {
         emulate_double_click(source);
+    } else if (command == 'p' || command == 'P') {
+        ESP_LOGI(TAG, "%s: colour bars 0xF800/0x07E0/0x001F/0xFFFF top-to-bottom",
+                 source);
+        display_test_pattern();
     } else if (command == 'l' || command == 'L') {
         emulate_long_press(source);
     } else if (command == 'm' || command == 'M') {
@@ -413,7 +417,7 @@ static void handle_serial_command(uint8_t command, const char *source)
         ESP_LOGI(TAG,
                  "%s commands: 'r'=start, 's'=stop, "
                  "'c'/'1'=single-click, 'd'/'2'=double-click, "
-                 "'l'=long-press sleep, "
+                 "'l'=long-press sleep, 'p'=colour bars, "
                  "'m'=mic PDM sweep, 'g'=cycle mic gain (1..16), 'h'=help",
                  source);
     }
@@ -1530,6 +1534,15 @@ void app_main(void)
         wait_button_a_release();
     }
 
+    /*
+     * NimBLE logs "GATT procedure initiated: notify" at INFO for every audio
+     * notification - ~600 lines (55 kB) per short recording. esp_log writes to
+     * the console UART synchronously, so at 115200 baud that stalls the BLE
+     * host task for seconds and starves the audio stream. Warnings and errors
+     * still come through.
+     */
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
+
     ESP_LOGI(TAG, "Initializing NimBLE...");
     ble_hs_cfg.sync_cb = ble_app_on_sync;
     ble_hs_cfg.reset_cb = ble_app_on_reset;
@@ -1556,5 +1569,5 @@ void app_main(void)
              BLE_ADV_NAME);
     ESP_LOGI(TAG,
              "Serial: 'r'=start 's'=stop 'c'=single 'd'=double 'l'=sleep "
-             "'m'=mic-sweep 'g'=gain 'h'=help");
+             "'m'=mic-sweep 'g'=gain 'p'=colour-bars 'h'=help");
 }

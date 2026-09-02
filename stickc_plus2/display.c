@@ -34,9 +34,15 @@ static const char *TAG = "hn_disp";
 #define LCD_GAP_X 52
 #define LCD_GAP_Y 40
 
+/*
+ * These are what the panel ACTUALLY shows, measured with the `p` test pattern
+ * (four bands of 0xF800 / 0x07E0 / 0x001F / 0xFFFF) on real hardware. The
+ * channel order does not match a plain RGB565 reading of the values, so do not
+ * "correct" them from the numbers alone - re-measure with the test pattern.
+ */
 #define COLOR_BG     0x0000
 #define COLOR_WHITE  0xFFFF
-#define COLOR_GREEN  0x07E0
+#define COLOR_BLUE   0x07E0
 #define COLOR_RED    0xF800
 
 #define BMP_NOT_CONNECTED_W 105
@@ -271,7 +277,9 @@ esp_err_t display_init(void)
 
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = PIN_LCD_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        /* Colour constants above were measured with this setting - changing it
+         * invalidates them. */
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
     };
     ret = esp_lcd_new_panel_st7789(io, &panel_config, &s_panel);
@@ -317,7 +325,7 @@ static void draw_status(display_status_t status)
         bmp = bmp_connected;
         bw = BMP_CONNECTED_W;
         bh = BMP_CONNECTED_H;
-        fg = COLOR_GREEN;
+        fg = COLOR_BLUE;
         break;
     case DISPLAY_STATUS_RECORDING:
         bmp = bmp_recording;
@@ -383,6 +391,23 @@ static void sleep_locked(void)
         (void)fill_rect(0, 0, LCD_H_RES, LCD_V_RES, COLOR_BG);
     }
     s_drawn = -1;
+}
+
+/* Colour calibration aid: paint four known RGB565 values as horizontal bands,
+ * top to bottom. Serial 'p'. The constants above were derived from this. */
+void display_test_pattern(void)
+{
+    static const uint16_t bands[4] = { 0xF800, 0x07E0, 0x001F, 0xFFFF };
+    DISPLAY_LOCK();
+    if (s_ready) {
+        const int h = LCD_V_RES / 4;
+        for (int i = 0; i < 4; i++) {
+            (void)fill_rect(0, i * h, LCD_H_RES, h, bands[i]);
+        }
+        bl_set(true);
+        s_drawn = -1;
+    }
+    DISPLAY_UNLOCK();
 }
 
 void display_sleep(void)
