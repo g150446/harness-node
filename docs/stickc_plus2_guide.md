@@ -155,6 +155,27 @@ USB 接続中は 5 V 側から給電され続けるため、G4 が LOW に落ち
 - `button_task` は開始時に押されているボタンを無視する（`press_active = false` で開始）。
   `press_start_tick = 0` のまま開始すると `now - 0 >= 1000 ms` が即成立して寝直す。
 
+#### 落とし穴: LCD は 1 タスクからしか触らない
+
+`display_set_status()` は **button_task / audio_stream_task / uart_task /
+NimBLE host task / app_main** の 5 文脈から呼ばれる。1 回の再描画は
+`esp_lcd_panel_draw_bitmap()` を約 240 回叩く重い処理なので、素で呼ぶと:
+
+- **SPI デバイスを 2 タスクが同時に使って固まる**。`fill_rect()` が黒で塗った直後に
+  止まるため、**画面は真っ黒・呼び出したタスクは永久ブロック**になる。
+  button_task が巻き込まれると BtnA が完全に無反応になる。
+- audio_stream_task が録音開始／停止のたびに数十 ms 止まり、**音声が途切れて
+  STT が文字起こしできない**。
+
+対策として `display.c` に描画専用タスクを置き、パネルへのアクセスは全て
+mutex (`DISPLAY_LOCK`) 配下に集約した。`display_set_status()` は
+深さ 1 の queue に `xQueueOverwrite()` するだけで**呼び出し側は一切ブロックしない**。
+同じ状態への再描画は `s_drawn` で握り潰す。
+
+再現テスト（BLE 不要）: シリアル `r` / `s` を 0.2 s 間隔で連打する。
+`r` は uart_task から、録音開始は audio_stream_task から再描画を呼ぶため衝突する。
+**修正前は 1 サイクル目で固まる**（最後のログが `Stop recording requested` で停止）。
+
 #### 落とし穴: 入眠を中止したら LCD のパッドを戻す
 
 `display_prepare_deep_sleep()` は G27 / G12 を **RTC mux に移す**ので、以降

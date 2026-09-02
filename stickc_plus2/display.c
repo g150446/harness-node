@@ -4,6 +4,10 @@
 
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
@@ -135,6 +139,23 @@ static bool s_ready;
 static display_status_t s_status = DISPLAY_STATUS_NOT_CONNECTED;
 static bool s_parked;
 
+/*
+ * The panel is driven from one task only. display_set_status() is called from
+ * button_task, audio_stream_task, uart_task, the NimBLE host task and
+ * app_main; a full repaint is ~240 SPI transactions, so letting those callers
+ * paint directly both raced on the SPI device (leaving the screen black and
+ * the caller stuck) and stalled the audio pipeline mid-recording.
+ */
+static SemaphoreHandle_t s_lock;              /* guards all panel access */
+static QueueHandle_t s_req;                   /* depth 1, overwrite: wanted status */
+static TaskHandle_t s_task;
+static int s_drawn = -1;                      /* last painted status, -1 = unknown */
+
+#define DISPLAY_LOCK()   xSemaphoreTake(s_lock, portMAX_DELAY)
+#define DISPLAY_UNLOCK() xSemaphoreGive(s_lock)
+
+static void display_task(void *arg);
+
 static void bl_set(bool on)
 {
     gpio_set_level(PIN_LCD_BL, on ? 1 : 0);
@@ -196,6 +217,13 @@ esp_err_t display_init(void)
 {
     if (s_ready) {
         return ESP_OK;
+    }
+
+    if (s_lock == NULL) {
+        s_lock = xSemaphoreCreateMutex();
+        if (s_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     gpio_config_t bl_cfg = {
@@ -260,17 +288,25 @@ esp_err_t display_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     s_ready = true;
+
+    if (s_task == NULL) {
+        s_req = xQueueCreate(1, sizeof(display_status_t));
+        if (s_req == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+        if (xTaskCreate(display_task, "display", 3072, NULL, 3, &s_task) != pdPASS) {
+            vQueueDelete(s_req);
+            s_req = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     ESP_LOGI(TAG, "LCD ready %dx%d gap(%d,%d)", LCD_H_RES, LCD_V_RES, LCD_GAP_X, LCD_GAP_Y);
     return ESP_OK;
 }
 
-void display_set_status(display_status_t status)
+static void draw_status(display_status_t status)
 {
-    if (!s_ready && display_init() != ESP_OK) {
-        return;
-    }
-    s_status = status;
-
     const uint8_t *bmp = bmp_not_connected;
     int bw = BMP_NOT_CONNECTED_W;
     int bh = BMP_NOT_CONNECTED_H;
@@ -301,13 +337,59 @@ void display_set_status(display_status_t status)
     bl_set(true);
 }
 
-void display_sleep(void)
+static void display_task(void *arg)
+{
+    (void)arg;
+    display_status_t want;
+
+    while (1) {
+        if (xQueueReceive(s_req, &want, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        DISPLAY_LOCK();
+        /* Skip while parked for deep sleep, and skip repaints that change nothing. */
+        if (!s_parked && (int)want != s_drawn) {
+            draw_status(want);
+            s_drawn = (int)want;
+        }
+        DISPLAY_UNLOCK();
+    }
+}
+
+void display_set_status(display_status_t status)
+{
+    if (!s_ready && display_init() != ESP_OK) {
+        return;
+    }
+    s_status = status;
+
+    /* Never paint on the caller's task: just hand the wanted state over. */
+    if (s_req != NULL) {
+        (void)xQueueOverwrite(s_req, &status);
+        return;
+    }
+
+    DISPLAY_LOCK();
+    draw_status(status);
+    s_drawn = (int)status;
+    DISPLAY_UNLOCK();
+}
+
+static void sleep_locked(void)
 {
     bl_set(false);
     if (s_ready && s_panel != NULL) {
         (void)esp_lcd_panel_disp_on_off(s_panel, false);
         (void)fill_rect(0, 0, LCD_H_RES, LCD_V_RES, COLOR_BG);
     }
+    s_drawn = -1;
+}
+
+void display_sleep(void)
+{
+    DISPLAY_LOCK();
+    sleep_locked();
+    DISPLAY_UNLOCK();
 }
 
 static void park_pad_low(int gpio_num)
@@ -334,7 +416,9 @@ static void unpark_pad(int gpio_num)
 
 void display_prepare_deep_sleep(void)
 {
-    display_sleep();
+    /* Waits out any repaint already in flight on the display task. */
+    DISPLAY_LOCK();
+    sleep_locked();
 
     /*
      * Both pads go high-impedance in deep sleep. Pull them down so the
@@ -345,6 +429,7 @@ void display_prepare_deep_sleep(void)
     park_pad_low(PIN_LCD_BL);
     park_pad_low(PIN_LCD_RST);
     s_parked = true;
+    DISPLAY_UNLOCK();
 }
 
 esp_err_t display_resume(void)
@@ -353,6 +438,7 @@ esp_err_t display_resume(void)
         return display_init();
     }
 
+    DISPLAY_LOCK();
     if (s_parked) {
         /*
          * park_pad_low() moved both pads onto the RTC mux, so the digital
@@ -371,6 +457,8 @@ esp_err_t display_resume(void)
     if (s_panel != NULL) {
         ret = esp_lcd_panel_disp_on_off(s_panel, true);
     }
+    s_drawn = -1;   /* force a repaint on the next display_set_status() */
+    DISPLAY_UNLOCK();
     /* Caller redraws (and turns the backlight back on) via display_set_status(). */
     return ret;
 }
