@@ -16,9 +16,9 @@
 | IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 起動後は待機時消灯。録音ジェスチャー成立後の録音中のみ赤 |
-| 署名バージョン（目安） | `0.0.93+`（single tap が全モードで録音トグル、double は非録音） |
+| 署名バージョン（目安） | `0.0.94+`（single/double は notify-only。録音はホスト RX またはジェスチャー） |
 | OTA 手順 | [`ota_update_notes.md`](ota_update_notes.md) |
-| Android / Handy single_tap | `0x14` + FW録音トグル（全モード）。Kindle/G2操作はdouble専用 |
+| Android / Handy single_tap | `0x14` notify-only。ホストが RX `0x01`/`0x00` で録音。パススルー中は G2 ページ送り |
 
 ---
 
@@ -244,8 +244,11 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 
 | モード | single (`0x14`) | double (`0x12`) |
 |--------|-----------------|-----------------|
-| 通常 | primary 接続中に録音トグル。`0x14` のあと `0x01`/`0x02` | 通知のみ（録音不変）。待機中の開始ジェスチャー候補を破棄し 3 s re-arm |
+| 通常 | **notify-only**（録音はホスト RX）。待機中の開始ジェスチャー候補は double 時に破棄 | 通知のみ（録音不変）。開始ジェスチャー候補を破棄し 3 s re-arm |
 | 運転 | 同上（ジェスチャー無効） | 通知のみ（録音不変） |
+
+録音 start/stop はホストが RX `0x01` / `0x00` で指示する（パススルー中の single はページ送り専用で RX を送らない）。
+手首ジェスチャーによる録音は従来どおり Node 自律。
 
 Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` 運転）を
 書き込み、Node は `0x40`（`[0x00,0x55,0x40,effective,pending]`）で応答する。

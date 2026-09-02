@@ -87,3 +87,6 @@
   交互送信していた（Android受信ログ: END が session=23→22 の LIFO で1ms差、
   チャンクの start が 288,288,296,296,... と重複）。`atomic_cas` の実行中ガードで解決。
   署名イメージ 253943 B。
+- 2026-09-02: 0.0.94（single/double notify-only）。single の FW 録音トグルを廃止し、
+  ホストが RX `0x01`/`0x00` で start/stop。パススルー中 single は G2 ページ送り専用。
+  Android アプリとセットで更新すること。

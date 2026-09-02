@@ -82,6 +82,8 @@ static const char *TAG = "voice_bridge";
 #define EVENT_RECORDING_STARTED 0x01
 #define EVENT_RECORDING_STOPPED 0x02
 #define EVENT_CONVERSATION_TOGGLED 0x03
+#define EVENT_DOUBLE_TAP 0x12
+#define EVENT_SINGLE_TAP 0x14
 
 // BLE UUIDs
 static ble_uuid128_t gatt_svr_svc_sec_uuid = BLE_UUID128_INIT(0x00, 0x00, 0x00, 0x00,
@@ -179,21 +181,16 @@ static void request_recording_stop(const char *source)
 
 static void emulate_single_click(const char *source)
 {
-    ESP_LOGI(TAG, "%s: Emulating single-click", source);
-    if (is_recording || recording_requested) {
-        request_recording_stop(source);
-    } else {
-        request_recording_start(source);
-    }
+    /* Notify-only; host starts/stops recording via RX 0x01 / 0x00. */
+    ESP_LOGI(TAG, "%s: Single click (host-authorized recording)", source);
+    send_status_event(EVENT_SINGLE_TAP, "single_tap");
 }
 
 static void emulate_double_click(const char *source)
 {
-    ESP_LOGI(TAG, "%s: Emulating double-click", source);
-    if (is_recording || recording_requested) {
-        request_recording_stop(source);
-    }
-    send_status_event(EVENT_CONVERSATION_TOGGLED, "conversation_toggled");
+    /* Notify-only; host owns passthrough toggle / interrupt. */
+    ESP_LOGI(TAG, "%s: Double click", source);
+    send_status_event(EVENT_DOUBLE_TAP, "double_tap");
 }
 
 static void handle_serial_command(uint8_t command, const char *source)

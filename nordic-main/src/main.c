@@ -2211,31 +2211,17 @@ static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
         tap_last_double_ms = now;
     }
 
-    /* Single tap toggles recording in every operation mode.  Double tap is
-     * notify-only (Kindle / G2 / host control).  Require a primary BLE peer so
-     * an unconnected recording cannot start with nowhere to deliver PCM. */
+    /* Single tap is notify-only.  The host decides whether to start/stop
+     * recording via RX 0x01 / 0x00 (passthrough mode uses single tap for G2
+     * page advance instead).  Double tap is also notify-only. */
     if (!is_double) {
-        if (!get_primary_conn()) {
-            printk(">>> Single tap ignored: no primary connection\n");
-            return;
-        }
-        if (is_recording) {
-            stop_requested = true;
-            printk(">>> Single tap: recording stop\n");
-        } else if (recording_requested) {
-            recording_requested = false;
-            printk(">>> Single tap: pending start cancelled\n");
-        } else {
-            stop_requested = false;
-            recording_requested = true;
-            printk(">>> Single tap: recording start\n");
-        }
         last_activity_ms = now;
         if (light_sleep_active) {
             light_sleep_active = false;
             send_event_packet(0x21);
             printk(">>> Light sleep wake (single tap)\n");
         }
+        printk(">>> Single tap detected (TAP_SRC=0x%02x)\n", tap_src);
         send_event_packet(EVT_SINGLE_TAP);
         return;
     }
