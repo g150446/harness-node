@@ -274,10 +274,10 @@ The Seeed XIAO nRF54L15 Sense board shares a single fixed regulator (`pdm_imu_pw
 This is why the `nrf54-handy/` firmware keeps `pdm_imu_pwr` ON for the entire BLE session (enabling both IMU gesture detection and PDM recording) and turns it OFF only when BLE is disconnected. By contrast, the `nordic-main/` firmware for nRF52840 Sense can toggle microphone power individually via the dedicated `msm261d3526hicpm-c-en` regulator (P1.10), achieving better battery life for gesture-triggered recording use cases.
 
 The standalone [`pdm_power_test/`](pdm_power_test/README.md) app measures whether
-stopping PDM returns current to the IMU-only baseline while keeping the
-accelerometer active at 416 Hz. It compares ordinary STOP, disconnected sleep
-pinctrl, forced-low PDM clock, and device suspend. This is an effective-sleep
-test; it does not claim that microphone VDD can be switched independently.
+the shared IMU/microphone rail and an active PDM stream create measurable current
+steps. It cycles every 20 seconds through both devices powered off, shared power
+on with the IMU powered down and microphone asleep, and the same state with the
+microphone active.
 
 For details, see `docs/nrf54_power_management.md`.
 
