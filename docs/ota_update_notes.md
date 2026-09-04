@@ -90,3 +90,6 @@
 - 2026-09-02: 0.0.94（single/double notify-only）。single の FW 録音トグルを廃止し、
   ホストが RX `0x01`/`0x00` で start/stop。パススルー中 single は G2 ページ送り専用。
   Android アプリとセットで更新すること。
+- 2026-09-04: 0.0.95（ジェスチャー検出スイッチ）。RX `0x07` / TX `0x3A`、既定 OFF（タップのみ）。
+  253887 B を 51.9 s でアップロード。slot 0 `active=true` / `confirmed=true` /
+  version=`0.0.95` / hash=`e1d126db89819e5f` を確認済み（直前の 0.0.94 は slot 1 へ）。

@@ -332,16 +332,20 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define GESTURE_DIAG_RESET                     0x80
 #define GESTURE_DEBUG_FINAL_PERIOD_MS           100
 
-/* Operation mode controlled by the Android companion.  NORMAL preserves the
- * existing gesture behaviour; DRIVING disables gesture start/stop.  Single
- * tap toggles recording in both modes; double tap is notify-only. */
+/* Operation mode controlled by the Android companion.  NORMAL allows gesture
+ * start/stop only when gesture_detect is also on; DRIVING disables gesture
+ * start/stop.  Single tap toggles recording in both modes; double tap is
+ * notify-only.  Gesture detect itself is a separate runtime switch (0x07),
+ * default off, because false triggers dominate everyday use. */
 #define CMD_SET_OPERATION_MODE                  0x05
 #define CMD_SET_GESTURE_CAPTURE                 0x06
+#define CMD_SET_GESTURE_DETECT                  0x07
 #define OPERATION_MODE_NORMAL                   0x00
 #define OPERATION_MODE_DRIVING                 0x01
 #define OPERATION_MODE_PENDING_NONE             0xff
 #define EVT_OPERATION_MODE                     0x40
 #define EVT_GESTURE_CAPTURE                    0x39
+#define EVT_GESTURE_DETECT                     0x3A
 
 /* History batch events (only when GESTURE_DEBUG_HISTORY=1). */
 #define EVT_GESTURE_HISTORY_BEGIN             0x33
@@ -666,6 +670,11 @@ static float gesture_gyro_roll_deg;
 static float gesture_gyro_peak_abs_dps;
 static float gesture_gyro_x_peak_abs_dps;
 static float gesture_outbound_gyro_sign;
+
+/* Runtime switch for wrist-gesture start/stop. Off at boot so everyday wear
+ * is tap-only until the companion opts in. RAM only; the phone re-asserts on
+ * every connect (same pattern as gesture_capture). Driving mode still wins. */
+static bool gesture_detect_enabled;
 
 /* Runtime switch for the IMU trajectory dump (0x36/0x37/0x38) and the
  * milestone batch (0x33/0x34/0x35). Off at boot: one gesture attempt costs
@@ -1084,6 +1093,8 @@ static void send_tap_src_raw(uint8_t tap_src, int ret);
 static void send_tap_reg_ack(uint8_t reg, uint8_t value, int ret);
 static void apply_pending_operation_mode(void);
 static void send_operation_mode_status(void);
+static bool gesture_detect_effective(void);
+static void send_gesture_detect_status(void);
 static bool gesture_capture_effective(void);
 static void send_gesture_capture_status(void);
 static void notify_all_conns(const void *data, uint16_t len);
@@ -2228,7 +2239,8 @@ static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
 
     /* Double tap: discard any in-progress start-gesture dwell so a tap does
      * not become palm-up still.  No recording toggle. */
-    if (operation_mode != OPERATION_MODE_DRIVING &&
+    if (gesture_detect_effective() &&
+        operation_mode != OPERATION_MODE_DRIVING &&
         !is_recording && !recording_requested) {
 #if GESTURE_DEBUG_HISTORY
         if (gesture_trajectory_committed) {
@@ -2470,10 +2482,11 @@ static void process_gesture_sample(float ax, float ay, float az,
                                    int64_t now)
 {
 
-    /* In driving mode the hardware double-tap is the only recording control.
-     * Keep the IMU sampler alive for that interrupt, but do not let ordinary
-     * motion samples arm or advance the gesture state machine. */
-    if (operation_mode == OPERATION_MODE_DRIVING && !is_recording) {
+    /* Gesture detect off or driving: keep the IMU sampler alive for hardware
+     * tap interrupts, but do not let ordinary motion samples arm or advance
+     * the gesture state machine. Tap recording is host-authorized via RX. */
+    if ((!gesture_detect_effective() ||
+         operation_mode == OPERATION_MODE_DRIVING) && !is_recording) {
         return;
     }
 
@@ -2500,7 +2513,8 @@ static void process_gesture_sample(float ax, float ay, float az,
                                     gx_raw_dps, gy_raw_dps, gz_raw_dps);
         }
 #endif
-        if (operation_mode != OPERATION_MODE_DRIVING && !stop_requested) {
+        if (gesture_detect_effective() &&
+            operation_mode != OPERATION_MODE_DRIVING && !stop_requested) {
             process_recording_stop_sample(ax, ay, az, gy_dps, gyro_ok,
                                           dt_s, now);
         }
@@ -3431,6 +3445,23 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
             printk(">>> Gesture capture: %s\n",
                    gesture_capture_effective() ? "ON" : "OFF");
             send_gesture_capture_status();
+        } else if (data[0] == CMD_SET_GESTURE_DETECT && len >= 2) {
+            gesture_detect_enabled = (data[1] != 0);
+            if (!gesture_detect_enabled &&
+                !is_recording && !recording_requested) {
+#if GESTURE_DEBUG_HISTORY
+                if (gesture_trajectory_committed) {
+                    gesture_trajectory_finish(2, GESTURE_DIAG_REASON_SEQUENCE_TIMEOUT);
+                } else if (gesture_trajectory_active) {
+                    gesture_trajectory_discard();
+                }
+#endif
+                reset_gesture_sequence();
+                gesture_rearm_required = true;
+            }
+            printk(">>> Gesture detect: %s\n",
+                   gesture_detect_effective() ? "ON" : "OFF");
+            send_gesture_detect_status();
         } else if (data[0] == CMD_IMU_REG_WRITE && len >= 3) {
             uint8_t reg = data[1];
             uint8_t val = data[2];
@@ -3505,6 +3536,21 @@ static void send_gesture_capture_status(void)
 {
     uint8_t pkt[4] = {0x00, 0x55, EVT_GESTURE_CAPTURE,
                       gesture_capture_effective() ? 1 : 0};
+
+    notify_all_conns(pkt, sizeof(pkt));
+}
+
+/* Gesture detect is independent of capture and of driving mode. */
+static bool gesture_detect_effective(void)
+{
+    return gesture_detect_enabled;
+}
+
+/* Detect switch ack: [0x00][0x55][0x3A][enabled]. */
+static void send_gesture_detect_status(void)
+{
+    uint8_t pkt[4] = {0x00, 0x55, EVT_GESTURE_DETECT,
+                      gesture_detect_effective() ? 1 : 0};
 
     notify_all_conns(pkt, sizeof(pkt));
 }
@@ -3607,13 +3653,17 @@ static void send_pending_greetings(void)
                           operation_mode, operation_mode_pending};
         bt_gatt_notify(connections[i], &audio_svc.attrs[2], pkt, sizeof(pkt));
 
-        /* Capture lives in RAM and a reset clears it, so state the truth here
-         * rather than leaving the host to assume its last request survived. */
+        /* Capture and detect live in RAM and a reset clears them, so state the
+         * truth here rather than leaving the host to assume last request. */
         uint8_t cap[4] = {0x00, 0x55, EVT_GESTURE_CAPTURE,
                           gesture_capture_effective() ? 1 : 0};
         bt_gatt_notify(connections[i], &audio_svc.attrs[2], cap, sizeof(cap));
-        printk(">>> Greeted conn[%d]: mode=%u capture=%u\n", i, operation_mode,
-               cap[3]);
+
+        uint8_t det[4] = {0x00, 0x55, EVT_GESTURE_DETECT,
+                          gesture_detect_effective() ? 1 : 0};
+        bt_gatt_notify(connections[i], &audio_svc.attrs[2], det, sizeof(det));
+        printk(">>> Greeted conn[%d]: mode=%u capture=%u detect=%u\n", i,
+               operation_mode, cap[3], det[3]);
 
         /* send_tap_diag() notifies every client; an extra copy for an already
          * connected peer is harmless and keeps the I2C reads in one place. */

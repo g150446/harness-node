@@ -1,6 +1,8 @@
 # HarnessNode / nordic-main ファームウェア運用ガイド
 
-`harness-node` リポジトリで現在メインとなっている、XIAO nRF52840 Sense 向けのジェスチャートリガー式 BLE 音声ファームウェアです。腕の動きを IMU で検知し、録音の開始・停止を自動制御します。
+`harness-node` リポジトリで現在メインとなっている、XIAO nRF52840 Sense 向けの BLE 音声ファームウェアです。
+**既定はシングルタップ録音**（ホスト承認）。手首ジェスチャーは実行時スイッチ（RX `0x07`）で
+opt-in したときだけ自律 start/stop する（FW `0.0.95+`）。
 
 ---
 
@@ -15,10 +17,10 @@
 | PDM マイク | DMIC（Zephyr DMIC API、RIGHT チャンネル、マイク電源制御あり） |
 | IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
-| LED 方針 | 起動後は待機時消灯。録音ジェスチャー成立後の録音中のみ赤 |
-| 署名バージョン（目安） | `0.0.94+`（single/double は notify-only。録音はホスト RX またはジェスチャー） |
+| LED 方針 | 起動後は待機時消灯。録音中のみ赤 |
+| 署名バージョン（目安） | `0.0.95+`（ジェスチャー検出 既定 OFF。single/double notify-only） |
 | OTA 手順 | [`ota_update_notes.md`](ota_update_notes.md) |
-| Android / Handy single_tap | `0x14` notify-only。ホストが RX `0x01`/`0x00` で録音。パススルー中は G2 ページ送り |
+| 録音操作 | 既定: シングルタップ（ホスト RX）。ジェスチャーは RX `0x07=1` かつ通常モード時のみ |
 
 ---
 
@@ -163,16 +165,18 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 
 | コード | イベント名 | オプションデータ | 説明 |
 |--------|-----------|----------------|------|
-| `0x01` | `recording_start` | なし | 録音開始（ジェスチャートリガー後） |
+| `0x01` | `recording_start` | なし | 録音開始（ホスト RX またはジェスチャー検出 ON 時） |
 | `0x02` | `recording_stop` | なし | 録音停止 |
 | `0x10` | `motion_active` | x, y, z f32 LE（各 4 byte） | モーション検出開始、xyz 加速度値 |
 | `0x11` | `motion_settled` | x, y, z f32 LE + elapsed_ms u32 + avg/peak_speed/distance f32 LE（計 28 bytes） | モーション静定、詳細メトリクス |
 | `0x12` | `double_tap` | なし | リストバンド表側から基板面へ垂直に行ったダブルタップ |
 | `0x14` | `single_tap` | なし | 同上のシングルタップ（間隔窓を超えた単独衝撃） |
+| `0x39` | `gesture_capture` | enabled u8 | IMU 軌跡収集スイッチ ack（既定 OFF） |
+| `0x3A` | `gesture_detect` | enabled u8 | ジェスチャー検出スイッチ ack（既定 OFF、`0.0.95+`） |
 | `0x40` | `operation_mode` | effective mode u8 + pending mode u8 | Android設定モードの同期状態（0=通常、1=運転、0xff=pendingなし）。要求受理時と適用時の2回、**全接続へ**送る |
 | `0x20` | `sleep_enter` | なし | ライトスリープ移行（10 秒無動作） |
 | `0x21` | `sleep_wake` | なし | ライトスリープ復帰（モーション検出） |
-| `0x30` | `gesture_diag` | stage/reason u8 + value1/2/3 f32 LE | USBなしのジェスチャー内部診断 |
+| `0x30` | `gesture_diag` | stage/reason u8 + value1/2/3 f32 LE | USBなしのジェスチャー内部診断（検出 ON 時のみ） |
 | `0xD0` | `tap_diag` | read_ret i8 + CTRL1_XL/CTRL6_C/TAP_CFG/TAP_THS_6D/INT_DUR2/WAKE_UP_THS/MD1_CFG/INT1_CTRL u8 + nonzero_count u16 LE + int1_level i8 | タップ関連レジスタのスナップショット（接続確立時に1回。任意タイミングの個別読み出しは RX `0x51` → `0xD2`） |
 | `0xD1` | `tap_src_raw` | TAP_SRC u8 + read_ret i8 | 判定に使った生の `TAP_SRC`。タップ1回につき1パケット |
 | `0xD2` | `imu_reg_ack` | reg u8 + 読み戻し値 u8 + ret i8 | RX `0x50` / `0x51` への応答 |
@@ -180,6 +184,10 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 ---
 
 ## ジェスチャー検出アルゴリズム
+
+**FW `0.0.95+`:** ジェスチャー状態機械は `gesture_detect_enabled`（RX `[0x07,e]`、
+TX `0x3A` ack）が ON **かつ** 通常モードのときだけ動く。既定 OFF＝タップのみ。
+フラグは RAM のみで、接続時 greeting でも `0x3A` を送る。IMU 軌跡収集（`0x06`）とは独立。
 
 この章は運用時の概要です。軸調査の根拠、判定式、状態遷移、全閾値、既知の
 制約、実機テスト項目は [掌上0.5秒静止→挙上→掌下静止仕様](flex_pronation_gesture.md)
@@ -248,13 +256,17 @@ LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側に�
 | 運転 | 同上（ジェスチャー無効） | 通知のみ（録音不変） |
 
 録音 start/stop はホストが RX `0x01` / `0x00` で指示する（パススルー中の single はページ送り専用で RX を送らない）。
-手首ジェスチャーによる録音は従来どおり Node 自律。
+手首ジェスチャーによる録音は、検出スイッチ ON かつ通常モードのときだけ Node 自律。
 
-Android は RX characteristic に `[0x05, mode]`（`mode=0` 通常、`mode=1` 運転）を
-書き込み、Node は `0x40`（`[0x00,0x55,0x40,effective,pending]`）で応答する。
-録音中のモード変更は pending として保持し、録音停止後に適用する。
+Android は RX characteristic に:
+
+- `[0x05, mode]`（`mode=0` 通常、`mode=1` 運転）→ ack `0x40`
+- `[0x07, e]`（ジェスチャー検出、既定 OFF）→ ack `0x3A`
+- `[0x06, e]`（IMU 軌跡収集、既定 OFF）→ ack `0x39`
+
+録音中の運転モード変更は pending として保持し、録音停止後に適用する。
 ライトスリープ中は復帰し、タップが掌上静止開始ジェスチャーとして
-扱われないよう、待機中の開始候補を破棄する（通常モード）。
+扱われないよう、待機中の開始候補を破棄する（検出 ON かつ通常モード）。
 
 `0x40` の送信タイミング（`0.0.88+`）:
 
