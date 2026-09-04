@@ -117,6 +117,8 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define EVT_DOUBLE_TAP                 0x12
 #define EVT_SINGLE_TAP                 0x14
 #define TAP_COOLDOWN_MS                 700
+/* After a confirmed double, ignore residual singles (vibration / bounce). */
+#define SINGLE_AFTER_DOUBLE_SUPPRESS_MS 1500
 /*
  * INT1 asserts on the FIRST strike because MD1_CFG routes single tap as well as
  * double.  TAP_SRC must not be read yet: with LIR=1 the read clears the latch
@@ -2322,7 +2324,11 @@ static void process_tap_event(int64_t now)
     }
 
     if (is_single) {
-        if ((now - tap_last_single_ms) >= TAP_COOLDOWN_MS) {
+        if (tap_last_double_ms > 0 &&
+            (now - tap_last_double_ms) < SINGLE_AFTER_DOUBLE_SUPPRESS_MS) {
+            printk(">>> Single tap dropped: %lld ms after double (TAP_SRC=0x%02x)\n",
+                   (long long)(now - tap_last_double_ms), tap_src);
+        } else if ((now - tap_last_single_ms) >= TAP_COOLDOWN_MS) {
             emit_tap_event(now, false, tap_src);
         } else {
             printk(">>> Single tap dropped: cooldown %lld ms (TAP_SRC=0x%02x)\n",
