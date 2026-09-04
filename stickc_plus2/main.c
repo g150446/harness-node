@@ -180,7 +180,10 @@ static int ble_app_gap_event(struct ble_gap_event *event, void *arg);
 static void request_recording_stop(const char *source);
 static void refresh_status_display(void);
 static void log_conn_params(const char *when);
-static void request_fast_conn_params(void *arg);
+static void request_conn_params(bool fast);
+static void deferred_idle_conn_params(void *arg);
+static bool conn_interval_is_fast(void);
+static bool wait_for_fast_conn_params(uint32_t timeout_ms);
 static void on_ota_busy(bool busy);
 static esp_err_t set_microphone_enabled(bool enabled);
 static esp_err_t init_audio(const mic_pdm_cfg_t *cfg);
@@ -242,6 +245,11 @@ static void request_recording_start(const char *source)
     ESP_LOGI(TAG, "%s: Start recording requested", source);
     stop_requested = false;
     recording_requested = true;
+    /* Need 7.5–15 ms before PCM; request immediately (not via 500 ms timer). */
+    if (conn_param_timer != NULL) {
+        (void)esp_timer_stop(conn_param_timer);
+    }
+    request_conn_params(true);
     refresh_status_display();
 }
 
@@ -257,6 +265,8 @@ static void request_recording_stop(const char *source)
     stop_requested = true;
     stop_event_pending = was_recording;
     led_set(false);
+    /* Drop back to idle radio ASAP; safe even if stream task still winding down. */
+    request_conn_params(false);
     refresh_status_display();
 }
 
@@ -282,6 +292,7 @@ static void emulate_single_click(const char *source)
     } else if (recording_requested) {
         recording_requested = false;
         ESP_LOGI(TAG, "%s: Pending recording start cancelled", source);
+        request_conn_params(false);
         apply_pending_operation_mode();
         refresh_status_display();
     } else {
@@ -298,33 +309,100 @@ static void emulate_double_click(const char *source)
 }
 
 /*
- * Centrals typically settle on a ~30 ms interval, which tops out around
- * 130 notifications/s - below the ~160/s that 16 kHz mono PCM needs, so the
- * mbuf pool drains and audio is dropped. nordic-main asks for 7.5-15 ms for
- * the same reason (see nordic-main/src/main.c conn_param_work_handler).
- * Deferred off the GAP callback: centrals commonly ignore a request made
- * before the link has settled.
+ * Fast params (7.5–15 ms): required while streaming 16 kHz mono PCM
+ * (~160 notif/s). Without them the mbuf pool drains and audio is dropped
+ * (see docs/stickc_plus2_guide.md). Idle params (50–100 ms): used whenever
+ * connected but not recording to cut radio wakeups. Latency stays 0 so
+ * START/STOP still arrive within one interval.
+ *
+ * Do not call ble_gap_update_params from inside a GAP callback; defer via
+ * esp_timer (connect path) or call from the audio/button/uart tasks.
  */
-static void request_fast_conn_params(void *arg)
+#define CONN_ITVL_FAST_MIN       6    /* 7.5 ms  */
+#define CONN_ITVL_FAST_MAX       12   /* 15 ms   */
+#define CONN_ITVL_IDLE_MIN       40   /* 50 ms   */
+#define CONN_ITVL_IDLE_MAX       80   /* 100 ms  */
+#define CONN_SUPERVISION_TO      400  /* 4 s, 10 ms units */
+#define CONN_FAST_GATE_TIMEOUT_MS 500
+
+static void request_conn_params(bool fast)
 {
-    (void)arg;
     if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
         return;
     }
     struct ble_gap_upd_params p = {
-        .itvl_min = 6,               /* 7.5 ms */
-        .itvl_max = 12,              /* 15 ms  */
+        .itvl_min = fast ? CONN_ITVL_FAST_MIN : CONN_ITVL_IDLE_MIN,
+        .itvl_max = fast ? CONN_ITVL_FAST_MAX : CONN_ITVL_IDLE_MAX,
         .latency = 0,
-        .supervision_timeout = 400,  /* 4 s, in 10 ms units */
+        .supervision_timeout = CONN_SUPERVISION_TO,
         .min_ce_len = 0,
         .max_ce_len = 0,
     };
     int rc = ble_gap_update_params(audio_conn_handle, &p);
     if (rc != 0) {
-        ESP_LOGW(TAG, "conn param update request failed rc=%d", rc);
+        ESP_LOGW(TAG, "conn param update (%s) failed rc=%d",
+                 fast ? "fast" : "idle", rc);
     } else {
-        ESP_LOGI(TAG, "conn param update requested (7.5-15 ms)");
+        /* itvl is 1.25 ms units → print as N.xx ms without float printf. */
+        const unsigned min_us = (unsigned)p.itvl_min * 1250u;
+        const unsigned max_us = (unsigned)p.itvl_max * 1250u;
+        ESP_LOGI(TAG, "conn param update requested (%s: %u.%02u-%u.%02u ms)",
+                 fast ? "fast" : "idle",
+                 min_us / 1000u, (min_us % 1000u) / 10u,
+                 max_us / 1000u, (max_us % 1000u) / 10u);
     }
+}
+
+/* Connect +500 ms: ask for idle unless a recording start already raced in. */
+static void deferred_idle_conn_params(void *arg)
+{
+    (void)arg;
+    if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+    if (is_recording || recording_requested) {
+        ESP_LOGI(TAG, "skip deferred idle conn params (recording)");
+        return;
+    }
+    request_conn_params(false);
+}
+
+static bool conn_interval_is_fast(void)
+{
+    struct ble_gap_conn_desc desc;
+    if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE ||
+        ble_gap_conn_find(audio_conn_handle, &desc) != 0) {
+        return false;
+    }
+    return desc.conn_itvl > 0 && desc.conn_itvl <= CONN_ITVL_FAST_MAX;
+}
+
+/* Wait until the link is fast enough for PCM, or timeout (host may refuse). */
+static bool wait_for_fast_conn_params(uint32_t timeout_ms)
+{
+    if (conn_interval_is_fast()) {
+        log_conn_params("fast already");
+        return true;
+    }
+    request_conn_params(true);
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (stop_requested || !recording_requested) {
+            return false;
+        }
+        if (audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            return false;
+        }
+        if (conn_interval_is_fast()) {
+            log_conn_params("fast gate ok");
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    log_conn_params("fast gate timeout");
+    ESP_LOGW(TAG, "fast conn params not confirmed within %u ms; streaming anyway",
+             (unsigned)timeout_ms);
+    return false;
 }
 
 static void log_conn_params(const char *when)
@@ -722,6 +800,9 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "BLE disconnected (reason=0x%04x)", event->disconnect.reason);
+        if (conn_param_timer != NULL) {
+            (void)esp_timer_stop(conn_param_timer);
+        }
         audio_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         is_recording = false;
         recording_requested = false;
@@ -740,6 +821,10 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_CONN_UPDATE:
         log_conn_params("conn update");
+        /* ble_gap_update_params is unsafe here; start gate / stop paths re-request. */
+        if ((is_recording || recording_requested) && !conn_interval_is_fast()) {
+            ESP_LOGW(TAG, "conn update left interval slow while recording");
+        }
         break;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -1263,9 +1348,13 @@ static void audio_stream_task(void *pvParameters)
 
         if (recording_requested && !is_recording) {
             ESP_LOGI(TAG, "Starting recording...");
+            /* Overlap fast-link negotiation with mic bring-up. */
+            request_conn_params(true);
             if (set_microphone_enabled(true) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to enable microphone");
                 recording_requested = false;
+                request_conn_params(false);
+                refresh_status_display();
                 continue;
             }
             /* Settle DC: feed IIR until residual is small, with timeout. */
@@ -1276,6 +1365,9 @@ static void audio_stream_task(void *pvParameters)
                 bool ok = false;
                 while ((esp_timer_get_time() - t0) <
                        (int64_t)MIC_START_DISCARD_MS * 1000) {
+                    if (stop_requested || !recording_requested) {
+                        break;
+                    }
                     esp_err_t rd = i2s_channel_read(i2s_rx_handle, i2s_buffer,
                                                     i2s_buffer_bytes, &bytes_read,
                                                     MIC_READ_TIMEOUT_MS);
@@ -1308,6 +1400,27 @@ static void audio_stream_task(void *pvParameters)
                 ESP_LOGI(TAG, "Mic DC settle offset=%d %s (%u ms)",
                          (int)mic_dc_offset, ok ? "ok" : "timeout",
                          (unsigned)((esp_timer_get_time() - t0) / 1000));
+            }
+            if (stop_requested || !recording_requested) {
+                ESP_LOGI(TAG, "Recording start aborted during settle");
+                (void)set_microphone_enabled(false);
+                recording_requested = false;
+                request_conn_params(false);
+                led_set(false);
+                refresh_status_display();
+                continue;
+            }
+            /* Prefer fast interval before first PCM notify; do not block forever. */
+            (void)wait_for_fast_conn_params(CONN_FAST_GATE_TIMEOUT_MS);
+            if (stop_requested || !recording_requested ||
+                audio_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+                ESP_LOGI(TAG, "Recording start aborted during conn gate");
+                (void)set_microphone_enabled(false);
+                recording_requested = false;
+                request_conn_params(false);
+                led_set(false);
+                refresh_status_display();
+                continue;
             }
             mic_level_log_left = I2S_SAMPLE_RATE; /* raw+proc stats for ~1 s */
             mic_raw_stats_init(&raw_log_stats);
@@ -1349,6 +1462,7 @@ static void audio_stream_task(void *pvParameters)
             stop_requested = false;
             stop_event_pending = false;
             led_set(false);
+            request_conn_params(false);
             apply_pending_operation_mode();
             refresh_status_display();
         }
@@ -1647,7 +1761,7 @@ void app_main(void)
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
 
     const esp_timer_create_args_t cp_args = {
-        .callback = request_fast_conn_params,
+        .callback = deferred_idle_conn_params,
         .name = "conn_param",
     };
     ESP_ERROR_CHECK(esp_timer_create(&cp_args, &conn_param_timer));

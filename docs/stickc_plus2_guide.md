@@ -41,7 +41,7 @@ idf.py -DHN_BOARD=stickc_plus2 -p /dev/cu.usbserial-XXXX flash monitor
 |-----------------|------|
 | `-DHN_BOARD=stickc_plus2` | コンポーネント `stickc_plus2/` をリンク |
 | `sdkconfig.defaults.esp32` | Flash 8MB、dual OTA、NimBLE、UART コンソール |
-| `stickc_plus2/VERSION` | `esp_app_desc.version`（現在 `0.1.5`） |
+| `stickc_plus2/VERSION` | `esp_app_desc.version`（単一の真実。ビルド前に読む） |
 
 **注意:** 以前 `esp32s3` でビルドした `build/` がある場合は退避してから `set-target esp32` する。
 
@@ -222,15 +222,65 @@ BL の G27 も同様に pulldown（浮かせるとバックライトが薄く光
 4. **USB を抜いて電池駆動**（本命）: 長押し → LCD 消灯 → BtnA をもう一度押す →
    **電源ボタンを使わずに** LCD が復帰すること。ここが通れば HOLD のグリッチは無い。
 
-### スリープ消費電力（調査）
+### 消費電力（接続中・非録音を含む）
 
 | 状態 | 目安 | 備考 |
 |------|------|------|
-| 起動中（LCD ON + BLE 広告） | 数十 mA | BL + RF が支配 |
+| 未接続（LCD ON + BLE 広告） | 数十 mA | BL + RF が支配 |
+| **BLE 接続・非録音** | 広告より低いが RF は生きる | **idle 接続間隔 50–100 ms**（下記） |
+| BLE 接続・録音中 | 高い | mic ON + fast 7.5–15 ms + PCM notify |
 | deep sleep（本実装） | **数十 µA〜1 mA 未満（要実測）** | ESP32 単体 ~10 µA だが Plus2 は AXP 無しで LDO / BM8563 / MPU6886 等が常時通電 |
 | HOLD=0 完全オフ | ほぼ 0 | 今回の UX では不採用 |
 
-実測は電池経路に直列電流計（0.1 mA 分解能以上）を入れ、USB 非接続で (1) 起動中アイドル (2) deep sleep を比較すること。USB 給電中の値は電池駆動と一致しない。
+実測は電池経路に直列電流計（0.1 mA 分解能以上）を入れ、**USB 非接続**で
+(1) 未接続アイドル (2) 接続・非録音 (3) 録音 (4) deep sleep を比較すること。
+USB 給電中の値は電池駆動と一致しない。
+
+すでにゲート済み（接続中でも非録音ならオフ）:
+
+- マイク / PDM（`set_microphone_enabled`）
+- 録音 LED
+- BLE 広告（接続中は出さない。1 本リンク前提）
+
+#### 動的 BLE 接続間隔（省電力の本命）
+
+Mac / Handy 等に繋いだまま長時間放置すると、**接続間隔が短いほどラジオが頻繁に起きる**。
+16 kHz PCM には fast が必須だが、非録音では不要。`stickc_plus2/main.c` で切替する。
+
+| モード | interval | latency | いつ |
+|--------|----------|---------|------|
+| **idle** | 40–80（**50–100 ms**） | 0 | 接続後・非録音 |
+| **fast** | 6–12（**7.5–15 ms**） | 0 | 録音開始〜停止 |
+
+ライフサイクル（`request_conn_params` / `deferred_idle_conn_params`）:
+
+```
+CONNECT ──(+500 ms timer)──► idle
+     │
+     ├─ recording start ──► fast（即時）
+     │         │
+     │         └─ PCM 前: interval ≤15 ms 待ち（最大 500 ms、タイムアウト後も録音続行）
+     │
+     └─ stop / cancel ──► idle
+```
+
+- **latency は常に 0**（START/STOP が 1 interval 以上遅れない）
+- 接続直後タイマーは **idle**。録音中・開始要求中なら idle を出さない
+- mic DC settle と fast ネゴは重ねる。`EVENT_RECORDING_STARTED` はゲート後
+- **GAP コールバック内で `ble_gap_update_params` しない**（無視されやすい / ロック問題）
+
+検証ログの目安:
+
+1. 接続のみ → `conn param update requested (idle: 50.00-100.00 ms)` →
+   `Conn params (conn update): interval=…` が数十 ms 帯
+2. シリアル `r` → fast 要求 → `fast gate ok` または `fast gate timeout` →
+   10 s 後 `s` で TX summary の nomem がほぼ 0、pkt/s が ~160 以上
+3. 停止後 → 再び idle
+
+ホスト（特に一部 Mac）がパラメータを拒否する場合がある。そのときは
+ゲートがタイムアウトしても録音は止めない（品質は従来どおりホスト依存）。
+
+LCD バックライト消灯・自動 deep sleep は未実装（接続表示を優先）。
 
 ### 音声帯域（Handy へのストリーミング）
 
@@ -250,12 +300,11 @@ BL の G27 も同様に pulldown（浮かせるとバックライトが薄く光
 一度も失敗しないので `notify failed` は 0 のまま、音声だけが虫食いになり
 STT が通らない。
 
-`nordic-main` は同じ理由で 7.5–15 ms を要求している
-（`nordic-main/src/main.c` の `conn_param_work_handler`）。Plus2 も接続 500 ms 後に
-`ble_gap_update_params()` で同じ値を要求する。**GAP コールバック内で呼ばない** —
-リンクが落ち着く前の要求はセントラルに無視されやすい。
+録音中は上記 **fast（7.5–15 ms）** が必須。`nordic-main` も録音向けに同じ帯を使う
+（`conn_param_work_handler`。ただし nordic は primary を常時 fast のまま — Plus2 のみ
+非録音 idle 切替を入れている）。
 
-実測（10 秒録音、シリアル `r` → `s`）:
+実測（10 秒録音、シリアル `r` → `s`、fast 常時要求時代）:
 
 | | 要求なし | 7.5–15 ms 要求 + プール 48 |
 |---|---|---|
