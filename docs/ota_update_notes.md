@@ -93,3 +93,10 @@
 - 2026-09-04: 0.0.95（ジェスチャー検出スイッチ）。RX `0x07` / TX `0x3A`、既定 OFF（タップのみ）。
   253887 B を 51.9 s でアップロード。slot 0 `active=true` / `confirmed=true` /
   version=`0.0.95` / hash=`e1d126db89819e5f` を確認済み（直前の 0.0.94 は slot 1 へ）。
+- 2026-09-04: 0.0.96（タップ閾値 0.5 g → 1.0 g、`TAP_THS_6D=0x10`）。
+  253943 B を 52.4 s でアップロード。slot 0 `active=true` / `confirmed=true` /
+  version=`0.0.96` / hash=`c3c7ff2e558cdf88` を確認済み（直前の 0.0.95 は slot 1 へ）。
+- 2026-09-04: 0.0.97（タップ閾値 +1 段階、`TAP_THS_6D=0x11` ≈ 1.0625 g）。
+  253947 B を 1295 s でアップロード（他 BLE 接続競合で低速）。slot 0 `active=true` /
+  `confirmed=true` / version=`0.0.97` / hash=`61cc3cd193bf9d82` を確認済み
+  （直前の 0.0.96 は slot 1 へ）。

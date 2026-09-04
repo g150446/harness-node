@@ -104,7 +104,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
  * LSM6DS3TR-C hardware single/double-tap detection.  Zephyr's NCS 2.9.2
  * LSM6DSL driver only exposes DATA_READY triggers, so the application
  * configures the embedded-function registers directly and reuses the driver's
- * INT1 plumbing.  At +/-2 g, TAP_THS=8 is 0.5 g.  At 416 Hz, INT_DUR2=0x4a
+ * INT1 plumbing.  At +/-2 g, TAP_THS=17 is 1.0625 g.  At 416 Hz, INT_DUR2=0x4a
  * gives about 38 ms shock, 19 ms quiet, and 308 ms between taps.  With
  * double-tap enable set, a lone tap asserts single after that gap; a second
  * tap inside the gap asserts double instead.
@@ -143,7 +143,7 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define LSM6DS3TR_C_TAP_CFG_MASK       (BIT(7) | BIT(3) | BIT(2) | BIT(1) | BIT(0))
 #define LSM6DS3TR_C_TAP_CFG_Z_LATCHED  (BIT(7) | BIT(1) | BIT(0))
 #define LSM6DS3TR_C_TAP_THS_MASK       0x1F
-#define LSM6DS3TR_C_TAP_THS_BALANCED   0x08
+#define LSM6DS3TR_C_TAP_THS_BALANCED   0x11
 #define LSM6DS3TR_C_INT_DUR_BALANCED   0x4A
 #define LSM6DS3TR_C_DOUBLE_TAP_ENABLE  BIT(7)
 #define LSM6DS3TR_C_MD1_TAP_MASK       (BIT(6) | BIT(3))
@@ -1345,7 +1345,7 @@ static int configure_tap_detection(void)
         return ret;
     }
 
-    LOG_INF("Tap ready: Z axis single+double, threshold=0.5g, gap<=308ms");
+    LOG_INF("Tap ready: Z axis single+double, threshold=1.0625g, gap<=308ms");
     return 0;
 
 register_error:
@@ -3375,9 +3375,17 @@ static ssize_t audio_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 
     if (len >= 1) {
         if (data[0] == 0x01) {
-            printk(">>> START command\n");
-            stop_requested = false;
-            recording_requested = true;
+            if (is_recording) {
+                /* Host thinks we are idle (e.g. after a missed 0x01/0x02).
+                 * Clear the stuck session then start again on the next loop. */
+                stop_requested = true;
+                recording_requested = true;
+                printk(">>> START while recording — restart\n");
+            } else {
+                printk(">>> START command\n");
+                stop_requested = false;
+                recording_requested = true;
+            }
         } else if (data[0] == 0x00) {
             printk(">>> STOP command\n");
             stop_requested = true;

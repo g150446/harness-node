@@ -44,7 +44,7 @@ DIAG_REGS = ["CTRL1_XL", "CTRL6_C", "TAP_CFG", "TAP_THS_6D",
 DIAG_EXPECT = {
     "CTRL1_XL": "ODR>=416Hz -> high nibble 0x6+",
     "TAP_CFG": "0x83 (INT_EN|TAP_Z|LIR)",
-    "TAP_THS_6D": "0x08 (0.5g)",
+    "TAP_THS_6D": "0x11 (1.0625g)",
     "INT_DUR2": "0x4a",
     "WAKE_UP_THS": "bit7 set (double enable)",
     "MD1_CFG": "bits 6+3 set (single+double)",

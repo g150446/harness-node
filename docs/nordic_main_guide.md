@@ -18,7 +18,7 @@ opt-in したときだけ自律 start/stop する（FW `0.0.95+`）。
 | IMU | LSM6DS3TR-C（加速度 ODR 416 Hz。ジャイロはオンデマンド 104 Hz） |
 | 音声フォーマット | 16 kHz / 16-bit / モノラル PCM |
 | LED 方針 | 起動後は待機時消灯。録音中のみ赤 |
-| 署名バージョン（目安） | `0.0.95+`（ジェスチャー検出 既定 OFF。single/double notify-only） |
+| 署名バージョン（目安） | `0.0.97+`（タップ閾値 ≈1.0625 g。ジェスチャー検出 既定 OFF） |
 | OTA 手順 | [`ota_update_notes.md`](ota_update_notes.md) |
 | 録音操作 | 既定: シングルタップ（ホスト RX）。ジェスチャーは RX `0x07=1` かつ通常モード時のみ |
 
@@ -135,7 +135,7 @@ west build -p always --sysbuild -b xiao_ble/nrf52840/sense \
 
 | バイト値 | 動作 |
 |---------|------|
-| `0x01` | 録音開始 |
+| `0x01` | 録音開始。既に録音中なら停止→再開始（ホストの状態ずれ救済、`0.0.97+`） |
 | `0x00` | 録音停止 |
 | `0x50 [reg] [val]` | IMUレジスタ書き込み（タップ関連のみ許可。`0xD2`で応答） |
 | `0x51 [reg]` | IMUレジスタ読み出し（`0xD2`で応答） |
@@ -248,7 +248,16 @@ BLE 接続はスリープ中も維持されます。録音停止後もタイマ�
 
 LSM6DS3TR-C のハードウェア判定を使用し、部品面を皮膚側にした装着状態で
 リストバンド表側から基板面へ垂直に行うタップを Z 軸で検出する。
-閾値は約 0.5 g、2 打の最大間隔（Duration）は約 308 ms、確定後のクールダウンは 700 ms。
+
+| パラメータ | 既定（FW `0.0.97+`） | 備考 |
+|------------|---------------------|------|
+| 閾値 `TAP_THS_6D` | `0x11`（≈ **1.0625 g**） | FS=±2 g 時 `THS` は 0–31 の 32 段階（1 LSB ≈ 0.0625 g）。小さいほど敏感 |
+| 2 打最大間隔 Duration | ≈ 308 ms（`INT_DUR2=0x4a`） | |
+| 分類待ち | 350 ms（`TAP_SRC_SETTLE_MS`） | Duration 閉じ後に `TAP_SRC` を1回読む |
+| クールダウン | 700 ms | single / double 別 |
+
+実行時調整は RX `0x50` で `TAP_THS_6D`（`0x59`）などへ書き込み可（再起動で既定に戻る）。
+OTA なしの試し書き例: `mac_client/tap_monitor.py --write 0x59:0x12`。
 
 | モード | single (`0x14`) | double (`0x12`) |
 |--------|-----------------|-----------------|
@@ -412,7 +421,7 @@ if (value != ccc->value) { ccc->value = value; ccc->cfg_changed(attr, value); }
 **接続直後に何かを通知したくなったら、`ble_connected()` でもCCCDコールバックでもなく、
 `bt_gatt_is_subscribed()` を接続ごとにポーリングすること。**
 
-正常時の期待値: `CTRL1_XL=0x60` `CTRL6_C=0x00` `TAP_CFG=0x83` `TAP_THS_6D=0x08`
+正常時の期待値: `CTRL1_XL=0x60` `CTRL6_C=0x00` `TAP_CFG=0x83` `TAP_THS_6D=0x11`
 `INT_DUR2=0x4a` `WAKE_UP_THS=0x80` `MD1_CFG=0x48` `INT1_CTRL=0x00`。
 
 Mac から `mac_client/tap_monitor.py` で観測する（macOSのBluetooth権限の都合で
