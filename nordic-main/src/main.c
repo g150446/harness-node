@@ -12,10 +12,11 @@
  *     RX 0x0003 (WRITE):  0x01=start, 0x00=stop
  *
  * LED states (active-low, Zephyr GPIO_ACTIVE_LOW flag handles inversion):
- *   Boot        White  1s then off
- *   Idle        Off    advertising / connected idle
- *   Recording   Red    solid
- *   Error       Red    200ms fast blink
+ *   Boot          White  1s then advertising or idle
+ *   Advertising   Blue   200ms on / 1800ms off (no connections)
+ *   Idle          Off    connected idle
+ *   Recording     Red    solid
+ *   Error         Red    200ms fast blink
  */
 
 #include <errno.h>
@@ -41,6 +42,7 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/bluetooth/services/bas.h>
 #include <zephyr/dfu/mcuboot.h>
+#include <zephyr/sys/poweroff.h>
 
 #include <hal/nrf_power.h>
 #include <math.h>
@@ -68,6 +70,9 @@ LOG_MODULE_REGISTER(nordic_main, LOG_LEVEL_INF);
 #define WDT_TIMEOUT_MS          5000
 #define MAIN_LOOP_INTERVAL_MS   25
 #define ERROR_BLINK_MS          200
+#define ADV_LED_ON_MS           200
+#define ADV_LED_OFF_MS          1800
+#define ADV_NO_CONN_SLEEP_MS    (3 * 60 * 1000)  /* unconnected this long → SYSTEMOFF */
 #define BATTERY_POLL_INTERVAL_MS 60000  /* 1 minute */
 #define BATTERY_CAPACITY_MAH        40   /* LiPo capacity in mAh */
 #define BATTERY_CHARGE_CURRENT_MA  100   /* BQ25120 charge current on XIAO nRF52840 */
@@ -455,6 +460,9 @@ static int active_count(void) {
 static uint8_t tx_packet[512];
 static uint8_t seq_num;
 static volatile bool is_recording;
+static int64_t last_tap_or_record_ms;
+static bool ble_primary_want_fast;
+static int64_t unconnected_since_ms;
 static volatile bool recording_requested;
 static volatile bool stop_requested;
 static volatile bool capture_enabled;
@@ -510,32 +518,59 @@ static struct k_work_delayable adv_work;
  * inside a BT/GATT callback where the BT lock is already held). */
 static struct k_work_delayable conn_param_work;
 
+static bool primary_conn_should_be_fast(void)
+{
+    if (is_recording) {
+        return true;
+    }
+    if (last_tap_or_record_ms == 0) {
+        return false;
+    }
+    return (k_uptime_get() - last_tap_or_record_ms) < SLEEP_IDLE_TIMEOUT_MS;
+}
+
+static void sync_primary_conn_speed(void)
+{
+    bool want_fast = primary_conn_should_be_fast();
+
+    if (want_fast == ble_primary_want_fast) {
+        return;
+    }
+    ble_primary_want_fast = want_fast;
+    k_work_schedule(&conn_param_work, K_MSEC(200));
+}
+
 static void conn_param_work_handler(struct k_work *work)
 {
-    /* Fast params for primary: 7.5–15 ms interval → max audio throughput */
+    ARG_UNUSED(work);
+    /* Fast params for primary while recording or shortly after a tap. */
     static const struct bt_le_conn_param fast_param = {
         .interval_min = 6,    /* 6 × 1.25 ms = 7.5 ms */
         .interval_max = 12,   /* 12 × 1.25 ms = 15 ms  */
         .latency      = 0,
         .timeout      = 400,
     };
-    /* Slow params for secondary: 200–500 ms → frees radio for primary */
+    /* Slow params: secondary always, and idle primary (no tap/record). */
     static const struct bt_le_conn_param slow_param = {
         .interval_min = 160,  /* 200 ms */
         .interval_max = 400,  /* 500 ms */
         .latency      = 0,
         .timeout      = 400,
     };
+    bool primary_fast = primary_conn_should_be_fast();
+
+    ble_primary_want_fast = primary_fast;
 
     for (int i = 0; i < MAX_CONNS; i++) {
         if (!connections[i]) continue;
-        const struct bt_le_conn_param *p = (i == primary_idx) ? &fast_param : &slow_param;
+        bool use_fast = (i == primary_idx) && primary_fast;
+        const struct bt_le_conn_param *p = use_fast ? &fast_param : &slow_param;
         int ret = bt_conn_le_param_update(connections[i], p);
         if (ret && ret != -EALREADY) {
             printk(">>> conn_param_update[%d] failed: %d\n", i, ret);
         } else {
             printk(">>> conn_param_update[%d]: %s\n", i,
-                   (i == primary_idx) ? "fast(7.5ms)" : "slow(200ms)");
+                   use_fast ? "fast(7.5ms)" : "idle(200ms)");
         }
     }
 }
@@ -786,6 +821,7 @@ static const struct gpio_dt_spec led_blue  = GPIO_DT_SPEC_GET(LED_BLUE_NODE,  gp
 typedef enum {
     LED_BOOT,
     LED_IDLE,
+    LED_ADVERTISING,
     LED_RECORDING,
     LED_ERROR,
 } led_state_t;
@@ -840,6 +876,11 @@ static void led_set_state(led_state_t state)
     case LED_IDLE:
         rgb_set(false, false, false); /* Off */
         break;
+    case LED_ADVERTISING:
+        rgb_set(false, false, true); /* Blue ON to start */
+        blink_on = true;
+        blink_next_ms = k_uptime_get() + ADV_LED_ON_MS;
+        break;
     case LED_RECORDING:
         rgb_set(true, false, false); /* Red solid */
         break;
@@ -861,6 +902,8 @@ static void led_sync_runtime_state(void)
 
     if (is_recording) {
         desired = LED_RECORDING;
+    } else if (active_count() == 0) {
+        desired = LED_ADVERTISING;
     }
 
     if (current_led_state != desired) {
@@ -878,6 +921,12 @@ static void led_tick(void)
             blink_on = !blink_on;
             rgb_set(blink_on, false, false);
             blink_next_ms = now + ERROR_BLINK_MS;
+        }
+    } else if (current_led_state == LED_ADVERTISING) {
+        if (now >= blink_next_ms) {
+            blink_on = !blink_on;
+            rgb_set(false, false, blink_on);
+            blink_next_ms = now + (blink_on ? ADV_LED_ON_MS : ADV_LED_OFF_MS);
         }
     } else if (current_led_state == LED_BOOT) {
         /* Turn off white after 1 second */
@@ -905,6 +954,7 @@ static void log_reset_cause(void)
     if (cause & RESET_SOFTWARE)   printk(" [SOFTWARE]");
     if (cause & RESET_CPU_LOCKUP) printk(" [CPU_LOCKUP]");
     if (cause & RESET_POR)        printk(" [POR — power-on]");
+    if (cause & RESET_LOW_POWER_WAKE) printk(" [LOW_POWER_WAKE — SYSTEMOFF]");
     if (cause == 0)               printk(" [POR — power-on / battery removed]");
     printk("\n");
 }
@@ -2229,6 +2279,8 @@ static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
      * page advance instead).  Double tap is also notify-only. */
     if (!is_double) {
         last_activity_ms = now;
+        last_tap_or_record_ms = now;
+        sync_primary_conn_speed();
         if (light_sleep_active) {
             light_sleep_active = false;
             send_event_packet(0x21);
@@ -2262,6 +2314,8 @@ static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
         printk(">>> Light sleep wake (double tap)\n");
     }
     last_activity_ms = now;
+    last_tap_or_record_ms = now;
+    sync_primary_conn_speed();
     printk(">>> Double tap detected (TAP_SRC=0x%02x)\n", tap_src);
     send_event_packet(EVT_DOUBLE_TAP);
 }
@@ -4341,6 +4395,8 @@ static void audio_thread(void *p1, void *p2, void *p3)
 
             is_recording = true;
             gyro_set_enabled(true);
+            last_tap_or_record_ms = k_uptime_get();
+            sync_primary_conn_speed();
             printk("Recording started\n");
             send_event_packet(0x01);
         }
@@ -4385,6 +4441,8 @@ static void audio_thread(void *p1, void *p2, void *p3)
             flush_gesture_history();
             battery_update();
             last_activity_ms = k_uptime_get();   /* reset idle timer after recording */
+            last_tap_or_record_ms = last_activity_ms;
+            sync_primary_conn_speed();
             continue;
         }
 
@@ -4529,16 +4587,9 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
         printk(">>> MTU exchange request failed: %d\n", ret);
     }
 
-    struct bt_le_conn_param conn_param = {
-        .interval_min = 6,
-        .interval_max = 12,
-        .latency = 0,
-        .timeout = 400,
-    };
-    ret = bt_conn_le_param_update(conn, &conn_param);
-    if (ret) {
-        LOG_WRN("Conn param update failed: %d", ret);
-    }
+    /* Idle connections stay at 200–500 ms until a tap or recording needs
+     * the fast audio interval.  Do not request params from this callback. */
+    k_work_schedule(&conn_param_work, K_MSEC(200));
 
     if (active_count() < MAX_CONNS) {
         /* Schedule advertising restart via work queue — calling bt_le_adv_start()
@@ -4595,6 +4646,77 @@ static struct bt_conn_cb conn_callbacks = {
     .disconnected = ble_disconnected,
 };
 
+static void enter_systemoff_for_tap_wake(void)
+{
+    uint8_t tap_src = 0;
+    int ret;
+
+    printk(">>> SYSTEMOFF: 3 min unconnected, double-tap to wake\n");
+    LOG_INF("Entering SYSTEMOFF; double-tap to resume advertising");
+
+    rgb_set(false, false, false);
+
+    if (wdt_channel_id >= 0) {
+        wdt_feed(wdt, wdt_channel_id);
+    }
+
+    (void)bt_le_adv_stop();
+
+    if (!device_is_ready(imu) || !i2c_is_ready_dt(&imu_i2c)) {
+        printk(">>> SYSTEMOFF aborted: IMU not ready\n");
+        k_work_schedule(&adv_work, K_MSEC(100));
+        unconnected_since_ms = k_uptime_get();
+        return;
+    }
+
+    (void)sensor_trigger_set(imu, &tap_trigger, NULL);
+
+    ret = i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_MD1_CFG,
+                                 LSM6DS3TR_C_MD1_TAP_MASK,
+                                 LSM6DS3TR_C_MD1_DOUBLE_TAP);
+    if (ret < 0) {
+        printk(">>> SYSTEMOFF aborted: MD1_CFG %d\n", ret);
+        goto restore_adv;
+    }
+
+    ret = i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
+    if (ret < 0) {
+        printk(">>> SYSTEMOFF aborted: TAP_SRC %d\n", ret);
+        goto restore_adv;
+    }
+
+    k_msleep(10);
+    if (gpio_pin_get_dt(&imu_int1) > 0) {
+        (void)i2c_reg_read_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_TAP_SRC, &tap_src);
+        k_msleep(10);
+    }
+    if (gpio_pin_get_dt(&imu_int1) > 0) {
+        printk(">>> SYSTEMOFF aborted: INT1 high (TAP_SRC=0x%02x)\n", tap_src);
+        goto restore_adv;
+    }
+
+    ret = gpio_pin_interrupt_configure_dt(&imu_int1, GPIO_INT_LEVEL_ACTIVE);
+    if (ret < 0) {
+        printk(">>> SYSTEMOFF aborted: INT1 sense %d\n", ret);
+        goto restore_adv;
+    }
+
+    if (wdt_channel_id >= 0) {
+        wdt_feed(wdt, wdt_channel_id);
+    }
+
+    sys_poweroff();
+
+restore_adv:
+    (void)i2c_reg_update_byte_dt(&imu_i2c, LSM6DS3TR_C_REG_MD1_CFG,
+                                 LSM6DS3TR_C_MD1_TAP_MASK,
+                                 LSM6DS3TR_C_MD1_SINGLE_TAP |
+                                 LSM6DS3TR_C_MD1_DOUBLE_TAP);
+    (void)sensor_trigger_set(imu, &tap_trigger, tap_irq_handler);
+    k_work_schedule(&adv_work, K_MSEC(100));
+    unconnected_since_ms = k_uptime_get();
+}
+
 /* ============================================================================
  * Main
  * ============================================================================ */
@@ -4638,6 +4760,9 @@ int main(void)
         }
     }
 
+    k_work_init_delayable(&adv_work, adv_work_handler);
+    k_work_init_delayable(&conn_param_work, conn_param_work_handler);
+
     ret = bt_enable(NULL);
     if (ret) { LOG_ERR("BLE enable failed: %d", ret); return ret; }
 
@@ -4651,10 +4776,6 @@ int main(void)
     if (ret) { LOG_ERR("BLE adv failed: %d", ret); return ret; }
 
     LOG_INF("BLE advertising: %s", BLE_DEVICE_NAME);
-
-    /* Initialize deferred advertising work */
-    k_work_init_delayable(&adv_work, adv_work_handler);
-    k_work_init_delayable(&conn_param_work, conn_param_work_handler);
 
     /* Capture runs above sender so DMIC blocks are freed under BLE backpressure. */
     k_thread_create(&audio_capture_thread_data, audio_capture_stack,
@@ -4670,12 +4791,20 @@ int main(void)
 
     LOG_INF("nordic-main ready");
 
-    /* Boot LED: white for ~1 second, then switch to idle/off */
+    /* Boot LED: white for ~1 second, then advertising blink or idle */
     k_msleep(1000);
     led_set_state(LED_IDLE);
+    led_sync_runtime_state();
 
     /* Auto-confirm OTA image after 3s total — basic sanity that we didn't crash */
-    k_msleep(2000);
+    {
+        int64_t confirm_until = k_uptime_get() + 2000;
+
+        while (k_uptime_get() < confirm_until) {
+            led_tick();
+            k_msleep(MAIN_LOOP_INTERVAL_MS);
+        }
+    }
     if (!boot_is_img_confirmed()) {
         int img_ret = boot_write_img_confirmed();
         if (img_ret < 0) {
@@ -4746,6 +4875,20 @@ int main(void)
                 printk(">>> Light sleep wake\n");
             }
             last_activity_ms = now_ms;
+        }
+
+        if (active_count() > 0) {
+            unconnected_since_ms = 0;
+            sync_primary_conn_speed();
+        } else {
+            if (unconnected_since_ms == 0) {
+                unconnected_since_ms = now_ms;
+            }
+            if (nrf_power_usbregstatus_vbusdet_get(NRF_POWER)) {
+                unconnected_since_ms = now_ms;
+            } else if ((now_ms - unconnected_since_ms) >= ADV_NO_CONN_SLEEP_MS) {
+                enter_systemoff_for_tap_wake();
+            }
         }
 
         /* Battery polling — force immediate re-read on USB disconnect */

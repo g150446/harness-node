@@ -105,8 +105,8 @@ Silero VAD: rmsAfterDC=0.0012   ← ほぼ無音
 
 ### 設計方針
 
-- **プライマリ接続**（音声データを受け取る側）: 7.5 ms インターバル → ラジオ帯域を最大確保
-- **セカンダリ接続**（イベント通知のみ）: 200 ms インターバル → 接続維持しつつ帯域を最小消費
+- **プライマリ接続**（音声データを受け取る側）: 録音中または直近タップから 10 秒以内は 7.5 ms。それ以外は 200–500 ms（FW `0.0.98+`）
+- **セカンダリ接続**（イベント通知のみ）: 常に 200–500 ms
 
 ### 実装（`main.c`）
 
@@ -126,10 +126,11 @@ static void conn_param_work_handler(struct k_work *work)
         .interval_max = 400,  /* 500 ms */
         .latency = 0, .timeout = 400,
     };
+    bool primary_fast = /* recording, or tap/record within 10 s */;
     for (int i = 0; i < MAX_CONNS; i++) {
         if (!connections[i]) continue;
-        const struct bt_le_conn_param *p =
-            (i == primary_idx) ? &fast_param : &slow_param;
+        bool use_fast = (i == primary_idx) && primary_fast;
+        const struct bt_le_conn_param *p = use_fast ? &fast_param : &slow_param;
         bt_conn_le_param_update(connections[i], p);
     }
 }
@@ -137,7 +138,7 @@ static void conn_param_work_handler(struct k_work *work)
 
 ### 発動タイミング
 
-`audio_rx_write` 内で `0x02`（primary claim）または `0x03`（yield）を受信した際に **200 ms 後に発動**するようスケジュール：
+接続確立時、primary claim（RX `0x02`）/ yield（RX `0x03`）、タップ、録音開始、および 10 秒無タップのタイムアウトで **200 ms 後に発動**するようスケジュール：
 
 ```c
 k_work_schedule(&conn_param_work, K_MSEC(200));

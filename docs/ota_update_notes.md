@@ -100,3 +100,7 @@
   253947 B を 1295 s でアップロード（他 BLE 接続競合で低速）。slot 0 `active=true` /
   `confirmed=true` / version=`0.0.97` / hash=`61cc3cd193bf9d82` を確認済み
   （直前の 0.0.96 は slot 1 へ）。
+- 2026-09-05: 0.0.98（接続アイドルで BLE 間隔を落とす。未接続 3 分で SYSTEMOFF、
+  アドバタイズ中は青の遅い点滅）。255354 B を 51.3 s でアップロード。
+  slot 0 `active=true` / `confirmed=true` / version=`0.0.98` /
+  hash=`74b078b20791d840` を確認済み（直前の 0.0.97 は slot 1 へ）。
