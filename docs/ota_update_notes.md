@@ -8,6 +8,7 @@
 2. `nordic-main/prj.conf` の `CONFIG_MCUBOOT_IMGTOOL_SIGN_VERSION` を、実機のslot 0より新しい値へ更新する。同じバージョンや同じハッシュを再送しない。
 3. `xiao_ble/nrf52840/sense` と `--sysbuild` を使用する。生成物は `nordic-main/ota_update.bin` とする。
 4. OTA中はデバイスの電源を切らず、BLEクライアント（Androidアプリ等）を同時接続させない。
+5. 実機の接続間隔が長いと SMP アップロードが極端に遅くなる。`0.0.98` idle（200–500 ms）からの `0.0.99` は **0.2 KB/s・1248 s**。他クライアント切断に加え、間隔も疑うこと。`0.0.99+` の primary idle は 30–50 ms。
 
 ## ビルド時の既知問題
 
@@ -104,3 +105,8 @@
   アドバタイズ中は青の遅い点滅）。255354 B を 51.3 s でアップロード。
   slot 0 `active=true` / `confirmed=true` / version=`0.0.98` /
   hash=`74b078b20791d840` を確認済み（直前の 0.0.97 は slot 1 へ）。
+- 2026-09-06: 0.0.99（primary idle を 200–500 ms から 30–50 ms へ。
+  `0.0.98` ではタップ〜録音が約 2 秒遅れた）。255390 B を 1248.4 s で
+  アップロード（当時の idle 200–500 ms のため 0.2 KB/s）。
+  slot 0 `active=true` / `confirmed=true` / version=`0.0.99` /
+  hash=`6bc5fe384518e7b2` を確認済み（直前の 0.0.98 は slot 1 へ）。

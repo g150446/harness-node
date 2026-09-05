@@ -105,7 +105,7 @@ Silero VAD: rmsAfterDC=0.0012   ← ほぼ無音
 
 ### 設計方針
 
-- **プライマリ接続**（音声データを受け取る側）: 録音中または直近タップから 10 秒以内は 7.5 ms。それ以外は 200–500 ms（FW `0.0.98+`）
+- **プライマリ接続**（音声データを受け取る側）: 録音中または直近タップから 10 秒以内は 7.5 ms。それ以外は 30–50 ms（FW `0.0.99+`）。`0.0.98` の 200–500 ms は接続更新が遅く、タップ〜録音が約 2 秒遅れた
 - **セカンダリ接続**（イベント通知のみ）: 常に 200–500 ms
 
 ### 実装（`main.c`）
@@ -121,6 +121,11 @@ static void conn_param_work_handler(struct k_work *work)
         .interval_max = 12,   /* 15 ms  */
         .latency = 0, .timeout = 400,
     };
+    static const struct bt_le_conn_param idle_param = {
+        .interval_min = 24,   /* 30 ms */
+        .interval_max = 40,   /* 50 ms */
+        .latency = 0, .timeout = 400,
+    };
     static const struct bt_le_conn_param slow_param = {
         .interval_min = 160,  /* 200 ms */
         .interval_max = 400,  /* 500 ms */
@@ -129,8 +134,8 @@ static void conn_param_work_handler(struct k_work *work)
     bool primary_fast = /* recording, or tap/record within 10 s */;
     for (int i = 0; i < MAX_CONNS; i++) {
         if (!connections[i]) continue;
-        bool use_fast = (i == primary_idx) && primary_fast;
-        const struct bt_le_conn_param *p = use_fast ? &fast_param : &slow_param;
+        const struct bt_le_conn_param *p = (i != primary_idx) ? &slow_param
+            : (primary_fast ? &fast_param : &idle_param);
         bt_conn_le_param_update(connections[i], p);
     }
 }

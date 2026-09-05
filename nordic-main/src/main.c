@@ -550,7 +550,14 @@ static void conn_param_work_handler(struct k_work *work)
         .latency      = 0,
         .timeout      = 400,
     };
-    /* Slow params: secondary always, and idle primary (no tap/record). */
+    /* Idle primary: 30–50 ms (tap latency vs radio cost). */
+    static const struct bt_le_conn_param idle_param = {
+        .interval_min = 24,   /* 30 ms */
+        .interval_max = 40,   /* 50 ms */
+        .latency      = 0,
+        .timeout      = 400,
+    };
+    /* Secondary always: 200–500 ms → frees radio for primary. */
     static const struct bt_le_conn_param slow_param = {
         .interval_min = 160,  /* 200 ms */
         .interval_max = 400,  /* 500 ms */
@@ -563,14 +570,26 @@ static void conn_param_work_handler(struct k_work *work)
 
     for (int i = 0; i < MAX_CONNS; i++) {
         if (!connections[i]) continue;
-        bool use_fast = (i == primary_idx) && primary_fast;
-        const struct bt_le_conn_param *p = use_fast ? &fast_param : &slow_param;
+        const struct bt_le_conn_param *p;
+        const char *label;
+
+        if (i == primary_idx) {
+            if (primary_fast) {
+                p = &fast_param;
+                label = "fast(7.5ms)";
+            } else {
+                p = &idle_param;
+                label = "idle(30ms)";
+            }
+        } else {
+            p = &slow_param;
+            label = "slow(200ms)";
+        }
         int ret = bt_conn_le_param_update(connections[i], p);
         if (ret && ret != -EALREADY) {
             printk(">>> conn_param_update[%d] failed: %d\n", i, ret);
         } else {
-            printk(">>> conn_param_update[%d]: %s\n", i,
-                   use_fast ? "fast(7.5ms)" : "idle(200ms)");
+            printk(">>> conn_param_update[%d]: %s\n", i, label);
         }
     }
 }
@@ -4587,7 +4606,7 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
         printk(">>> MTU exchange request failed: %d\n", ret);
     }
 
-    /* Idle connections stay at 200–500 ms until a tap or recording needs
+    /* Idle primary stays at 30–50 ms until a tap or recording needs
      * the fast audio interval.  Do not request params from this callback. */
     k_work_schedule(&conn_param_work, K_MSEC(200));
 
