@@ -15,6 +15,17 @@ ESP-IDF dual-OTA + **同じ SMP BLE UUID / `ota_updater.py`** で更新できる
 
 イメージ形式は ESP app bin（MCUboot signed ではない）だが、SMP の upload/state/reset はホスト互換。
 
+## M5StickC Plus SE (`HarnessNode-PlusSE`)
+
+Plus2 と同じ SMP / `ota_updater.py`。ビルドは **`-B build-plus_se`**（4 MB、PSRAM なし）。Stick は **BtnA で `ADV`** にしてから OTA。Handy は切る。FTDI 初回 USB は **115200**。
+
+1. `stickc_plus_se/VERSION` を上げる。
+2. `./stickc_plus_se/build_and_package_ota.sh` → `stickc_plus_se/ota_update.bin`
+3. 初回は USB flash（115200）。
+4. Terminal で:
+   `python3 mac_client/ota_updater.py --device HarnessNode-PlusSE stickc_plus_se/ota_update.bin`
+5. 完了条件は Plus2 / nRF と同じ。
+
 ## 事前確認
 
 1. 対象は `HarnessNode` であることを確認する。別のBLEデバイスへ書き込まない。

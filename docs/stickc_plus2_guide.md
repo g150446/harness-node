@@ -40,7 +40,8 @@ idf.py -DHN_BOARD=stickc_plus2 -p /dev/cu.usbserial-XXXX flash monitor
 | 変数 / ファイル | 意味 |
 |-----------------|------|
 | `-DHN_BOARD=stickc_plus2` | コンポーネント `stickc_plus2/` をリンク |
-| `sdkconfig.defaults.esp32` | Flash 8MB、dual OTA、NimBLE、UART コンソール |
+| `sdkconfig.defaults.esp32` | 共通 NimBLE / UART |
+| `sdkconfig.defaults.stickc_plus2` | Flash 8MB、PSRAM、dual OTA、BLE 名 |
 | `stickc_plus2/VERSION` | `esp_app_desc.version`（単一の真実。ビルド前に読む） |
 
 **注意:** 以前 `esp32s3` でビルドした `build/` がある場合は退避してから `set-target esp32` する。
@@ -522,7 +523,15 @@ XIAO の電源を切ること。
 
 ---
 
-## ボード切替（Atom Echo S3R）
+## ボード切替
+
+Plus SE（4 MB / AXP192）は別コンポーネント。**`build/` を共有しない**:
+
+```bash
+idf.py -DHN_BOARD=stickc_plus_se -B build-plus_se set-target esp32 build
+```
+
+詳細: [`stickc_plus_se_guide.md`](stickc_plus_se_guide.md)
 
 ```bash
 idf.py -DHN_BOARD=atom_echo_s3r set-target esp32s3 build
@@ -538,7 +547,8 @@ Echo は別コンポーネント `atom_echo_s3r/`（保留中のデスクノー�
 | パス | 役割 |
 |------|------|
 | `stickc_plus2/main.c` | HOLD, PDM, BtnA, long-press sleep, NimBLE audio, LED |
-| `sdkconfig.defaults.esp32` | MSYS プール等（**生成済み `sdkconfig` を上書きしない**） |
+| `sdkconfig.defaults.esp32` | 共通 NimBLE（**生成済み `sdkconfig` を上書きしない**） |
+| `sdkconfig.defaults.stickc_plus2` | 8MB / PSRAM / BLE 名 |
 | `stickc_plus2/display.c` | ST7789 状態表示 / deep sleep 前のパッド待避 |
 | `stickc_plus2/smp_ota.c` | MCUmgr 互換 SMP OTA |
 | `stickc_plus2/partitions_ota.csv` | dual OTA |

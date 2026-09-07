@@ -1,7 +1,9 @@
 # Shared defaults; target-specific files:
-#   sdkconfig.defaults.esp32   -> StickC Plus2
-#   sdkconfig.defaults.esp32s3 -> Atom Echo S3R
-# Select board component with -DHN_BOARD=stickc_plus2|atom_echo_s3r
+#   sdkconfig.defaults.esp32            -> common ESP32 NimBLE/UART
+#   sdkconfig.defaults.stickc_plus2     -> Plus2 flash/PSRAM/name
+#   sdkconfig.defaults.stickc_plus_se   -> Plus SE flash/name
+#   sdkconfig.defaults.esp32s3          -> Atom Echo S3R
+# Select board with -DHN_BOARD=stickc_plus2|stickc_plus_se|atom_echo_s3r
 
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y

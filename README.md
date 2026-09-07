@@ -11,6 +11,7 @@ Supports:
 - **XIAO nRF52840 Sense** (Zephyr/NCS) — `nordic-main`（現行: ジェスチャー録音 + OTA + Battery Service）
 - **XIAO nRF54L15 Sense** (Zephyr/NCS) - Latest!
 - **M5StickC Plus2** (ESP-IDF) — `stickc_plus2/` BLE name `HarnessNode-Plus2`（BtnA single で録音トグル）
+- **M5StickC Plus SE** (ESP-IDF) — `stickc_plus_se/` BLE name `HarnessNode-PlusSE`（Plus2 相当 + 残量 LCD / BAS）
 - **M5 Atom Echo S3R** (ESP-IDF, reserved) — `atom_echo_s3r/`
 
 ## Project Structure
@@ -18,8 +19,10 @@ Supports:
 ```
 harness-node/
 ├── stickc_plus2/              # ESP-IDF: M5StickC Plus2 (HarnessNode-Plus2)
+├── stickc_plus_se/            # ESP-IDF: M5StickC Plus SE (HarnessNode-PlusSE)
 ├── atom_echo_s3r/             # ESP-IDF: Atom Echo S3R (reserved)
 ├── docs/stickc_plus2_guide.md # Plus2 build/flash notes
+├── docs/stickc_plus_se_guide.md # Plus SE (AXP192 / 4MB / battery)
 ├── esp32s3/                   # ESP-IDF firmware (ESP32S3)
 │   ├── main.c                 # Main application
 │   ├── adpcm.c/h              # IMA ADPCM codec
@@ -104,6 +107,25 @@ idf.py -DHN_BOARD=stickc_plus2 -p /dev/cu.usbserial-XXXX flash monitor
 - BLE OTA: `./stickc_plus2/build_and_package_ota.sh` のあと  
   `python3 mac_client/ota_updater.py --device HarnessNode-Plus2 stickc_plus2/ota_update.bin`
 - 詳細: [`docs/stickc_plus2_guide.md`](docs/stickc_plus2_guide.md)
+
+### For M5StickC Plus SE — HarnessNode-PlusSE (`stickc_plus_se`)
+
+Plus2 と電源・LCD ピン・Flash が違う。**`-B build-plus_se` を使う**（Plus2 の 8MB `build/` と混ぜない）。
+
+```bash
+source ~/esp/esp-idf/export.sh
+cd harness-node
+idf.py -DHN_BOARD=stickc_plus_se -B build-plus_se set-target esp32
+idf.py -DHN_BOARD=stickc_plus_se -B build-plus_se build
+idf.py -DHN_BOARD=stickc_plus_se -B build-plus_se -p /dev/cu.usbserial-XXXX flash monitor
+```
+
+- BLE name: `HarnessNode-PlusSE`
+- 起動直後は広告しない。**BtnA 短押しで `ADV`** → Handy Scan → Connect
+- LCD 上部に残量 %、BLE Battery Service `0x180F`。FTDI フラッシュは **115200**
+- BLE OTA: `./stickc_plus_se/build_and_package_ota.sh` のあと  
+  `python3 mac_client/ota_updater.py --device HarnessNode-PlusSE stickc_plus_se/ota_update.bin`
+- 詳細: [`docs/stickc_plus_se_guide.md`](docs/stickc_plus_se_guide.md)
 
 Atom Echo S3R（保留）: `HN_BOARD=atom_echo_s3r` + `esp32s3`。  
 [`docs/atom_echo_s3r_guide.md`](docs/atom_echo_s3r_guide.md)
@@ -482,7 +504,7 @@ python3 serial_monitor.py --list
 python3 serial_monitor.py --reset
 ```
 
-### M5 StickC Plus2 / Atom Echo S3R serial (115200)
+### M5 StickC Plus2 / Plus SE / Atom Echo S3R serial (115200)
 
 Same Handy-compatible click semantics on both M5 firmwares:
 
@@ -494,6 +516,7 @@ Same Handy-compatible click semantics on both M5 firmwares:
 | BLE name | Board |
 |----------|--------|
 | `HarnessNode-Plus2` | M5StickC Plus2 (`stickc_plus2/`) |
+| `HarnessNode-PlusSE` | M5StickC Plus SE (`stickc_plus_se/`) |
 | `HarnessNode-Echo` | Atom Echo S3R (`atom_echo_s3r/`, reserved) |
 
 Mode via RX `[0x05, mode]` (`0`=normal, `1`=driving); TX  
