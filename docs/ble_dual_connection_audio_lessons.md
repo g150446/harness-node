@@ -52,7 +52,7 @@ Android(MAC_HANDYモード)   nRF52840              Handy
         │── 0x03(yield) ─────────▶│                   │── 0x02(claim primary) ──▶│
         │                   primary_idx=1             │
         │                      │  conn_param_work      │
-        │◀── slow(200ms) ────────│── fast(7.5ms) ─────▶│
+        │◀── slow(100ms) ────────│── idle(30ms) ──────▶│
 ```
 
 ### Test B（Android プライマリ）の接続シーケンス
@@ -67,7 +67,7 @@ Handy(Test Aから継続)    nRF52840              Android(ANDROIDモード)
         │◀── 0x31(peer connected)──│                  │
         │  (stays primary, no re-claim)               │
         │                      │  conn_param_work      │
-        │◀── slow(200ms) ────────│── fast(7.5ms) ──────▶│
+        │◀── slow(100ms) ────────│── idle(30ms) ───────▶│
 ```
 
 ---
@@ -105,8 +105,9 @@ Silero VAD: rmsAfterDC=0.0012   ← ほぼ無音
 
 ### 設計方針
 
-- **プライマリ接続**（音声データを受け取る側）: 録音中または直近タップから 10 秒以内は 7.5 ms。それ以外は 30–50 ms（FW `0.0.99+`）。`0.0.98` の 200–500 ms は接続更新が遅く、タップ〜録音が約 2 秒遅れた
-- **セカンダリ接続**（イベント通知のみ）: 常に 200–500 ms
+- **プライマリ接続**（音声データを受け取る側）: 録音中だけ 7.5 ms。それ以外は 30–50 ms（FW `0.0.100+`）
+- **セカンダリ接続**（イベント通知のみ）: 常に 100–150 ms
+- **supervision timeout / GAP PPCP**: すべて 8 s。idle 中に間隔を再更新しない
 
 ### 実装（`main.c`）
 
@@ -119,19 +120,19 @@ static void conn_param_work_handler(struct k_work *work)
     static const struct bt_le_conn_param fast_param = {
         .interval_min = 6,    /* 7.5 ms */
         .interval_max = 12,   /* 15 ms  */
-        .latency = 0, .timeout = 400,
+        .latency = 0, .timeout = 800,
     };
     static const struct bt_le_conn_param idle_param = {
         .interval_min = 24,   /* 30 ms */
         .interval_max = 40,   /* 50 ms */
-        .latency = 0, .timeout = 400,
+        .latency = 0, .timeout = 800,
     };
     static const struct bt_le_conn_param slow_param = {
-        .interval_min = 160,  /* 200 ms */
-        .interval_max = 400,  /* 500 ms */
-        .latency = 0, .timeout = 400,
+        .interval_min = 80,   /* 100 ms */
+        .interval_max = 120,  /* 150 ms */
+        .latency = 0, .timeout = 800,
     };
-    bool primary_fast = /* recording, or tap/record within 10 s */;
+    bool primary_fast = /* recording only */;
     for (int i = 0; i < MAX_CONNS; i++) {
         if (!connections[i]) continue;
         const struct bt_le_conn_param *p = (i != primary_idx) ? &slow_param
@@ -143,7 +144,7 @@ static void conn_param_work_handler(struct k_work *work)
 
 ### 発動タイミング
 
-接続確立時、primary claim（RX `0x02`）/ yield（RX `0x03`）、タップ、録音開始、および 10 秒無タップのタイムアウトで **200 ms 後に発動**するようスケジュール：
+接続確立時、primary claim（RX `0x02`）/ yield（RX `0x03`）、録音開始・停止で **200 ms 後に発動**するようスケジュール：
 
 ```c
 k_work_schedule(&conn_param_work, K_MSEC(200));
@@ -155,9 +156,9 @@ BT コールバック内から直接 `bt_conn_le_param_update()` を呼ぶと BT
 
 `bt_conn_le_param_update()` はペリフェラルからセントラルへの **要求** であり、セントラルが拒否することもあります。
 
-- **Android**: 通常 7.5 ms–4000 ms の範囲は受け入れる
+- **Android**: 7.5 ms–4000 ms は受け入れることが多い。GAP PPCP の timeout が短い（Zephyr 既定 420 ms）と、探索後にそれを採用して Connection Timeout（HCI 0x08）で切る。`prj.conf` で PPCP を idle（30–50 ms / 8 s）に合わせること
 - **macOS (CoreBluetooth)**: 15 ms–2000 ms 程度は受け入れる
-- **拒否された場合**: 既存のインターバルのまま動作します（致命的エラーにはならない）
+- **拒否された場合**: 既存のインターバルのまま動作する（切断にはならないとは限らない。timeout をセット間で変えない）
 
 ---
 
@@ -210,7 +211,7 @@ android_set_priority("ANDROID")
 ```
 [XIAO] >>> conn[0] is primary
 [XIAO] >>> Primary yielded to conn[1]
-[XIAO] >>> conn_param_update[1]: fast(7.5ms)
+[XIAO] >>> conn_param_update[1]: idle(30ms)
 [XIAO] >>> send_event 0x01 -> primary[1]
 ```
 

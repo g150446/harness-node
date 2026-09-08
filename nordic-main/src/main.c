@@ -460,7 +460,6 @@ static int active_count(void) {
 static uint8_t tx_packet[512];
 static uint8_t seq_num;
 static volatile bool is_recording;
-static int64_t last_tap_or_record_ms;
 static bool ble_primary_want_fast;
 static int64_t unconnected_since_ms;
 static volatile bool recording_requested;
@@ -520,13 +519,7 @@ static struct k_work_delayable conn_param_work;
 
 static bool primary_conn_should_be_fast(void)
 {
-    if (is_recording) {
-        return true;
-    }
-    if (last_tap_or_record_ms == 0) {
-        return false;
-    }
-    return (k_uptime_get() - last_tap_or_record_ms) < SLEEP_IDLE_TIMEOUT_MS;
+    return is_recording;
 }
 
 static void sync_primary_conn_speed(void)
@@ -543,26 +536,26 @@ static void sync_primary_conn_speed(void)
 static void conn_param_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
-    /* Fast params for primary while recording or shortly after a tap. */
+    /* Fast params for primary while recording. */
     static const struct bt_le_conn_param fast_param = {
         .interval_min = 6,    /* 6 × 1.25 ms = 7.5 ms */
         .interval_max = 12,   /* 12 × 1.25 ms = 15 ms  */
         .latency      = 0,
-        .timeout      = 400,
+        .timeout      = 800,  /* 8 s — keep timeout identical across sets */
     };
     /* Idle primary: 30–50 ms (tap latency vs radio cost). */
     static const struct bt_le_conn_param idle_param = {
         .interval_min = 24,   /* 30 ms */
         .interval_max = 40,   /* 50 ms */
         .latency      = 0,
-        .timeout      = 400,
+        .timeout      = 800,
     };
-    /* Secondary always: 200–500 ms → frees radio for primary. */
+    /* Secondary: 100–150 ms. Wider 200–500 ms + 4 s timeout dropped Android. */
     static const struct bt_le_conn_param slow_param = {
-        .interval_min = 160,  /* 200 ms */
-        .interval_max = 400,  /* 500 ms */
+        .interval_min = 80,   /* 100 ms */
+        .interval_max = 120,  /* 150 ms */
         .latency      = 0,
-        .timeout      = 400,
+        .timeout      = 800,
     };
     bool primary_fast = primary_conn_should_be_fast();
 
@@ -583,7 +576,7 @@ static void conn_param_work_handler(struct k_work *work)
             }
         } else {
             p = &slow_param;
-            label = "slow(200ms)";
+            label = "slow(100ms)";
         }
         int ret = bt_conn_le_param_update(connections[i], p);
         if (ret && ret != -EALREADY) {
@@ -2298,8 +2291,6 @@ static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
      * page advance instead).  Double tap is also notify-only. */
     if (!is_double) {
         last_activity_ms = now;
-        last_tap_or_record_ms = now;
-        sync_primary_conn_speed();
         if (light_sleep_active) {
             light_sleep_active = false;
             send_event_packet(0x21);
@@ -2333,8 +2324,6 @@ static void emit_tap_event(int64_t now, bool is_double, uint8_t tap_src)
         printk(">>> Light sleep wake (double tap)\n");
     }
     last_activity_ms = now;
-    last_tap_or_record_ms = now;
-    sync_primary_conn_speed();
     printk(">>> Double tap detected (TAP_SRC=0x%02x)\n", tap_src);
     send_event_packet(EVT_DOUBLE_TAP);
 }
@@ -4414,7 +4403,6 @@ static void audio_thread(void *p1, void *p2, void *p3)
 
             is_recording = true;
             gyro_set_enabled(true);
-            last_tap_or_record_ms = k_uptime_get();
             sync_primary_conn_speed();
             printk("Recording started\n");
             send_event_packet(0x01);
@@ -4460,7 +4448,6 @@ static void audio_thread(void *p1, void *p2, void *p3)
             flush_gesture_history();
             battery_update();
             last_activity_ms = k_uptime_get();   /* reset idle timer after recording */
-            last_tap_or_record_ms = last_activity_ms;
             sync_primary_conn_speed();
             continue;
         }
@@ -4606,8 +4593,8 @@ static void ble_connected(struct bt_conn *conn, uint8_t err)
         printk(">>> MTU exchange request failed: %d\n", ret);
     }
 
-    /* Idle primary stays at 30–50 ms until a tap or recording needs
-     * the fast audio interval.  Do not request params from this callback. */
+    /* Idle primary stays at 30–50 ms until recording needs the fast
+     * audio interval.  Do not request params from this callback. */
     k_work_schedule(&conn_param_work, K_MSEC(200));
 
     if (active_count() < MAX_CONNS) {
@@ -4660,9 +4647,20 @@ static void ble_disconnected(struct bt_conn *conn, uint8_t reason)
     printk(">>> Advertising restart scheduled\n");
 }
 
+static void ble_le_param_updated(struct bt_conn *conn, uint16_t interval,
+                                 uint16_t latency, uint16_t timeout)
+{
+    int idx = conn_index(conn);
+
+    printk(">>> le_param_updated[%d]: interval=%u (%u.%02u ms) latency=%u timeout=%u (%u ms)\n",
+           idx, interval, (interval * 125U) / 100U, (interval * 125U) % 100U,
+           latency, timeout, timeout * 10U);
+}
+
 static struct bt_conn_cb conn_callbacks = {
-    .connected    = ble_connected,
-    .disconnected = ble_disconnected,
+    .connected        = ble_connected,
+    .disconnected     = ble_disconnected,
+    .le_param_updated = ble_le_param_updated,
 };
 
 static void enter_systemoff_for_tap_wake(void)
