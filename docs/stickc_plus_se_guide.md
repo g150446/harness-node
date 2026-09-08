@@ -1,7 +1,7 @@
 # M5StickC Plus SE / HarnessNode-PlusSE
 
 ESP-IDF ファーム: `stickc_plus_se/`  
-BLE 名: **`HarnessNode-PlusSE`**（現行 `VERSION` **0.1.5**）  
+BLE 名: **`HarnessNode-PlusSE`**（現行 `VERSION` **0.1.6**）  
 Audio Service UUID: XIAO `HarnessNode` / Plus2 と同じ  
 `00000001/0002/0003-0000-1000-8000-00805f9b34fb`
 
@@ -20,7 +20,7 @@ Plus2 の音声・ボタン・LCD・SMP OTA を移植し、AXP192 の残量 LCD 
 | BtnA | **G37** active-low |
 | 電源 | **AXP192** I2C SDA=G21 SCL=G22（GPIO4 HOLD はない） |
 | LCD | ST7789V2 135×240（MOSI=G15 CLK=G13 DC=**G23** RST=**G18** CS=G5 BL=**AXP LDO2**） |
-| Status LED | **G10** active-high |
+| Status LED | **G10** active-low（録音中のみ点灯） |
 | 電池 | 120 mAh、AXP ADC（0x78、1.1 mV/LSB） |
 | IMU | **なし**（本 FW でも未使用） |
 
@@ -109,6 +109,19 @@ Plus2 と同じ音声 UUID / パケット。
 | 状態の下の MAC | 白 | GAP 接続中の相手。OTA のみなら `OTA ` 接頭辞 |
 
 色定数は Plus2 と同じ実測値。SE で違う場合は serial `p`。
+
+### LED（G10）
+
+本体左上の赤 LED。**G10 は active-low**（LOW で点灯）。0.1.5 以前は active-high として駆動していたため、コネクテッド／待機中も点灯した。
+
+| 状態 | LED |
+|------|-----|
+| 起動 | 約 200 ms 点灯して消灯 |
+| 未接続 / `ADV` / `LINK` / `connected` | 消灯 |
+| `recording`（`is_recording`） | 点灯 |
+| 録音停止・開始キャンセル・切断・入眠 | 消灯 |
+
+LCD バックライトと充電アイコン（上部、充電中は青）とは別。点灯は録音中だけ。
 
 ### バッテリー
 

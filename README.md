@@ -123,6 +123,7 @@ idf.py -DHN_BOARD=stickc_plus_se -B build-plus_se -p /dev/cu.usbserial-XXXX flas
 - BLE name: `HarnessNode-PlusSE`
 - 起動直後は広告しない。**BtnA 短押しで `ADV`** → Handy Scan → Connect
 - LCD 上部に残量 %、BLE Battery Service `0x180F`。FTDI フラッシュは **115200**
+- 赤 LED（G10 **active-low**）は **録音中のみ点灯**。コネクテッド／待機は消灯
 - BLE OTA: `./stickc_plus_se/build_and_package_ota.sh` のあと  
   `python3 mac_client/ota_updater.py --device HarnessNode-PlusSE stickc_plus_se/ota_update.bin`
 - 詳細: [`docs/stickc_plus_se_guide.md`](docs/stickc_plus_se_guide.md)

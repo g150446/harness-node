@@ -218,7 +218,7 @@ static void stop_ghost_kick_timer(void);
 
 static void led_set(bool on)
 {
-    gpio_set_level(LED_GPIO, on ? 1 : 0);
+    gpio_set_level(LED_GPIO, on ? 0 : 1);
 }
 
 static void led_init(void)
@@ -230,7 +230,9 @@ static void led_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
+    gpio_set_level(LED_GPIO, 1);
     gpio_config(&cfg);
+    led_set(false);
     led_set(true);
     vTaskDelay(pdMS_TO_TICKS(200));
     led_set(false);
@@ -298,6 +300,7 @@ static void emulate_single_click(const char *source)
     } else if (recording_requested) {
         recording_requested = false;
         ESP_LOGI(TAG, "%s: Pending recording start cancelled", source);
+        led_set(false);
         request_conn_params(false);
         apply_pending_operation_mode();
         refresh_status_display();
