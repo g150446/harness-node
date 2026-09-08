@@ -283,11 +283,12 @@ static void emulate_single_click(const char *source)
 
     if (!audio_subscribed) {
         if (audio_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-            ESP_LOGW(TAG, "%s: Single-click ignored: waiting for app subscribe", source);
+            ESP_LOGW(TAG, "%s: drop unsubscribed link and re-advertise", source);
+            pairing_active = true;
+            ble_gap_terminate(audio_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             return;
         }
         ESP_LOGI(TAG, "%s: start advertising", source);
-        pairing_active = true;
         ble_app_advertise();
         return;
     }
@@ -441,6 +442,8 @@ static void refresh_status_display(void)
         display_set_status(DISPLAY_STATUS_RECORDING);
     } else if (audio_subscribed) {
         display_set_status(DISPLAY_STATUS_CONNECTED);
+    } else if (audio_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        display_set_status(DISPLAY_STATUS_LINKING);
     } else if (advertising) {
         display_set_status(DISPLAY_STATUS_ADVERTISING);
     } else {
@@ -883,6 +886,7 @@ ble_app_advertise(void)
         return;
     }
 
+    pairing_active = true;
     advertising = true;
     ESP_LOGI(TAG, "Advertising started: %s", BLE_ADV_NAME);
     refresh_status_display();

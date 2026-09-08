@@ -69,6 +69,10 @@ static const uint8_t font5x7[][7] = {
     { 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00 },
     { 0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1f },
     { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04 },
+    { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f },
+    { 0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e },
+    { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 },
+    { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 },
 };
 #define FONT_W 5
 #define FONT_H 7
@@ -392,6 +396,18 @@ static int glyph_index(char c)
     if (c == 'V' || c == 'v') {
         return 20;
     }
+    if (c == 'L' || c == 'l') {
+        return 21;
+    }
+    if (c == 'I' || c == 'i') {
+        return 22;
+    }
+    if (c == 'N' || c == 'n') {
+        return 23;
+    }
+    if (c == 'K' || c == 'k') {
+        return 24;
+    }
     if (c == 'O' || c == 'o') {
         return 0;
     }
@@ -518,6 +534,7 @@ static void draw_status(display_status_t status)
         fg = COLOR_RED;
         break;
     case DISPLAY_STATUS_ADVERTISING:
+    case DISPLAY_STATUS_LINKING:
         bmp = NULL;
         break;
     case DISPLAY_STATUS_NOT_CONNECTED:
@@ -529,13 +546,14 @@ static void draw_status(display_status_t status)
     const int bat_band = 8 + FONT_H * FONT_SCALE + 8;
     int x = (LCD_H_RES - bw) / 2;
     int y = bat_band + (LCD_V_RES - bat_band - bh) / 2;
-    if (status == DISPLAY_STATUS_ADVERTISING) {
-        const char *adv = "ADV";
+    if (status == DISPLAY_STATUS_ADVERTISING || status == DISPLAY_STATUS_LINKING) {
+        const char *label = (status == DISPLAY_STATUS_LINKING) ? "LINK" : "ADV";
+        const int nch = (status == DISPLAY_STATUS_LINKING) ? 4 : 3;
         const int cell = FONT_W * FONT_SCALE + FONT_PAD;
-        const int tw = 3 * cell;
+        const int tw = nch * cell;
         x = (LCD_H_RES - tw) / 2;
         y = bat_band + (LCD_V_RES - bat_band - FONT_H * FONT_SCALE) / 2;
-        draw_text_scaled(x, y, adv, COLOR_WHITE, FONT_SCALE, FONT_PAD);
+        draw_text_scaled(x, y, label, COLOR_WHITE, FONT_SCALE, FONT_PAD);
         bh = FONT_H * FONT_SCALE;
     } else {
         (void)blit_mono_bitmap(x, y, bw, bh, bmp, fg, COLOR_BG);

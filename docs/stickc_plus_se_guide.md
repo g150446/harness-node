@@ -1,7 +1,7 @@
 # M5StickC Plus SE / HarnessNode-PlusSE
 
 ESP-IDF ファーム: `stickc_plus_se/`  
-BLE 名: **`HarnessNode-PlusSE`**（現行 `VERSION` **0.1.4**）  
+BLE 名: **`HarnessNode-PlusSE`**（現行 `VERSION` **0.1.5**）  
 Audio Service UUID: XIAO `HarnessNode` / Plus2 と同じ  
 `00000001/0002/0003-0000-1000-8000-00805f9b34fb`
 
@@ -102,6 +102,7 @@ Plus2 と同じ音声 UUID / パケット。
 |------|-----|------|
 | `not connected` | 白 | 未広告・未接続 |
 | `ADV` | 白 | BtnA 後、広告中 |
+| `LINK` | 白 | GAP 接続済み・未購読（BtnA で切断して再広告） |
 | `connected` | 青 | 音声 TX Notify 購読済み・非録音 |
 | `recording` | 赤 | 録音中 |
 | 上部アイコン + `N%` | 白（充電中は青、≤15% は赤） | AXP 残量、30 秒ごと |

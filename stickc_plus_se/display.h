@@ -9,6 +9,7 @@ typedef enum {
     DISPLAY_STATUS_CONNECTED,
     DISPLAY_STATUS_RECORDING,
     DISPLAY_STATUS_ADVERTISING,
+    DISPLAY_STATUS_LINKING,
 } display_status_t;
 
 esp_err_t display_init(void);
