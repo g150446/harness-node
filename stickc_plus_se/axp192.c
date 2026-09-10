@@ -92,8 +92,16 @@ esp_err_t axp192_init(void)
     ESP_ERROR_CHECK(axp_write(0x32, 0x46));                 /* battery detection */
 
     s_ready = true;
+    int mv = 0;
+    for (int i = 0; i < 10; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        mv = axp192_battery_millivolt();
+        if (mv > 0) {
+            break;
+        }
+    }
     ESP_LOGI(TAG, "AXP192 ready bat=%d mV vbus=%d chg=%d",
-             axp192_battery_millivolt(), axp192_vbus_present(), axp192_is_charging());
+             mv, axp192_vbus_present(), axp192_is_charging());
     return ESP_OK;
 }
 

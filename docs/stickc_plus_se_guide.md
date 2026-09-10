@@ -1,7 +1,7 @@
 # M5StickC Plus SE / HarnessNode-PlusSE
 
 ESP-IDF ファーム: `stickc_plus_se/`  
-BLE 名: **`HarnessNode-PlusSE`**（現行 `VERSION` **0.1.6**）  
+BLE 名: **`HarnessNode-PlusSE`**（現行 `VERSION` **0.1.8**）  
 Audio Service UUID: XIAO `HarnessNode` / Plus2 と同じ  
 `00000001/0002/0003-0000-1000-8000-00805f9b34fb`
 
@@ -17,7 +17,8 @@ Plus2 の音声・ボタン・LCD・SMP OTA を移植し、AXP192 の残量 LCD 
 | Flash / PSRAM | **4 MB / なし** |
 | USB-UART | FTDI → `/dev/cu.usbserial-…`（**115200**。460800 は失敗する） |
 | Mic | SPM1423 **PDM** CLK=**G0**, DIN=**G34**（AXP GPIO0 LDO 給電） |
-| BtnA | **G37** active-low |
+| BtnA | **G37** active-low（録音トグル／ADV／長押し睡眠） |
+| BtnB | **G39** active-low（短押しで切断して ADV） |
 | 電源 | **AXP192** I2C SDA=G21 SCL=G22（GPIO4 HOLD はない） |
 | LCD | ST7789V2 135×240（MOSI=G15 CLK=G13 DC=**G23** RST=**G18** CS=G5 BL=**AXP LDO2**） |
 | Status LED | **G10** active-low（録音中のみ点灯） |
@@ -30,16 +31,24 @@ Plus2 の音声・ボタン・LCD・SMP OTA を移植し、AXP192 の残量 LCD 
 
 ## Handy / Android 接続
 
-起動直後は **BLE 広告しない**（macOS が勝手に掴むのを防ぐ）。
+未接続は **deep sleep** か **`ADV`** だけ。`not connected` 画面は出さない。
 
-1. Stick の **BtnA 短押し** → 画面が **`ADV`**（広告中）
+| きっかけ | 次の状態 |
+|----------|----------|
+| 電池での電源投入 | deep sleep |
+| USB（VBUS）起動 | `ADV` |
+| BtnA で起床 | その一回で `ADV`（二度押し不要） |
+| Handy 切断／音声購読解除 | すぐ切って `ADV` |
+| OS だけ掴んで未購読 | 15 秒で蹴って deep sleep |
+| BtnB 短押し / serial `a` | リンクを切って `ADV` |
+| BtnA 長押し / serial `l` | deep sleep |
+
+1. 起床または USB 起動で画面が **`ADV`**
 2. Handy 設定で音声ソース **BLE** → **Scan** → `HarnessNode-PlusSE` を選ぶ
 3. **Connect**
 4. 画面が **`connected`**、状態の下に相手 MAC
 
-`connected` は GAP 接続ではなく、**音声 TX Notify 購読**が付いたときだけ。Handy / Android が購読する。OS の Bluetooth 設定が掴んだだけの接続は 15 秒で切断し、`ADV` に戻る（BtnA 後の pairing 中）。
-
-Handy 切断後は再広告する。幽霊切断のあとは BtnA 待ち。
+`connected` は GAP 接続ではなく、**音声 TX Notify 購読**が付いたときだけ。OS が掴んだだけの接続は `LINK` のあと 15 秒で切断し睡眠する。
 
 広告パケットにはローカル名 `HarnessNode-PlusSE` を入れる（UUID はスキャンレスポンス）。
 
@@ -91,18 +100,18 @@ Plus2 と同じ音声 UUID / パケット。
 
 | 入力 | 動作 |
 |------|------|
-| 未接続で BtnA **single** / serial `c` | 広告開始（`ADV`） |
+| 未購読で BtnA **single** / serial `c` | 未接続なら `ADV`。GAP のみなら切って再広告 |
 | Handy 接続中に BtnA **single** / serial `c` | 録音トグル。TX `0x14` のあと `0x01` or `0x02` |
 | BtnA **double** / serial `d` | TX `0x12` のみ |
-| BtnA **≥1 s** / serial `l` | deep sleep。同じ BtnA で起床 |
+| BtnB **short** / serial `a` | 切断して `ADV` |
+| BtnA **≥1 s** / serial `l` | deep sleep。同じ BtnA で起床して `ADV` |
 
 ### LCD
 
 | 表示 | 色 | 条件 |
 |------|-----|------|
-| `not connected` | 白 | 未広告・未接続 |
-| `ADV` | 白 | BtnA 後、広告中 |
-| `LINK` | 白 | GAP 接続済み・未購読（BtnA で切断して再広告） |
+| `ADV` | 白 | 広告中（未接続はこれか睡眠だけ） |
+| `LINK` | 白 | GAP 接続済み・未購読（15 秒で蹴って睡眠） |
 | `connected` | 青 | 音声 TX Notify 購読済み・非録音 |
 | `recording` | 赤 | 録音中 |
 | 上部アイコン + `N%` | 白（充電中は青、≤15% は赤） | AXP 残量、30 秒ごと |
@@ -117,7 +126,7 @@ Plus2 と同じ音声 UUID / パケット。
 | 状態 | LED |
 |------|-----|
 | 起動 | 約 200 ms 点灯して消灯 |
-| 未接続 / `ADV` / `LINK` / `connected` | 消灯 |
+| `ADV` / `LINK` / `connected` / 睡眠 | 消灯 |
 | `recording`（`is_recording`） | 点灯 |
 | 録音停止・開始キャンセル・切断・入眠 | 消灯 |
 
@@ -125,7 +134,7 @@ LCD バックライトと充電アイコン（上部、充電中は青）とは�
 
 ### バッテリー
 
-- AXP192 0x78、LSB 1.1 mV
+- AXP192 0x78、LSB 1.1 mV。ADC 有効化後に非ゼロまで待つ。0 mV は未計測として捨て、0% にしない。`ADV` 開始時にも再読込
 - nordic-main と同じ OCV LUT（4150 mV=100% … 3000 mV=0%）
 - BLE BAS `0x180F` / `0x2A19` Read+Notify（Handy 購読後）
 - `python3 mac_client/battery_check.py --device HarnessNode-PlusSE`
@@ -140,7 +149,11 @@ USB 給電中は電圧が高め。充電中はアイコンが青。
 3. LCD 消灯、AXP `SetSleep`（DCDC1 のみ）
 4. `esp_sleep_enable_ext0_wakeup(G37, 0)` → deep sleep
 
-起床は cold boot。`axp192_init()` がレールを戻す。広告はしない（また BtnA）。
+起床は cold boot。`axp192_init()` がレールを戻す。BtnA 起床はその押しで `ADV` を始める。
+
+### シリアル（115200）
+
+`r/s/c/d/a/l/m/g/p/h` に加え `b`=battery。`a` は BtnB 相当（切断して ADV）。
 
 ---
 
@@ -150,17 +163,11 @@ USB 給電中は電圧が高め。充電中はアイコンが青。
 
 ---
 
-## シリアル（115200）
-
-`r/s/c/d/l/m/g/p/h` に加え `b`=battery。`c` は未接続なら広告開始。
-
----
-
 ## ファイル一覧
 
 | パス | 役割 |
 |------|------|
-| `stickc_plus_se/main.c` | AXP, PDM, BtnA, 広告ゲート, NimBLE audio, BAS |
+| `stickc_plus_se/main.c` | AXP, PDM, BtnA/BtnB, ADV/睡眠, NimBLE audio, BAS |
 | `stickc_plus_se/axp192.c` | AXP192 I2C |
 | `stickc_plus_se/display.c` | ST7789 + 残量 + 相手 MAC |
 | `stickc_plus_se/smp_ota.c` | MCUmgr 互換 SMP OTA |

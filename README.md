@@ -121,7 +121,8 @@ idf.py -DHN_BOARD=stickc_plus_se -B build-plus_se -p /dev/cu.usbserial-XXXX flas
 ```
 
 - BLE name: `HarnessNode-PlusSE`
-- 起動直後は広告しない。**BtnA 短押しで `ADV`** → Handy Scan → Connect
+- 未接続は **deep sleep** か **`ADV`** のみ。電池起動は睡眠、USB／BtnA 起床は `ADV`
+- Handy 切断・BtnB 短押しで `ADV`。幽霊接続は 15 秒で蹴って睡眠
 - LCD 上部に残量 %、BLE Battery Service `0x180F`。FTDI フラッシュは **115200**
 - 赤 LED（G10 **active-low**）は **録音中のみ点灯**。コネクテッド／待機は消灯
 - BLE OTA: `./stickc_plus_se/build_and_package_ota.sh` のあと  
@@ -512,6 +513,7 @@ Same Handy-compatible click semantics on both M5 firmwares:
 - `r` / `s`: recording start / stop
 - `c` / `1`: single-click (`0x14`; toggles recording while connected)
 - `d` / `2`: double-click (`0x12`; notify only)
+- `a`: Plus SE BtnB — drop link and advertise
 - `h`: help
 
 | BLE name | Board |

@@ -40,6 +40,7 @@ static const char *TAG = "hn_plusse";
 #define PDM_CLK_GPIO      0
 #define PDM_DIN_GPIO      34
 #define BUTTON_A_GPIO     37
+#define BUTTON_B_GPIO     39
 #define LED_GPIO          10
 
 #define BUTTON_POLL_MS          10
@@ -125,6 +126,9 @@ static uint8_t peer_mac[6];
 static bool peer_present;
 static bool pairing_active;
 static bool advertising;
+static bool advertise_after_sync;
+static volatile bool resume_adv;
+static volatile bool pending_deep_sleep;
 
 static adpcm_state_t adpcm_enc_state;
 static uint8_t seq_num = 0;
@@ -279,6 +283,20 @@ static void on_ota_busy(bool busy)
     }
 }
 
+static void emulate_drop_to_adv(const char *source)
+{
+    ESP_LOGI(TAG, "%s: drop link to ADV", source);
+    resume_adv = true;
+    pairing_active = true;
+    pending_deep_sleep = false;
+    if (audio_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        request_recording_stop(source);
+        ble_gap_terminate(audio_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    ble_app_advertise();
+}
+
 static void emulate_single_click(const char *source)
 {
     ESP_LOGI(TAG, "%s: Single-click", source);
@@ -286,6 +304,7 @@ static void emulate_single_click(const char *source)
     if (!audio_subscribed) {
         if (audio_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             ESP_LOGW(TAG, "%s: drop unsubscribed link and re-advertise", source);
+            resume_adv = true;
             pairing_active = true;
             ble_gap_terminate(audio_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             return;
@@ -447,10 +466,8 @@ static void refresh_status_display(void)
         display_set_status(DISPLAY_STATUS_CONNECTED);
     } else if (audio_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         display_set_status(DISPLAY_STATUS_LINKING);
-    } else if (advertising) {
-        display_set_status(DISPLAY_STATUS_ADVERTISING);
     } else {
-        display_set_status(DISPLAY_STATUS_NOT_CONNECTED);
+        display_set_status(DISPLAY_STATUS_ADVERTISING);
     }
 }
 
@@ -495,6 +512,8 @@ static void ghost_kick_cb(void *arg)
         return;
     }
     ESP_LOGW(TAG, "Kicking BLE central with no audio/OTA subscribe");
+    pairing_active = false;
+    resume_adv = false;
     ble_gap_terminate(audio_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
 }
 
@@ -573,6 +592,8 @@ static void handle_serial_command(uint8_t command, const char *source)
         emulate_single_click(source);
     } else if (command == 'd' || command == 'D' || command == '2') {
         emulate_double_click(source);
+    } else if (command == 'a' || command == 'A') {
+        emulate_drop_to_adv(source);
     } else if (command == 'p' || command == 'P') {
         ESP_LOGI(TAG, "%s: colour bars 0xF800/0x07E0/0x001F/0xFFFF top-to-bottom",
                  source);
@@ -600,10 +621,10 @@ static void handle_serial_command(uint8_t command, const char *source)
     } else if (command == 'h' || command == 'H') {
         ESP_LOGI(TAG,
                  "%s commands: 'r'=start, 's'=stop, "
-                 "'c'/'1'=single-click, 'd'/'2'=double-click, "
-                 "'l'=long-press sleep, 'p'=colour bars, "
-                 "'m'=mic PDM sweep, 'g'=cycle mic gain (1..16), "
-                 "'b'=battery, 'h'=help",
+                  "'c'/'1'=single-click, 'd'/'2'=double-click, "
+                  "'a'=BtnB drop-to-ADV, 'l'=long-press sleep, "
+                  "'p'=colour bars, 'm'=mic PDM sweep, "
+                  "'g'=cycle mic gain (1..16), 'b'=battery, 'h'=help",
                  source);
     }
 }
@@ -831,6 +852,10 @@ static uint8_t battery_millivolt_to_percent(int mv)
 static void battery_update(void)
 {
     int mv = axp192_battery_millivolt();
+    if (mv <= 0) {
+        ESP_LOGW(TAG, "Battery ADC not ready");
+        return;
+    }
     bool chg = axp192_is_charging() || axp192_vbus_present();
     uint8_t pct = battery_millivolt_to_percent(mv);
     battery_level_pct = pct;
@@ -892,13 +917,17 @@ ble_app_advertise(void)
     pairing_active = true;
     advertising = true;
     ESP_LOGI(TAG, "Advertising started: %s", BLE_ADV_NAME);
+    battery_update();
     refresh_status_display();
 }
 
 static void
 ble_app_on_sync(void)
 {
-    ESP_LOGI(TAG, "BLE synced (idle; BtnA to advertise)");
+    ESP_LOGI(TAG, "BLE synced%s", advertise_after_sync ? "; advertise" : "");
+    if (advertise_after_sync) {
+        ble_app_advertise();
+    }
 }
 
 static void
@@ -958,11 +987,13 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
         led_set(false);
         (void)set_microphone_enabled(false);
         apply_pending_operation_mode();
-        refresh_status_display();
-        if (was_app || pairing_active) {
+        bool adv = was_app || resume_adv;
+        resume_adv = false;
+        if (adv) {
             ble_app_advertise();
         } else {
-            ESP_LOGI(TAG, "ghost/OTA drop; stay silent until BtnA");
+            ESP_LOGI(TAG, "ghost drop; deep sleep");
+            pending_deep_sleep = true;
         }
         break;
 
@@ -995,7 +1026,11 @@ ble_app_gap_event(struct ble_gap_event *event, void *arg)
             store_peer_mac();
             refresh_status_display();
             if (!audio_subscribed && !smp_subscribed) {
-                start_ghost_kick_timer();
+                ESP_LOGI(TAG, "audio unsubscribed; drop to ADV");
+                resume_adv = true;
+                pairing_active = true;
+                pending_deep_sleep = false;
+                ble_gap_terminate(audio_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             }
         } else if (event->subscribe.attr_handle == smp_ota_chr_handle()) {
             smp_subscribed = event->subscribe.cur_notify;
@@ -1469,10 +1504,10 @@ static void run_mic_config_sweep(int16_t *i2s_buffer, size_t i2s_buffer_bytes)
 static esp_err_t init_button(void)
 {
     gpio_config_t button_cfg = {
-        .pin_bit_mask = 1ULL << BUTTON_A_GPIO,
+        .pin_bit_mask = (1ULL << BUTTON_A_GPIO) | (1ULL << BUTTON_B_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_DISABLE, /* board has external pull-up; G37 input-only */
+        .pull_up_en = GPIO_PULLUP_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     esp_err_t ret = gpio_config(&button_cfg);
@@ -1480,7 +1515,8 @@ static esp_err_t init_button(void)
         ESP_LOGE(TAG, "button gpio_config failed: %s", esp_err_to_name(ret));
         return ret;
     }
-    ESP_LOGI(TAG, "Button A on GPIO %d (active low)", BUTTON_A_GPIO);
+    ESP_LOGI(TAG, "Button A GPIO %d, B GPIO %d (active low)",
+             BUTTON_A_GPIO, BUTTON_B_GPIO);
     return ESP_OK;
 }
 
@@ -1783,7 +1819,19 @@ static void button_task(void *pvParameters)
     bool press_active = false;
     bool awaiting_single = false;
 
+    int b_stable = gpio_get_level(BUTTON_B_GPIO);
+    int b_last = b_stable;
+    TickType_t b_change_tick = xTaskGetTickCount();
+    TickType_t b_press_start = b_change_tick;
+    bool b_press_active = false;
+    bool b_ignore_down = (b_stable == 0);
+
     while (1) {
+        if (pending_deep_sleep) {
+            pending_deep_sleep = false;
+            enter_deep_sleep("deferred");
+        }
+
         int level = gpio_get_level(BUTTON_A_GPIO);
         TickType_t now = xTaskGetTickCount();
 
@@ -1845,6 +1893,30 @@ static void button_task(void *pvParameters)
             emulate_single_click("Button A");
         }
 
+        int b_level = gpio_get_level(BUTTON_B_GPIO);
+        if (b_level != b_last) {
+            b_last = b_level;
+            b_change_tick = now;
+        }
+        if (b_level != b_stable &&
+            (now - b_change_tick) >= pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
+            b_stable = b_level;
+            if (b_stable == 0) {
+                if (!b_ignore_down) {
+                    b_press_active = true;
+                    b_press_start = now;
+                }
+            } else {
+                b_ignore_down = false;
+                if (b_press_active) {
+                    b_press_active = false;
+                    if ((now - b_press_start) < pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS)) {
+                        emulate_drop_to_adv("Button B");
+                    }
+                }
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
     }
 }
@@ -1895,7 +1967,6 @@ void app_main(void)
     led_init();
 
     if (display_init() == ESP_OK) {
-        refresh_status_display();
         battery_update();
     } else {
         ESP_LOGW(TAG, "Display init failed; continuing without LCD");
@@ -1916,9 +1987,16 @@ void app_main(void)
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
     ESP_ERROR_CHECK(init_button());
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
-        ESP_LOGI(TAG, "Woke from deep sleep (BtnA); waiting for release");
+    bool woke_btn = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
+    bool boot_vbus = axp192_vbus_present();
+    advertise_after_sync = woke_btn || boot_vbus;
+    if (woke_btn) {
+        ESP_LOGI(TAG, "Woke from deep sleep (BtnA); waiting for release then ADV");
         wait_button_a_release();
+    } else if (boot_vbus) {
+        ESP_LOGI(TAG, "USB/VBUS present; ADV after BLE sync");
+    } else {
+        ESP_LOGI(TAG, "Battery cold boot; deep sleep after init");
     }
 
     /*
@@ -1973,9 +2051,13 @@ void app_main(void)
     xTaskCreate(uart_task, "uart_task", 4096, NULL, 4, NULL);
 
     ESP_LOGI(TAG,
-             "Init complete. Adv name %s; BtnA single=record, long=sleep; SMP OTA enabled",
+             "Init complete. Adv name %s; BtnA single=record, BtnB=ADV, long=sleep",
              BLE_ADV_NAME);
     ESP_LOGI(TAG,
-             "Serial: 'r'=start 's'=stop 'c'=single 'd'=double 'l'=sleep "
-             "'m'=mic-sweep 'g'=gain 'p'=colour-bars 'b'=battery 'h'=help");
+             "Serial: 'r'=start 's'=stop 'c'=single 'd'=double 'a'=ADV "
+             "'l'=sleep 'm'=mic-sweep 'g'=gain 'p'=colour-bars 'b'=battery 'h'=help");
+
+    if (!advertise_after_sync) {
+        enter_deep_sleep("cold boot");
+    }
 }
