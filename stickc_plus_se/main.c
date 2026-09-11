@@ -74,6 +74,12 @@ static const char *TAG = "hn_plusse";
 /* Classification thresholds (16 kHz => Nyquist 8 kHz). */
 #define MIC_ZCR_NOISE_HZ    2500.0   /* above this the stream is broadband noise */
 #define MIC_ZCR_SIGNAL_MIN  100.0    /* speech sits in roughly 300-1500 Hz */
+/* Single-pole 200 Hz high-pass against background-music bass, applied after
+ * the DC IIR and before gain. a = exp(-2*pi*fc/fs) = 0.92447 at fc=200,
+ * fs=16000, stored Q15. y[n] = a*(y[n-1] + x[n] - x[n-1]).
+ * (y1+x-x1) reaches ~+-196k pre-gain, so the product is widened to 64 bit.
+ * Toggle at runtime with serial 'f'; defaults on. */
+#define MIC_HPF_COEF_Q15    30293
 
 #define BLE_MTU_SIZE      512
 #define BLE_ADV_NAME      "HarnessNode-PlusSE"
@@ -189,6 +195,24 @@ static mic_pdm_cfg_t mic_pdm_cfg = MIC_PDM_DEFAULT;
 static volatile int32_t mic_gain = MIC_GAIN_DEFAULT;
 /* In stereo capture only one slot carries the mic; which one the sweep reveals. */
 static uint8_t mic_stereo_pick = 0;
+static volatile bool mic_hpf_enabled = true;
+static int32_t mic_hpf_x1 = 0;
+static int32_t mic_hpf_y1 = 0;
+
+static inline int32_t mic_hpf_apply(int32_t x)
+{
+    int32_t y = (int32_t)(((int64_t)MIC_HPF_COEF_Q15 *
+                           (mic_hpf_y1 + x - mic_hpf_x1)) >> 15);
+    mic_hpf_x1 = x;
+    mic_hpf_y1 = y;
+    return y;
+}
+
+static inline void mic_hpf_reset(void)
+{
+    mic_hpf_x1 = 0;
+    mic_hpf_y1 = 0;
+}
 
 static void ble_app_advertise(void);
 static void ble_app_on_sync(void);
@@ -616,6 +640,10 @@ static void handle_serial_command(uint8_t command, const char *source)
         }
         mic_gain = next;
         ESP_LOGI(TAG, "%s: mic gain = %d", source, (int)mic_gain);
+    } else if (command == 'f' || command == 'F') {
+        mic_hpf_enabled = !mic_hpf_enabled;
+        mic_hpf_reset();
+        ESP_LOGI(TAG, "%s: 200 Hz HPF %s", source, mic_hpf_enabled ? "on" : "off");
     } else if (command == 'b' || command == 'B') {
         battery_update();
     } else if (command == 'h' || command == 'H') {
@@ -624,7 +652,8 @@ static void handle_serial_command(uint8_t command, const char *source)
                   "'c'/'1'=single-click, 'd'/'2'=double-click, "
                   "'a'=BtnB drop-to-ADV, 'l'=long-press sleep, "
                   "'p'=colour bars, 'm'=mic PDM sweep, "
-                  "'g'=cycle mic gain (1..16), 'b'=battery, 'h'=help",
+                  "'g'=cycle mic gain (1..16), 'f'=toggle 200 Hz HPF, "
+                  "'b'=battery, 'h'=help",
                  source);
     }
 }
@@ -1570,6 +1599,7 @@ static void audio_stream_task(void *pvParameters)
             }
             /* Settle DC: feed IIR until residual is small, with timeout. */
             mic_dc_offset = 0;
+            mic_hpf_reset();
             {
                 int64_t t0 = esp_timer_get_time();
                 uint32_t settled = 0;
@@ -1591,6 +1621,11 @@ static void audio_stream_task(void *pvParameters)
                         int32_t x = i2s_buffer[i];
                         mic_dc_offset += (x - mic_dc_offset) >> MIC_DC_SHIFT;
                         int32_t resid = x - mic_dc_offset;
+                        /* Converge the HPF state too so the first streamed
+                         * packet does not carry a start-up transient. */
+                        if (mic_hpf_enabled) {
+                            (void)mic_hpf_apply(resid);
+                        }
                         if (resid < 0) {
                             resid = -resid;
                         }
@@ -1608,9 +1643,10 @@ static void audio_stream_task(void *pvParameters)
                         break;
                     }
                 }
-                ESP_LOGI(TAG, "Mic DC settle offset=%d %s (%u ms)",
+                ESP_LOGI(TAG, "Mic DC settle offset=%d %s (%u ms) hpf=%s",
                          (int)mic_dc_offset, ok ? "ok" : "timeout",
-                         (unsigned)((esp_timer_get_time() - t0) / 1000));
+                         (unsigned)((esp_timer_get_time() - t0) / 1000),
+                         mic_hpf_enabled ? "on" : "off");
             }
             if (stop_requested || !recording_requested) {
                 ESP_LOGI(TAG, "Recording start aborted during settle");
@@ -1713,6 +1749,9 @@ static void audio_stream_task(void *pvParameters)
             int32_t x = (int32_t)raw;
             mic_dc_offset += (x - mic_dc_offset) >> MIC_DC_SHIFT;
             int32_t centered = x - mic_dc_offset;
+            if (mic_hpf_enabled) {
+                centered = mic_hpf_apply(centered);
+            }
             int32_t v = centered * mic_gain;
             if (v > INT16_MAX) {
                 v = INT16_MAX;
@@ -1744,8 +1783,9 @@ static void audio_stream_task(void *pvParameters)
                 mic_raw_stats_log("Mic raw", &raw_log_stats, I2S_SAMPLE_RATE);
                 int32_t rms = (int32_t)sqrt((double)proc_sum_sq / (double)proc_samples);
                 unsigned clip_pct = (unsigned)((clip_count * 100u) / proc_samples);
-                ESP_LOGI(TAG, "Mic proc peak=%d rms=%d gain=%d clip=%u%%",
-                         (int)proc_peak, (int)rms, (int)mic_gain, clip_pct);
+                ESP_LOGI(TAG, "Mic proc peak=%d rms=%d gain=%d clip=%u%% hpf=%s",
+                         (int)proc_peak, (int)rms, (int)mic_gain, clip_pct,
+                         mic_hpf_enabled ? "on" : "off");
             }
         }
 
@@ -2055,7 +2095,8 @@ void app_main(void)
              BLE_ADV_NAME);
     ESP_LOGI(TAG,
              "Serial: 'r'=start 's'=stop 'c'=single 'd'=double 'a'=ADV "
-             "'l'=sleep 'm'=mic-sweep 'g'=gain 'p'=colour-bars 'b'=battery 'h'=help");
+              "'l'=sleep 'm'=mic-sweep 'g'=gain 'f'=HPF 'p'=colour-bars "
+              "'b'=battery 'h'=help");
 
     if (!advertise_after_sync) {
         enter_deep_sleep("cold boot");

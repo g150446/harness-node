@@ -1,7 +1,7 @@
 # M5StickC Plus SE / HarnessNode-PlusSE
 
 ESP-IDF ファーム: `stickc_plus_se/`  
-BLE 名: **`HarnessNode-PlusSE`**（現行 `VERSION` **0.1.8**）  
+BLE 名: **`HarnessNode-PlusSE`**（現行 `VERSION` **0.1.9**）  
 Audio Service UUID: XIAO `HarnessNode` / Plus2 と同じ  
 `00000001/0002/0003-0000-1000-8000-00805f9b34fb`
 
@@ -153,13 +153,17 @@ USB 給電中は電圧が高め。充電中はアイコンが青。
 
 ### シリアル（115200）
 
-`r/s/c/d/a/l/m/g/p/h` に加え `b`=battery。`a` は BtnB 相当（切断して ADV）。
+`r/s/c/d/a/l/m/g/f/p/h` に加え `b`=battery。`a` は BtnB 相当（切断して ADV）。
 
 ---
 
 ## マイク
 
 初期値 **IDF クロック + LEFT + DSR_16S + gain ×4**。SE でスロットが違うなら serial `m`。
+
+BGM 低音対策の **200 Hz 1次 HPF が既定 ON**（DC 除去 IIR ≈80 Hz の後段、gain の前段）。
+serial `f` でトグル。状態は録音開始ログ（`Mic DC settle ... hpf=on/off`）と
+1 秒統計（`Mic proc ... hpf=on/off`）に出る。
 
 ---
 
